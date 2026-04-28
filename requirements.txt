@@ -1,0 +1,55 @@
+# AI Trading App — Python dependencies
+# Install with: pip install -r requirements.txt
+
+# ── IBKR Connection ──────────────────────────────────────────────────────────
+ib_insync>=0.9.86          # Async wrapper for IBKR TWS API
+
+# ── Data & Numerics ──────────────────────────────────────────────────────────
+pandas>=2.1.0
+numpy>=1.26.0
+yfinance>=0.2.36           # Market data (Step 2)
+requests>=2.31.0
+
+# ── Technical Indicators ─────────────────────────────────────────────────────
+ta>=0.11.0                 # Pure-Python TA library (no TA-Lib C dependency needed)
+# ta-lib>=0.4.28           # Uncomment if you install TA-Lib C library separately
+
+# ── Database ─────────────────────────────────────────────────────────────────
+sqlalchemy>=2.0.0          # ORM for trade log / feature store (Step 2)
+
+# ── ML / AI (Step 2+) ────────────────────────────────────────────────────────
+scikit-learn>=1.4.0
+xgboost>=2.0.0
+lightgbm>=4.3.0
+torch>=2.2.0               # PyTorch for LSTM
+transformers>=4.38.0       # HuggingFace (FinBERT sentiment, Step 2)
+
+# ── Reinforcement Learning (Step 4) ──────────────────────────────────────────
+stable-baselines3>=2.2.0
+gymnasium>=0.29.0          # Gym environment for RL agent
+
+# ── Backtesting (Step 3) ─────────────────────────────────────────────────────
+vectorbt>=0.26.0
+
+# ── Dashboard (Step 2) ───────────────────────────────────────────────────────
+streamlit>=1.32.0
+plotly>=5.20.0
+
+# ── Alpaca Markets ───────────────────────────────────────────────────────────
+alpaca-py>=0.20.0             # Alpaca Markets SDK (news + bar data)
+
+# ── API layer ────────────────────────────────────────────────────────────────
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+
+# ── Testing ──────────────────────────────────────────────────────────────────
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+pytest-mock>=3.12.0
+
+# ── Utilities ────────────────────────────────────────────────────────────────
+python-dotenv>=1.0.0       # .env file support for secrets
+schedule>=1.2.0            # Cron-style job scheduler for universe_scheduler.py
+pyyaml>=6.0                # YAML config file support
+pydantic>=2.6.0            # Data validation
+loguru>=0.7.0              # Optional richer logging

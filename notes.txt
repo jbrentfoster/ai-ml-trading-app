@@ -1,0 +1,19 @@
+consider moving away from IBKR
+
+Verify trailing stop orders and UI for viewing them
+
+would it make sense to code our logic for the bracket orders (with stop loss and trailing stop loss) into the walk  
+  forward testing?  I barely understand all of this, so this may not make any sense. What do you think?               
+
+● It makes total sense — that's actually the right instinct, and it's a real gap. Right now the walk-forward says "you
+   held a long for 5 bars, here's the P&L from close to close" — but in live trading the position has a stop loss that
+   may fire mid-bar (capping the loss), a take-profit that may fire mid-bar (locking in a gain earlier than the model
+  says to exit), and now a trailing stop that may convert and ratchet exit prices upward. The WF doesn't model any of
+  those, so its P&L can be much worse (or much better) than what the live strategy would actually realize. That's part
+   of why the post-fix Sharpes look so bad — for the SPY example, a real ATR stop would have capped the short's loss
+  long before close-to-close P&L did.
+
+  Recommendation: yes, this is worth doing — and it's the single biggest realism upgrade left in the WF. The cost is
+  moderate: we'd track stop/TP/trail state per bar inside _run_test_window and check intra-bar high/low against those
+  levels (we already store H/L in ohlcv_bars). The main gotcha is daily bars don't tell us order of high vs low within
+   the day, so we have to make a worst-case or open-relative assumption.

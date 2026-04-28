@@ -1,0 +1,14 @@
+[server]
+# Disable Streamlit's file watcher entirely.
+#
+# Without this, loading FinBERT triggers Streamlit to scan the entire
+# transformers package, hitting dozens of image-processing submodules that
+# import torchvision (not installed, not needed for text-only FinBERT).
+# This floods the terminal with hundreds of ModuleNotFoundError lines.
+#
+# Trade-off: you must manually restart the app (Ctrl-C, then re-run
+# `streamlit run dashboard/app.py`) after editing source files.
+fileWatcherType = "none"
+
+[browser]
+gatherUsageStats = false

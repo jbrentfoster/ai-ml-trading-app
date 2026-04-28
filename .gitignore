@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+*.egg-info/
+
+# Environment / secrets
+.env
+*.env
+
+# Database
+db/
+
+# Logs
+logs/
+
+# ML model cache (trained weights — regenerate with verify_signals.py / training run)
+models/cache/
+
+# Pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# User-specific runtime config (auto-created by Settings page; never stores secrets
+# but contains user overrides like ports, weights, thresholds).  Committing it
+# would force every clone to inherit one user's preferences.
+config/settings.yaml
+
+# Merge / backup artifacts (e.g. settings.yaml.orig left by tools)
+*.orig
+
+# Claude Code per-user state (local permission grants, session settings)
+.claude/
+
+# Project-local agent memory (user-specific notes accumulated across sessions)
+memory/
+
+# misc
+notes.txt
