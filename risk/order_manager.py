@@ -322,6 +322,12 @@ class OrderManager:
         )
 
         if not is_dry_run and self._ibkr is not None:
+            # Cancel any active bracket children (SELL LMT take-profit, SELL STP
+            # stop-loss) before flattening.  Without this, the orphaned stops
+            # remain live after the position goes to 0; if price subsequently
+            # triggers one, IBKR fires a SELL against no shares and opens an
+            # unintended SHORT — bypassing allow_short_selling=False entirely.
+            self._cancel_bracket_children(symbol)
             self._submit_market_close(symbol, shares)
 
         decision = OrderDecision(
@@ -342,6 +348,62 @@ class OrderManager:
             symbol, shares, entry_price, is_dry_run,
         )
         return decision
+
+    def _cancel_bracket_children(self, symbol: str) -> None:
+        """
+        Cancel any open SELL LMT (take-profit) and SELL STP / STP LMT (stop)
+        legs for `symbol` before a long is closed.  Errors are logged but not
+        raised — the caller still attempts the market close so a stale bracket
+        doesn't block flattening.
+        """
+        try:
+            coro_get = self._ibkr.get_open_orders()
+            if self._loop is not None:
+                open_orders = self._loop.run_until_complete(coro_get)
+            else:
+                loop = asyncio.new_event_loop()
+                try:
+                    open_orders = loop.run_until_complete(coro_get)
+                finally:
+                    loop.close()
+        except Exception as exc:
+            log.error(
+                "Could not fetch open orders to cancel bracket children for %s: %s",
+                symbol, exc,
+            )
+            return
+
+        targets = [
+            o for o in open_orders
+            if o.get("symbol") == symbol
+            and o.get("action") == "SELL"
+            and o.get("order_type") in ("LMT", "STP", "STP LMT")
+        ]
+        if not targets:
+            return
+
+        for o in targets:
+            order_id = o.get("order_id")
+            try:
+                coro_cancel = self._ibkr.cancel_order(order_id)
+                if self._loop is not None:
+                    self._loop.run_until_complete(coro_cancel)
+                else:
+                    loop = asyncio.new_event_loop()
+                    try:
+                        loop.run_until_complete(coro_cancel)
+                    finally:
+                        loop.close()
+                log.info(
+                    "[%s] Cancelled bracket child %s id=%s before close",
+                    symbol, o.get("order_type"), order_id,
+                )
+            except Exception as exc:
+                log.error(
+                    "[%s] Could not cancel bracket child id=%s: %s — "
+                    "orphan order may remain live in IBKR",
+                    symbol, order_id, exc,
+                )
 
     def _submit_market_close(self, symbol: str, shares: int) -> bool:
         """

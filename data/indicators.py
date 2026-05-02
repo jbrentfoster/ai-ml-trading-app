@@ -124,7 +124,10 @@ class IndicatorEngine:
 
         ind_df = df[[c for c in _INDICATOR_COLS if c in df.columns]]
         n = upsert_indicators(ind_df, symbol, interval)
-        log.info("Persisted %d new indicator row(s) for %s (%s)", n, symbol, interval)
+        if n > 0:
+            log.info("Persisted %d new indicator row(s) for %s (%s)", n, symbol, interval)
+        else:
+            log.debug("Persisted 0 new indicator row(s) for %s (%s) — already current", symbol, interval)
 
         return df
 

@@ -198,7 +198,9 @@ class TestTrailingStopManager:
         assert "bracket" in actions[0].reason.lower()
 
     def test_short_positions_skipped(self, loop):
-        """Short positions are out of scope for the long-only trailing stop."""
+        """Short positions are out of scope for the long-only trailing stop;
+        they're logged as SKIPPED so an unexpected short surfaces in the
+        daily log instead of vanishing silently."""
         ibkr = _ibkr_stub(
             positions=[{"symbol": "AAPL", "quantity": -100, "avg_cost": 100.0}],
             open_orders=[],
@@ -211,7 +213,11 @@ class TestTrailingStopManager:
             cfg.risk.trailing_stop_trail_atr = 2.0
             actions = mgr.manage()
 
-        assert actions == []
+        assert len(actions) == 1
+        assert actions[0].symbol == "AAPL"
+        assert actions[0].action == "SKIPPED"
+        assert actions[0].shares == -100
+        assert "non-long" in actions[0].reason.lower()
         ibkr.cancel_order.assert_not_called()
 
     def test_run_id_propagates_to_action_and_persist(self, loop, monkeypatch):

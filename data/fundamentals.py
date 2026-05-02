@@ -80,7 +80,7 @@ class FundamentalsClient:
         }
 
         upsert_fundamentals(symbol, data)
-        log.info("Fetched and cached fundamentals for %s", symbol)
+        log.debug("Fetched and cached fundamentals for %s", symbol)
         return {"symbol": symbol, **data}
 
     def get_feature_vector(self, symbol: str) -> dict[str, float]:

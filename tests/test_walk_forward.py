@@ -238,20 +238,18 @@ class TestWalkForwardValidator:
             )
 
 
-# ── MLWalkForwardOrchestrator cost model ──────────────────────────────────────
+# ── MLWalkForwardOrchestrator cost model + bracket simulation ────────────────
 #
-# These tests target the bug fix in models/walk_forward.py:_run_test_window.
-# Pre-fix the function deducted `slippage_pct*2 + commission_per_share` from
-# every signal bar's fractional return — but commission_per_share is a
-# DOLLAR amount per share, not a fractional cost.  And it charged the full
-# round-trip on every signal bar, ignoring position carry-over.
+# These tests target two distinct concerns of `_run_test_window`:
+#   1. Cost-model correctness (one_way = slippage + commission/price; charged
+#      on transitions only) — historically buggy, now fixed.
+#   2. Bracket simulation (Phase 4.5 — Phase A) — entries deferred to next
+#      bar's open, ATR-based stop/tp, gap-aware fills, worst-case rule on
+#      same-bar stop+tp tie, trailing-stop activation/ratchet, no same-bar
+#      re-entry, fold-end force-flatten.  Closed trades populate `trade_log`.
 #
-# Both bugs are fixed by:
-#   1. one_way_cost = slippage + commission/price   (unit fix)
-#   2. cost charged only on |Δposition| transitions (round-trip fix)
-#   3. position force-flatten on the final bar      (closed-out P&L)
-# We drive the orchestrator with mocked ensemble + gate so signal sequences
-# are deterministic and the cost arithmetic is the only thing under test.
+# All tests drive the orchestrator with mocked ensemble + gate so signal
+# sequences are deterministic; the simulator's bracket math is the SUT.
 
 from unittest.mock import MagicMock, patch
 from datetime import datetime, timezone
@@ -276,6 +274,33 @@ def _flat_price_df(n_bars: int, price: float = 100.0) -> pd.DataFrame:
         {"Open": price, "High": price, "Low": price, "Close": price, "Volume": 1e6},
         index=dates,
     )
+
+
+def _ohlc_df(rows: list[dict], atr: float | None = 2.0) -> pd.DataFrame:
+    """
+    Synthetic OHLC DataFrame for bracket-simulation tests.
+
+    `rows` is a list of dicts with keys Open/High/Low/Close (any subset
+    defaults to the provided Close).  When `atr` is set, every bar gets that
+    constant `atr_14` value; pass None to omit the column entirely (no
+    brackets armed).
+    """
+    n = len(rows)
+    dates = pd.bdate_range(end=datetime(2024, 6, 1), periods=n)
+    normalised = []
+    for r in rows:
+        c = r.get("Close")
+        normalised.append({
+            "Open":  r.get("Open",  c),
+            "High":  r.get("High",  c),
+            "Low":   r.get("Low",   c),
+            "Close": c,
+            "Volume": 1e6,
+        })
+    df = pd.DataFrame(normalised, index=dates)
+    if atr is not None:
+        df["atr_14"] = atr
+    return df
 
 
 def _build_orchestrator(signals: list[str]):
@@ -307,7 +332,13 @@ def _build_orchestrator(signals: list[str]):
 
 
 class TestCostModel:
-    """Tests for the corrected WF cost model in _run_test_window."""
+    """Tests for the corrected WF cost model in _run_test_window.
+
+    Entry timing changed under Phase 4.5: a BUY/SELL signal at bar t close
+    now schedules entry at bar t+1's open (was: same-bar position change).
+    Transition counts and total costs are unchanged; only WHICH bar each cost
+    lands on shifted by one.
+    """
 
     def test_all_hold_no_cost_no_returns(self):
         """No signals → no transitions → zero cost, zero returns throughout."""
@@ -315,13 +346,14 @@ class TestCostModel:
         df = _flat_price_df(5)
         train_df, test_df = df.iloc[:0], df
 
-        _, returns, _ = orch._run_test_window(ensemble, train_df, test_df)
+        _, returns, _, trades = orch._run_test_window(ensemble, train_df, test_df)
 
         assert (returns == 0).all()
+        assert trades == []
 
     def test_single_buy_then_holds_charges_one_round_trip(self):
-        """BUY on bar 0, HOLD afterwards.  Last bar force-exits → 2 trades total
-        (entry + final exit), not one per signal bar."""
+        """BUY on bar 0 → entry on bar 1 open; force-exit on last bar.
+        Two cost-bearing bars (entry + fold_end), not one per signal bar."""
         from config.settings import config
 
         # Flat-price test window so any non-zero return is purely cost.
@@ -330,35 +362,98 @@ class TestCostModel:
         train_df, test_df = df.iloc[:0], df
         orch, ensemble = _build_orchestrator(["BUY", "HOLD", "HOLD", "HOLD", "HOLD"])
 
-        _, returns, _ = orch._run_test_window(ensemble, train_df, test_df)
+        _, returns, _, trades = orch._run_test_window(ensemble, train_df, test_df)
 
-        # Exactly two non-zero return entries: entry (bar 0) and forced-exit (bar 4).
+        # Two non-zero return entries: entry (bar 1) and force-exit (bar 4).
         nonzero = (returns != 0).sum()
-        assert nonzero == 2, f"expected 2 transition bars, got {nonzero}"
+        assert nonzero == 2, f"expected 2 cost bars, got {nonzero}"
 
         one_way = config.ml.slippage_pct + config.ml.commission_per_share / 100.0
-        assert returns.iloc[0]  == pytest.approx(-one_way)
-        assert returns.iloc[-1] == pytest.approx(-one_way)
+        assert returns.iloc[0]  == pytest.approx(0.0)        # signal bar — no cost yet
+        assert returns.iloc[1]  == pytest.approx(-one_way)   # entry bar
+        assert returns.iloc[-1] == pytest.approx(-one_way)   # force-exit bar
         # Sum of all returns = total cost paid (entry + exit) on a flat-price strategy.
         assert returns.sum() == pytest.approx(-2 * one_way)
+        # One trade logged with exit_reason='fold_end'.
+        assert len(trades) == 1
+        assert trades[0]["exit_reason"] == "fold_end"
 
-    def test_flip_buy_to_sell_counts_two_trades(self):
-        """+1 → -1 transition is two one-way trades (close long + open short)."""
+    def test_flip_buy_to_sell_counts_two_trades(self, monkeypatch):
+        """BUY then SELL with shorts allowed: bar 1 enters long & immediately
+        signal-flips at close, bar 2 enters short & is force-flattened at close.
+        Total cost = 4 one-ways.
+
+        Requires `allow_short_selling=True` — under the default (False),
+        the SELL after closing the long is a no-op (see
+        `test_long_only_sell_does_not_open_short` below)."""
         from config.settings import config
+        monkeypatch.setattr(config.trading, "allow_short_selling", True)
 
         df = _flat_price_df(3, price=100.0)
         train_df, test_df = df.iloc[:0], df
         orch, ensemble = _build_orchestrator(["BUY", "SELL", "HOLD"])
 
-        _, returns, _ = orch._run_test_window(ensemble, train_df, test_df)
+        _, returns, _, trades = orch._run_test_window(ensemble, train_df, test_df)
 
         one_way = config.ml.slippage_pct + config.ml.commission_per_share / 100.0
-        # Bar 0: 0 → +1 = 1 trade
-        # Bar 1: +1 → -1 = 2 trades
-        # Bar 2: -1 → 0 (force-exit) = 1 trade
-        assert returns.iloc[0] == pytest.approx(-one_way)
+        # Bar 0: BUY signal — schedule entry; no cost yet.
+        # Bar 1: enter long at open; SELL signal at close → signal-flip exit.
+        #        Two one-ways on this bar (entry + signal-flip).  Pending=SELL for bar 2.
+        # Bar 2: enter short at open; last bar → force-flatten at close.
+        #        Two one-ways on this bar (entry + fold_end).
+        assert returns.iloc[0] == pytest.approx(0.0)
         assert returns.iloc[1] == pytest.approx(-2 * one_way)
-        assert returns.iloc[2] == pytest.approx(-one_way)
+        assert returns.iloc[2] == pytest.approx(-2 * one_way)
+        assert returns.sum()    == pytest.approx(-4 * one_way)
+        # Two trades logged: signal_flip on the long, fold_end on the short.
+        assert [t["exit_reason"] for t in trades] == ["signal_flip", "fold_end"]
+        assert [t["signal"]      for t in trades] == ["BUY", "SELL"]
+
+    def test_long_only_sell_from_flat_is_noop(self, monkeypatch):
+        """With allow_short_selling=False (default): a SELL signal at flat
+        position must NOT open a short.  No entry, no costs, no trade record.
+
+        Mirrors OrderManager.process behaviour in live signal_runner — a SELL
+        with no existing long is REJECTED_NO_POSITION, never a short open."""
+        from config.settings import config
+        monkeypatch.setattr(config.trading, "allow_short_selling", False)
+
+        df = _flat_price_df(3, price=100.0)
+        train_df, test_df = df.iloc[:0], df
+        orch, ensemble = _build_orchestrator(["SELL", "SELL", "HOLD"])
+
+        _, returns, _, trades = orch._run_test_window(ensemble, train_df, test_df)
+
+        # No position ever opened — every bar's bar_pnl is 0, no trades logged.
+        assert (returns == 0).all()
+        assert trades == []
+
+    def test_long_only_sell_after_long_closes_without_reopening_short(self, monkeypatch):
+        """With allow_short_selling=False: BUY then SELL closes the long via
+        signal_flip but does NOT schedule a short entry on the next bar.
+        Exactly one trade, exit_reason='signal_flip', no fold_end short."""
+        from config.settings import config
+        monkeypatch.setattr(config.trading, "allow_short_selling", False)
+
+        df = _flat_price_df(3, price=100.0)
+        train_df, test_df = df.iloc[:0], df
+        orch, ensemble = _build_orchestrator(["BUY", "SELL", "HOLD"])
+
+        _, returns, _, trades = orch._run_test_window(ensemble, train_df, test_df)
+
+        one_way = config.ml.slippage_pct + config.ml.commission_per_share / 100.0
+        # Bar 0: BUY signal scheduled.
+        # Bar 1: enter long at open; SELL signal at close → signal_flip exit.
+        #        Two one-ways on this bar (entry + signal-flip).
+        #        Pending entry NOT scheduled (long-only).
+        # Bar 2: flat — no costs.
+        assert returns.iloc[0] == pytest.approx(0.0)
+        assert returns.iloc[1] == pytest.approx(-2 * one_way)
+        assert returns.iloc[2] == pytest.approx(0.0)
+        assert returns.sum()    == pytest.approx(-2 * one_way)
+        assert len(trades) == 1
+        assert trades[0]["exit_reason"] == "signal_flip"
+        assert trades[0]["signal"]      == "BUY"
 
     def test_commission_units_are_fractional_per_price(self):
         """A $1000 stock should incur ~10× less commission cost (as a fraction
@@ -370,15 +465,15 @@ class TestCostModel:
 
         df_lo = _flat_price_df(3, price=100.0)
         orch_lo, ens_lo = _build_orchestrator(signals)
-        _, returns_lo, _ = orch_lo._run_test_window(ens_lo, df_lo.iloc[:0], df_lo)
+        _, returns_lo, _, _ = orch_lo._run_test_window(ens_lo, df_lo.iloc[:0], df_lo)
 
         df_hi = _flat_price_df(3, price=1000.0)
         orch_hi, ens_hi = _build_orchestrator(signals)
-        _, returns_hi, _ = orch_hi._run_test_window(ens_hi, df_hi.iloc[:0], df_hi)
+        _, returns_hi, _, _ = orch_hi._run_test_window(ens_hi, df_hi.iloc[:0], df_hi)
 
-        # Each window has 2 transitions (entry + final exit).
-        # one_way = slippage + commission/price.  Slippage component is the
-        # same; commission component scales as 1/price.
+        # Each window has 2 fills (entry on bar 1 + force-exit on bar 2).
+        # one_way = slippage + commission/price.  Slippage is constant; the
+        # commission component scales as 1/price.
         slip = config.ml.slippage_pct
         comm = config.ml.commission_per_share
 
@@ -391,10 +486,14 @@ class TestCostModel:
         assert returns_hi.sum() > returns_lo.sum()
 
     def test_held_position_captures_subsequent_bar_returns(self):
-        """A long held through HOLD bars should accrue P&L from price moves
-        on those HOLD bars — they are not free returns to a flat strategy."""
+        """A long held through HOLD bars accrues P&L from price moves on
+        those HOLD bars — not free returns to a flat strategy.
+
+        With next-bar entry: BUY at bar 0 close → enter at bar 1 open=110.
+        Returns from bar 2 onward are mark-to-market vs. prior close.
+        """
         n = 4
-        # Price doubles by the end of the window, with one move per bar.
+        # Price increases by the end of the window, with one move per bar.
         prices = [100.0, 110.0, 121.0, 133.10]
         dates  = pd.bdate_range(end=datetime(2024, 6, 1), periods=n)
         df = pd.DataFrame(
@@ -405,19 +504,278 @@ class TestCostModel:
         train_df, test_df = df.iloc[:0], df
         orch, ensemble = _build_orchestrator(["BUY", "HOLD", "HOLD", "HOLD"])
 
-        _, returns, _ = orch._run_test_window(ensemble, train_df, test_df)
+        _, returns, _, trades = orch._run_test_window(ensemble, train_df, test_df)
 
-        # Bar 0: position carried in = 0, no return; pay entry cost.
-        # Bar 1: position +1, return = (121-110)/110 ≈ +0.10
-        # Bar 2: position +1, return = (133.10-121)/121 ≈ +0.10
-        # Bar 3: position +1, return = 0 (last bar) — force exit, pay exit cost.
-        # Returns 1 and 2 should be ~+10% (minus zero cost since position unchanged).
-        assert returns.iloc[1] == pytest.approx(0.10, rel=1e-3)
+        # Bar 0: signal BUY — pending entry; no cost.
+        # Bar 1: enter at 110. Open==Close==110, MTM=0; pay entry cost.
+        # Bar 2: HELD; MTM = (121-110)/110 ≈ +0.10. No cost.
+        # Bar 3: last bar; force-flatten at 133.10. MTM = (133.10-121)/121 ≈ +0.10
+        #        less exit cost.
         assert returns.iloc[2] == pytest.approx(0.10, rel=1e-3)
 
         # Net total: cumulative product should be ~ +21% minus ~2 one-way costs.
-        from config.settings import config
-        avg_cost = config.ml.slippage_pct + config.ml.commission_per_share / 100
-        # Ballpark check: total > 18%, total < 22%
         net_total = float((1 + returns).prod() - 1)
         assert 0.18 < net_total < 0.22
+        # One trade closed at fold_end with positive pnl_pct.
+        assert len(trades) == 1
+        assert trades[0]["exit_reason"] == "fold_end"
+        assert trades[0]["pnl_pct"] > 0
+
+
+class TestBracketSimulation:
+    """Tests for Phase 4.5 (Phase A) bracket simulation in _run_test_window."""
+
+    def test_stop_caps_loss_at_atr_distance(self):
+        """ATR=2, stop_mult=2 → stop=entry-4.  A bar with Low<=stop fires
+        the stop intra-bar and exits at stop_px with extra slippage."""
+        from config.settings import config
+
+        # Bar 0: signal-only (BUY).
+        # Bar 1: enter long at Open=100.  stop=96, tp=106.
+        # Bar 2: Low=95 → intra-bar stop fires at 96.
+        # Bar 3: flat, no further trades.
+        rows = [
+            {"Close": 100},                                  # bar 0 (signal bar)
+            {"Open": 100, "High": 101, "Low": 99,  "Close": 100},  # bar 1 (entry)
+            {"Open": 100, "High": 101, "Low": 95,  "Close": 99},   # bar 2 (stop hit)
+            {"Open": 99,  "High": 99,  "Low": 99,  "Close": 99},   # bar 3 (flat)
+        ]
+        df = _ohlc_df(rows, atr=2.0)
+        orch, ensemble = _build_orchestrator(["BUY", "HOLD", "HOLD", "HOLD"])
+
+        _, _, _, trades = orch._run_test_window(ensemble, df.iloc[:0], df)
+
+        assert len(trades) == 1
+        t = trades[0]
+        assert t["exit_reason"] == "stop"
+        assert t["entry_px"]    == pytest.approx(100.0)
+        assert t["exit_px"]     == pytest.approx(96.0)   # stop_px, not Low
+
+        # Loss is bounded by ATR distance plus one round-trip + intra-bar stop slippage.
+        slip = config.ml.slippage_pct
+        comm = config.ml.commission_per_share
+        stop_slip = config.risk.stop_slippage_multiplier * slip
+        expected_pnl_pct = (96 - 100) / 100 - (slip + comm / 100) - (slip + comm / 96) - stop_slip
+        assert t["pnl_pct"] == pytest.approx(expected_pnl_pct, abs=1e-6)
+
+    def test_tp_locks_gain_at_atr_distance(self):
+        """ATR=2, tp_mult=3 → tp=entry+6.  TP fills exactly with NO slippage."""
+        from config.settings import config
+
+        rows = [
+            {"Close": 100},                                          # bar 0
+            {"Open": 100, "High": 101, "Low": 99,  "Close": 100},    # bar 1 (entry)
+            {"Open": 100, "High": 110, "Low": 100, "Close": 109},    # bar 2 (tp hit)
+            {"Open": 109, "High": 109, "Low": 109, "Close": 109},    # bar 3
+        ]
+        df = _ohlc_df(rows, atr=2.0)
+        orch, ensemble = _build_orchestrator(["BUY", "HOLD", "HOLD", "HOLD"])
+
+        _, _, _, trades = orch._run_test_window(ensemble, df.iloc[:0], df)
+
+        assert len(trades) == 1
+        t = trades[0]
+        assert t["exit_reason"] == "tp"
+        assert t["exit_px"]     == pytest.approx(106.0)
+
+        slip = config.ml.slippage_pct
+        comm = config.ml.commission_per_share
+        # TP fills exact: no stop-slippage extra.
+        expected_pnl_pct = (106 - 100) / 100 - (slip + comm / 100) - (slip + comm / 106)
+        assert t["pnl_pct"] == pytest.approx(expected_pnl_pct, abs=1e-6)
+
+    def test_gap_through_stop_fills_at_open_no_extra_slippage(self):
+        """Open <= stop (long) → fill at Open, no stop-slippage charge.
+        The gap IS the slippage; don't double-count."""
+        from config.settings import config
+
+        rows = [
+            {"Close": 100},                                          # bar 0
+            {"Open": 100, "High": 101, "Low": 99,  "Close": 100},    # bar 1 (entry; stop=96)
+            {"Open":  90, "High":  92, "Low":  85, "Close":  88},    # bar 2 (gap-down through stop)
+        ]
+        df = _ohlc_df(rows, atr=2.0)
+        orch, ensemble = _build_orchestrator(["BUY", "HOLD", "HOLD"])
+
+        _, _, _, trades = orch._run_test_window(ensemble, df.iloc[:0], df)
+
+        assert len(trades) == 1
+        t = trades[0]
+        assert t["exit_reason"] == "stop"
+        assert t["exit_px"]     == pytest.approx(90.0)   # Open, not stop_px=96 nor Low=85
+
+        # No extra stop-slippage on gap fills.
+        slip = config.ml.slippage_pct
+        comm = config.ml.commission_per_share
+        expected_pnl_pct = (90 - 100) / 100 - (slip + comm / 100) - (slip + comm / 90)
+        assert t["pnl_pct"] == pytest.approx(expected_pnl_pct, abs=1e-6)
+
+    def test_both_touched_bar_fills_stop_not_tp(self):
+        """Worst-case rule: when both stop and tp are touched on the same bar,
+        the stop fills (TP is forfeit)."""
+        rows = [
+            {"Close": 100},                                          # bar 0
+            {"Open": 100, "High": 101, "Low":  99, "Close": 100},    # bar 1 (entry)
+            # Bar 2: full range crosses both stop=96 and tp=106 — worst case.
+            {"Open": 100, "High": 107, "Low":  95, "Close": 100},    # bar 2 (both)
+        ]
+        df = _ohlc_df(rows, atr=2.0)
+        orch, ensemble = _build_orchestrator(["BUY", "HOLD", "HOLD"])
+
+        _, _, _, trades = orch._run_test_window(ensemble, df.iloc[:0], df)
+
+        assert len(trades) == 1
+        t = trades[0]
+        assert t["exit_reason"] == "stop"
+        assert t["exit_px"]     == pytest.approx(96.0)
+
+    def test_trailing_activates_then_triggers(self):
+        """Close >= entry + activation_atr × ATR → activate trail at peak-trail_amount.
+        A subsequent down-move below the trail level fires exit_reason='trailing'.
+
+        ATR=2: stop=96, tp=106, activation_dist=4, trail_dist=4.
+        Activation bar must satisfy close>=104 AND high<106 (else TP fires
+        intra-bar before activation runs).
+        """
+        rows = [
+            {"Close": 100},                                              # bar 0
+            {"Open": 100, "High": 101, "Low":  99,    "Close": 100},     # bar 1 (entry)
+            {"Open": 100, "High": 105, "Low": 100,    "Close": 104.5},   # bar 2 activate (high<106, close>=104) → peak=105, trail=101
+            {"Open": 104, "High": 104, "Low": 100,    "Close": 101},     # bar 3 trail trigger at 101
+        ]
+        df = _ohlc_df(rows, atr=2.0)
+        orch, ensemble = _build_orchestrator(["BUY", "HOLD", "HOLD", "HOLD"])
+
+        _, _, _, trades = orch._run_test_window(ensemble, df.iloc[:0], df)
+
+        assert len(trades) == 1
+        t = trades[0]
+        assert t["exit_reason"] == "trailing"
+        # Activation on bar 2: peak=105, stop=105-4=101.  On bar 3 low=100<=101 → fill at 101.
+        assert t["exit_px"] == pytest.approx(101.0)
+
+    def test_trailing_ratchet_locks_in_gains(self):
+        """Trail level monotonically tightens as peak rises.  Without the
+        ratchet, the trail set at activation (101) would let bar 4 Low=104
+        ride; with it, the ratcheted stop (106) fills at the higher level."""
+        rows = [
+            {"Close": 100},                                              # bar 0
+            {"Open": 100, "High": 101, "Low":  99,    "Close": 100},     # bar 1 entry
+            {"Open": 100, "High": 105, "Low": 100,    "Close": 104.5},   # bar 2 activate, peak=105, trail=101
+            {"Open": 104, "High": 110, "Low": 102,    "Close": 108},     # bar 3 ratchet (tp_px now None) peak=110, trail=106
+            {"Open": 107, "High": 107, "Low": 104,    "Close": 105},     # bar 4 trail trigger at 106
+        ]
+        df = _ohlc_df(rows, atr=2.0)
+        orch, ensemble = _build_orchestrator(["BUY", "HOLD", "HOLD", "HOLD", "HOLD"])
+
+        _, _, _, trades = orch._run_test_window(ensemble, df.iloc[:0], df)
+
+        assert len(trades) == 1
+        t = trades[0]
+        assert t["exit_reason"] == "trailing"
+        # Without ratcheting, stop would still be 101 and bar 4 Low=104 wouldn't fire.
+        # With ratcheting the stop is at 106 → fills at 106.
+        assert t["exit_px"] == pytest.approx(106.0)
+
+    def test_trailing_one_bar_delay(self):
+        """The new trailing-stop level set at bar t close only applies bar t+1+.
+        Today's intra-bar check always uses yesterday's end-of-bar stop level.
+
+        Bar 2 activates with close=104.5; new trail level = 101.  Bar 2's
+        intra-bar check uses the OLD stop (96), so bar 2 Low=97 (below the
+        new trail of 101 but above the old stop 96) does NOT exit.
+        Bar 3 then uses the NEW trail (101) and Low=100 fills at 101.
+        """
+        rows = [
+            {"Close": 100},                                              # bar 0
+            {"Open": 100, "High": 101, "Low":  99,    "Close": 100},     # bar 1 (entry)
+            {"Open": 100, "High": 105, "Low":  97,    "Close": 104.5},   # bar 2 activate, but no exit
+            {"Open": 102, "High": 104, "Low": 100,    "Close": 102},     # bar 3 (trail at 101)
+        ]
+        df = _ohlc_df(rows, atr=2.0)
+        orch, ensemble = _build_orchestrator(["BUY", "HOLD", "HOLD", "HOLD"])
+
+        _, _, _, trades = orch._run_test_window(ensemble, df.iloc[:0], df)
+
+        assert len(trades) == 1
+        t = trades[0]
+        # If today's High had tightened today's stop, bar 2 Low=97 vs new-stop 101
+        # would have exited there — that's the lookahead we avoid.
+        assert t["exit_reason"] == "trailing"
+        assert t["exit_px"]     == pytest.approx(101.0)
+        assert t["exit_ts"]     == df.index[3].to_pydatetime()
+
+    def test_no_same_bar_re_entry_after_stop(self):
+        """When a stop fires on bar t, a fresh BUY signal at bar t close
+        schedules entry on bar t+1 — never the same bar as the bracket exit."""
+        rows = [
+            {"Close": 100},                                          # bar 0 (1st BUY)
+            {"Open": 100, "High": 101, "Low":  99, "Close": 100},    # bar 1 (entry)
+            {"Open": 100, "High": 100, "Low":  95, "Close":  97},    # bar 2 (stop @ 96)
+            {"Open":  98, "High":  99, "Low":  97, "Close":  98},    # bar 3 (re-entry)
+            {"Open":  98, "High":  99, "Low":  97, "Close":  98},    # bar 4 (force-exit)
+        ]
+        df = _ohlc_df(rows, atr=2.0)
+        # Signal sequence: BUY at bar 0 (first entry), BUY again at bar 2 close
+        # (after stop) → must enter bar 3, never same-bar bar 2.
+        orch, ensemble = _build_orchestrator(["BUY", "HOLD", "BUY", "HOLD", "HOLD"])
+
+        _, _, _, trades = orch._run_test_window(ensemble, df.iloc[:0], df)
+
+        assert len(trades) == 2
+        # First trade: bar 1 entry, bar 2 stop.
+        assert trades[0]["exit_reason"] == "stop"
+        assert trades[0]["entry_ts"]    == df.index[1].to_pydatetime()
+        assert trades[0]["exit_ts"]     == df.index[2].to_pydatetime()
+        # Second trade: bar 3 entry — NOT bar 2 (no same-bar re-entry).
+        assert trades[1]["exit_reason"] == "fold_end"
+        assert trades[1]["entry_ts"]    == df.index[3].to_pydatetime()
+
+    def test_fold_end_force_flatten(self):
+        """A position still open at the last bar is force-closed at last bar's
+        Close with exit_reason='fold_end'."""
+        rows = [
+            {"Close": 100},                                          # bar 0
+            {"Open": 100, "High": 102, "Low":  99, "Close": 101},    # bar 1 (entry)
+            {"Open": 101, "High": 102, "Low": 100, "Close": 102},    # bar 2 (held; no bracket trigger)
+        ]
+        df = _ohlc_df(rows, atr=2.0)
+        orch, ensemble = _build_orchestrator(["BUY", "HOLD", "HOLD"])
+
+        _, _, _, trades = orch._run_test_window(ensemble, df.iloc[:0], df)
+
+        assert len(trades) == 1
+        t = trades[0]
+        assert t["exit_reason"] == "fold_end"
+        assert t["exit_px"]     == pytest.approx(102.0)
+        assert t["exit_ts"]     == df.index[-1].to_pydatetime()
+
+    def test_trade_log_record_fields_populated(self):
+        """Each trade row must have the schema fields populated for log_trades_bulk."""
+        rows = [
+            {"Close": 100},
+            {"Open": 100, "High": 101, "Low":  99, "Close": 100},
+            {"Open": 100, "High": 101, "Low":  95, "Close":  99},
+        ]
+        df = _ohlc_df(rows, atr=2.0)
+        orch, ensemble = _build_orchestrator(["BUY", "HOLD", "HOLD"])
+
+        _, _, _, trades = orch._run_test_window(
+            ensemble, df.iloc[:0], df, fold_index=3,
+        )
+
+        assert len(trades) == 1
+        t = trades[0]
+        # Schema check — every column expected by data.database.TradeLog.
+        for k in ("source", "run_id", "fold_index", "symbol", "signal",
+                  "entry_ts", "entry_px", "exit_ts", "exit_px", "exit_reason",
+                  "shares", "pnl", "pnl_pct", "costs_charged", "recorded_at"):
+            assert k in t, f"missing field: {k}"
+        assert t["source"]     == "walk_forward"
+        assert t["fold_index"] == 3
+        assert t["symbol"]     == "TEST"
+        assert t["signal"]     == "BUY"
+        assert t["shares"]     == 1.0
+        # pnl and costs_charged are denominated in entry-price-anchored dollars (1-share notional).
+        assert t["pnl"]            == pytest.approx(t["pnl_pct"] * t["entry_px"])
+        assert t["costs_charged"]  > 0

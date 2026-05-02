@@ -55,6 +55,7 @@ from data.database import (
     get_order_decisions,
     get_recent_news,
     get_signal_runner_log,
+    get_trade_log,
     get_trailing_stop_log,
     get_universe_assets,
     get_universe_run_log,
@@ -391,9 +392,9 @@ def query_data_status() -> pd.DataFrame:
             conn,
         )
 
-        # Symbols that have fundamentals
+        # Symbols that have fundamentals (table is append-only history; dedupe)
         fund_df = pd.read_sql(
-            text("SELECT symbol FROM fundamental_data"),
+            text("SELECT DISTINCT symbol FROM fundamental_data"),
             conn,
         )
 
@@ -610,3 +611,206 @@ def query_trailing_stop_log(
         "decided_at":    "Decided At",
     }
     return df.rename(columns=rename)
+
+
+# ── Trade history (closed trades from trade_log) ──────────────────────────────
+
+@st.cache_data(ttl=300)
+def query_trade_log(
+    source: str | None = None,
+    symbols: tuple[str, ...] | None = None,
+    start_date=None,
+    end_date=None,
+    exit_reasons: tuple[str, ...] | None = None,
+    run_id: str = "",
+) -> pd.DataFrame:
+    """
+    Return closed-trade rows from trade_log with derived columns.
+
+    Adds:
+      - holding_days  = (exit_ts − entry_ts).days
+      - is_long_term  = holding_days > 365
+      - net_pnl       = pnl − costs_charged
+
+    Date range is applied against exit_ts (the realisation date — what matters
+    for tax-year bucketing).  Symbols and exit_reasons are tuples so the
+    @st.cache_data hash is stable.
+    """
+    df = get_trade_log(source=source if source else None)
+    if df.empty:
+        return df
+
+    df = df.copy()
+
+    if symbols:
+        df = df[df["symbol"].isin(symbols)]
+    if start_date is not None:
+        df = df[df["exit_ts"] >= pd.Timestamp(start_date)]
+    if end_date is not None:
+        df = df[df["exit_ts"] < pd.Timestamp(end_date) + pd.Timedelta(days=1)]
+    if exit_reasons:
+        df = df[df["exit_reason"].isin(exit_reasons)]
+    if run_id:
+        df = df[df["run_id"] == run_id]
+
+    if df.empty:
+        return df
+
+    # Derived columns (computed on entry_ts/exit_ts before tz conversion so the
+    # holding_days math is in UTC — same instant in every timezone).
+    df["holding_days"] = (df["exit_ts"] - df["entry_ts"]).dt.days
+    df["is_long_term"] = df["holding_days"] > 365
+    df["net_pnl"]      = df["pnl"] - df["costs_charged"].fillna(0.0)
+
+    # Display columns shifted to local for readability.
+    df["entry_ts"]    = _to_local_series(df["entry_ts"])
+    df["exit_ts"]     = _to_local_series(df["exit_ts"])
+    df["recorded_at"] = _to_local_series(df["recorded_at"])
+
+    return df.reset_index(drop=True)
+
+
+@st.cache_data(ttl=300)
+def query_trade_summary(
+    source: str | None = None,
+    symbols: tuple[str, ...] | None = None,
+    start_date=None,
+    end_date=None,
+    exit_reasons: tuple[str, ...] | None = None,
+    run_id: str = "",
+) -> dict:
+    """
+    Aggregates for the summary cards on the Trade History page.
+
+    Returns a dict with: n_trades, gross_pnl, total_costs, net_pnl, win_rate.
+    win_rate is computed against net_pnl (i.e. fees count against you).
+    """
+    df = query_trade_log(
+        source=source, symbols=symbols,
+        start_date=start_date, end_date=end_date,
+        exit_reasons=exit_reasons, run_id=run_id,
+    )
+    if df.empty:
+        return {
+            "n_trades":    0,
+            "gross_pnl":   0.0,
+            "total_costs": 0.0,
+            "net_pnl":     0.0,
+            "win_rate":    0.0,
+        }
+    n_trades  = len(df)
+    gross_pnl = float(df["pnl"].sum())
+    total_costs = float(df["costs_charged"].fillna(0.0).sum())
+    net_pnl   = float(df["net_pnl"].sum())
+    n_wins    = int((df["net_pnl"] > 0).sum())
+    win_rate  = n_wins / n_trades if n_trades else 0.0
+    return {
+        "n_trades":    n_trades,
+        "gross_pnl":   gross_pnl,
+        "total_costs": total_costs,
+        "net_pnl":     net_pnl,
+        "win_rate":    win_rate,
+    }
+
+
+@st.cache_data(ttl=300)
+def query_tax_breakdown(
+    source: str | None = None,
+    symbols: tuple[str, ...] | None = None,
+    start_date=None,
+    end_date=None,
+    exit_reasons: tuple[str, ...] | None = None,
+    run_id: str = "",
+) -> dict:
+    """
+    Short-term vs long-term realised gain/loss aggregates.
+
+    Tax rates are intentionally NOT applied here — they live in the page's
+    session state so the user can fiddle without invalidating cache.
+
+    Returns a dict with eight figures (all dollar amounts, all positive
+    magnitudes for gains/losses), plus the net of each class:
+      st_gain, st_loss, st_net,
+      lt_gain, lt_loss, lt_net,
+      total_net, n_st, n_lt
+    """
+    df = query_trade_log(
+        source=source, symbols=symbols,
+        start_date=start_date, end_date=end_date,
+        exit_reasons=exit_reasons, run_id=run_id,
+    )
+    if df.empty:
+        return {
+            "st_gain": 0.0, "st_loss": 0.0, "st_net": 0.0,
+            "lt_gain": 0.0, "lt_loss": 0.0, "lt_net": 0.0,
+            "total_net": 0.0, "n_st": 0, "n_lt": 0,
+        }
+    st_df = df[~df["is_long_term"]]
+    lt_df = df[ df["is_long_term"]]
+
+    st_gain = float(st_df.loc[st_df["net_pnl"] > 0, "net_pnl"].sum())
+    st_loss = float(-st_df.loc[st_df["net_pnl"] < 0, "net_pnl"].sum())
+    lt_gain = float(lt_df.loc[lt_df["net_pnl"] > 0, "net_pnl"].sum())
+    lt_loss = float(-lt_df.loc[lt_df["net_pnl"] < 0, "net_pnl"].sum())
+
+    return {
+        "st_gain": st_gain, "st_loss": st_loss, "st_net": st_gain - st_loss,
+        "lt_gain": lt_gain, "lt_loss": lt_loss, "lt_net": lt_gain - lt_loss,
+        "total_net": (st_gain - st_loss) + (lt_gain - lt_loss),
+        "n_st": int(len(st_df)),
+        "n_lt": int(len(lt_df)),
+    }
+
+
+@st.cache_data(ttl=300)
+def query_trade_log_filter_options() -> dict:
+    """
+    Distinct values present in trade_log for populating page filters.
+
+    Returns: {"symbols": [...], "exit_reasons": [...], "sources": [...]}
+    Each list is sorted; empty lists when the table has no rows yet.
+    """
+    df = get_trade_log()
+    if df.empty:
+        return {"symbols": [], "exit_reasons": [], "sources": []}
+    return {
+        "symbols":      sorted(df["symbol"].dropna().unique().tolist()),
+        "exit_reasons": sorted(df["exit_reason"].dropna().unique().tolist()),
+        "sources":      sorted(df["source"].dropna().unique().tolist()),
+    }
+
+
+@st.cache_data(ttl=60)
+def query_distinct_trade_log_run_ids(limit: int = 20) -> list[dict]:
+    """
+    Return the most recent distinct run_ids in trade_log, newest first.
+
+    Each dict has: run_id, source, latest (datetime in local tz), n_trades.
+    Different from query_distinct_run_ids (Page 8) — those are signal_runner
+    run_ids from order_decisions; these come from trade_log and today are
+    walk_forward training run_ids.  Once Phase B lands, source='live' rows
+    will share run_ids with the signal_runner table.
+    """
+    from sqlalchemy import text
+    engine = get_engine()
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT run_id, source,
+                   MAX(recorded_at) AS latest,
+                   COUNT(*)         AS n_trades
+            FROM trade_log
+            WHERE run_id IS NOT NULL
+            GROUP BY run_id, source
+            ORDER BY latest DESC
+            LIMIT :limit
+        """), {"limit": limit}).fetchall()
+    out = []
+    for r in rows:
+        latest = pd.to_datetime(r[2]) if r[2] is not None else None
+        out.append({
+            "run_id":   r[0],
+            "source":   r[1],
+            "latest":   _to_local_dt(latest.to_pydatetime()) if latest is not None else None,
+            "n_trades": int(r[3]),
+        })
+    return out

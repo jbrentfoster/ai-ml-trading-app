@@ -15,13 +15,14 @@ Tables:
   equity_snapshots        — daily NLV snapshot for circuit-breaker baseline
   order_decisions         — per-signal order decisions from OrderManager
   signal_runner_log       — daily signal_runner.py run summaries
+  trade_log               — closed-trade outcomes (walk-forward simulator + live fills)
 
 All timestamps are stored as UTC-naive datetimes.
 """
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -45,6 +46,10 @@ from core.logger import get_logger
 log = get_logger("data.database")
 
 
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
 # ── ORM models ────────────────────────────────────────────────────────────────
 
 class Base(DeclarativeBase):
@@ -63,7 +68,7 @@ class OHLCVBar(Base):
     low       = Column(Float,      nullable=False)
     close     = Column(Float,      nullable=False)
     volume    = Column(Float,      nullable=False)
-    created_at = Column(DateTime,  default=datetime.utcnow)
+    created_at = Column(DateTime,  default=_utc_now)
 
     __table_args__ = (
         UniqueConstraint("symbol", "interval", "timestamp", name="uq_bar"),
@@ -95,7 +100,7 @@ class IndicatorSnapshot(Base):
     atr_14       = Column(Float)
     volume_sma_20 = Column(Float)
 
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=_utc_now)
 
     __table_args__ = (
         UniqueConstraint("symbol", "interval", "timestamp", name="uq_indicator"),
@@ -103,11 +108,16 @@ class IndicatorSnapshot(Base):
 
 
 class FundamentalData(Base):
-    """Snapshot of yfinance fundamental metrics per symbol."""
+    """Snapshot of yfinance fundamental metrics — append-only history.
+
+    Multiple rows per symbol are expected; readers should order by
+    ``fetched_at DESC`` to get the latest snapshot. The 24h cache check
+    in ``FundamentalsClient.get`` prevents duplicate same-day inserts.
+    """
     __tablename__ = "fundamental_data"
 
     id         = Column(Integer, primary_key=True, autoincrement=True)
-    symbol     = Column(String(10), nullable=False, unique=True)
+    symbol     = Column(String(10), nullable=False, index=True)
     fetched_at = Column(DateTime,   nullable=False)
 
     # Valuation
@@ -334,6 +344,39 @@ class TrailingStopLog(Base):
     decided_at     = Column(DateTime, nullable=False)
 
 
+class TradeLog(Base):
+    """
+    Closed-trade outcomes for both the walk-forward simulator and live fills.
+
+    Phase A populates rows with source='walk_forward' from
+    MLWalkForwardOrchestrator's bracket simulation.  Phase B will add
+    source='live' rows from IBKRConnection fill subscriptions.  Phase C reads
+    these rows (filtered to entry_ts < as_of for forward-only safety) to
+    compute realised-Kelly position sizing.
+
+    exit_reason ∈ {'stop', 'tp', 'trailing', 'signal_flip', 'fold_end',
+                    'manual_close'}.
+    """
+    __tablename__ = "trade_log"
+
+    id            = Column(Integer, primary_key=True, autoincrement=True)
+    source        = Column(String(20), nullable=False)   # 'walk_forward' | 'live'
+    run_id        = Column(String(36))
+    fold_index    = Column(Integer)
+    symbol        = Column(String(10), nullable=False)
+    signal        = Column(String(10), nullable=False)   # 'BUY' | 'SELL'
+    entry_ts      = Column(DateTime, nullable=False)
+    entry_px      = Column(Float,    nullable=False)
+    exit_ts       = Column(DateTime, nullable=False)
+    exit_px       = Column(Float,    nullable=False)
+    exit_reason   = Column(String(20), nullable=False)
+    shares        = Column(Float,    nullable=False)
+    pnl           = Column(Float,    nullable=False)
+    pnl_pct       = Column(Float,    nullable=False)
+    costs_charged = Column(Float,    default=0.0)
+    recorded_at   = Column(DateTime, nullable=False)
+
+
 # ── Engine (lazy singleton) ───────────────────────────────────────────────────
 
 _engine = None
@@ -409,6 +452,59 @@ def _migrate(engine) -> None:
                 ))
                 conn.commit()
                 log.info("Migration applied: signal_runner_log.skipped_stale")
+
+        # fundamental_data: drop UNIQUE(symbol) so the table can hold append-only
+        # snapshot history (needed for derived features like analyst-target
+        # revisions). SQLite cannot drop a column constraint in place — rebuild
+        # the table once, preserving existing rows. Detect via the original
+        # CREATE TABLE DDL (auto-generated UNIQUE indexes have sql=NULL, so
+        # we can't rely on sqlite_master.indexes; check the table DDL instead).
+        if "fundamental_data" in insp.get_table_names():
+            ddl = conn.execute(text(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type='table' AND name='fundamental_data'"
+            )).scalar() or ""
+            if "UNIQUE" in ddl.upper() or "sqlite_autoindex_fundamental_data" in {
+                row[0] for row in conn.execute(text(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='index' AND tbl_name='fundamental_data' AND sql IS NULL"
+                )).fetchall()
+            }:
+                log.info("Migration applied: fundamental_data -> append-only (rebuilding table)")
+                conn.execute(text("""
+                    CREATE TABLE fundamental_data_new (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        symbol VARCHAR(10) NOT NULL,
+                        fetched_at DATETIME NOT NULL,
+                        market_cap FLOAT,
+                        pe_ratio FLOAT,
+                        forward_pe FLOAT,
+                        price_to_book FLOAT,
+                        ev_to_ebitda FLOAT,
+                        revenue_growth FLOAT,
+                        earnings_growth FLOAT,
+                        profit_margin FLOAT,
+                        roe FLOAT,
+                        debt_to_equity FLOAT,
+                        current_ratio FLOAT,
+                        free_cashflow FLOAT,
+                        analyst_target FLOAT
+                    )
+                """))
+                conn.execute(text("""
+                    INSERT INTO fundamental_data_new
+                    SELECT id, symbol, fetched_at, market_cap, pe_ratio, forward_pe,
+                           price_to_book, ev_to_ebitda, revenue_growth, earnings_growth,
+                           profit_margin, roe, debt_to_equity, current_ratio,
+                           free_cashflow, analyst_target
+                    FROM fundamental_data
+                """))
+                conn.execute(text("DROP TABLE fundamental_data"))
+                conn.execute(text("ALTER TABLE fundamental_data_new RENAME TO fundamental_data"))
+                conn.execute(text(
+                    "CREATE INDEX ix_fundamental_data_symbol ON fundamental_data (symbol)"
+                ))
+                conn.commit()
 
 
 # ── OHLCV helpers ─────────────────────────────────────────────────────────────
@@ -569,27 +665,53 @@ def get_latest_indicators(symbol: str, interval: str) -> dict | None:
 # ── Fundamental helpers ───────────────────────────────────────────────────────
 
 def upsert_fundamentals(symbol: str, data: dict) -> None:
-    """Insert or replace the fundamental snapshot for `symbol`."""
+    """Append a fundamental snapshot row for `symbol`.
+
+    Always inserts a new row (the table is append-only history). The 24h
+    cache in ``FundamentalsClient.get`` is what prevents same-day duplicates.
+    Function name kept for caller compatibility; behaviour is now insert-only.
+    """
     engine = get_engine()
     with Session(engine) as session:
-        row = session.query(FundamentalData).filter_by(symbol=symbol).first()
-        if row is None:
-            row = FundamentalData(symbol=symbol)
-            session.add(row)
+        row = FundamentalData(symbol=symbol)
         for k, v in data.items():
             if hasattr(row, k):
                 setattr(row, k, v)
+        session.add(row)
         session.commit()
 
 
 def get_fundamentals(symbol: str) -> dict | None:
-    """Return the stored fundamental snapshot or None."""
+    """Return the latest stored fundamental snapshot for `symbol`, or None."""
     engine = get_engine()
     with Session(engine) as session:
-        row = session.query(FundamentalData).filter_by(symbol=symbol).first()
+        row = (
+            session.query(FundamentalData)
+            .filter_by(symbol=symbol)
+            .order_by(FundamentalData.fetched_at.desc())
+            .first()
+        )
     if not row:
         return None
     return {c.name: getattr(row, c.name) for c in FundamentalData.__table__.columns}
+
+
+def get_fundamentals_history(symbol: str, limit: int | None = None) -> list[dict]:
+    """Return all stored fundamental snapshots for `symbol`, newest first."""
+    engine = get_engine()
+    with Session(engine) as session:
+        q = (
+            session.query(FundamentalData)
+            .filter_by(symbol=symbol)
+            .order_by(FundamentalData.fetched_at.desc())
+        )
+        if limit is not None:
+            q = q.limit(limit)
+        rows = q.all()
+    return [
+        {c.name: getattr(r, c.name) for c in FundamentalData.__table__.columns}
+        for r in rows
+    ]
 
 
 # ── News / sentiment helpers ──────────────────────────────────────────────────
@@ -1032,4 +1154,77 @@ def get_trailing_stop_log(
         "trail_amount":  r.trail_amount,
         "reason":        r.reason,
         "decided_at":    r.decided_at,
+    } for r in rows])
+
+
+# ── Trade log helpers ─────────────────────────────────────────────────────────
+
+def log_trade(record: dict) -> None:
+    """Persist one closed trade to trade_log."""
+    engine = get_engine()
+    with Session(engine) as session:
+        session.add(TradeLog(**record))
+        session.commit()
+
+
+def log_trades_bulk(records: list[dict]) -> int:
+    """Persist multiple closed trades in a single transaction.
+
+    Used by MLWalkForwardOrchestrator at the end of each fold to write all
+    simulated trades together rather than one round-trip per trade.
+    Returns the number of rows inserted.
+    """
+    if not records:
+        return 0
+    engine = get_engine()
+    with Session(engine) as session:
+        session.add_all([TradeLog(**r) for r in records])
+        session.commit()
+    return len(records)
+
+
+def get_trade_log(
+    symbol: str | None = None,
+    source: str | None = None,
+    before_ts: datetime | None = None,
+    limit: int | None = None,
+) -> pd.DataFrame:
+    """Return trade_log entries with optional filters, newest first.
+
+    Phase C uses ``before_ts`` to enforce the forward-only invariant when
+    computing realised-Kelly sizing (only trades that closed before the
+    current bar's timestamp are eligible).
+    """
+    engine = get_engine()
+    with Session(engine) as session:
+        q = session.query(TradeLog)
+        if symbol:
+            q = q.filter(TradeLog.symbol == symbol)
+        if source:
+            q = q.filter(TradeLog.source == source)
+        if before_ts is not None:
+            q = q.filter(TradeLog.entry_ts < before_ts)
+        q = q.order_by(desc(TradeLog.entry_ts))
+        if limit:
+            q = q.limit(limit)
+        rows = q.all()
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame([{
+        "id":            r.id,
+        "source":        r.source,
+        "run_id":        r.run_id,
+        "fold_index":    r.fold_index,
+        "symbol":        r.symbol,
+        "signal":        r.signal,
+        "entry_ts":      r.entry_ts,
+        "entry_px":      r.entry_px,
+        "exit_ts":       r.exit_ts,
+        "exit_px":       r.exit_px,
+        "exit_reason":   r.exit_reason,
+        "shares":        r.shares,
+        "pnl":           r.pnl,
+        "pnl_pct":       r.pnl_pct,
+        "costs_charged": r.costs_charged,
+        "recorded_at":   r.recorded_at,
     } for r in rows])

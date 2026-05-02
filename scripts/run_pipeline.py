@@ -92,7 +92,7 @@ def main(interval: str = "1d", skip_news: bool = False,
     if skip_news:
         print()
         print("Done.  Start the dashboard with:")
-        print("  streamlit run dashboard/app.py")
+        print("  streamlit run dashboard/1_Market_Data.py")
         return
 
     # ── News fetch ────────────────────────────────────────────────────────────
@@ -156,7 +156,7 @@ def main(interval: str = "1d", skip_news: bool = False,
 
     print()
     print("Done.  Start the dashboard with:")
-    print("  streamlit run dashboard/app.py")
+    print("  streamlit run dashboard/1_Market_Data.py")
 
 
 if __name__ == "__main__":

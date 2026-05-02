@@ -160,4 +160,4 @@ class XGBoostModel(BaseModel):
             self._symbol          = meta.get("symbol", self._symbol)
             self._feature_columns = meta.get("feature_columns", self._feature_columns)
 
-        log.info("XGBoost loaded from %s", path)
+        log.debug("XGBoost loaded from %s", path)

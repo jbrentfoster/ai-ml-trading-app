@@ -179,8 +179,14 @@ class EnsembleModel:
         )
 
     def _normalise_weights(self) -> None:
-        """Apply floor then re-normalise so weights sum to 1."""
-        for m in _MODELS:
+        """Apply floor to LSTM/XGBoost only, then re-normalise so weights sum to 1.
+
+        FinBERT's weight is intentionally coverage-driven (set to
+        ``configured_base × finbert_coverage`` in :meth:`rebalance`); flooring
+        it would defeat that scaling — a 0-coverage symbol must contribute 0,
+        not the floor minimum.
+        """
+        for m in ("lstm", "xgb"):
             self.weights[m] = max(self._floor, self.weights[m])
         total = sum(self.weights.values())
         for m in _MODELS:
@@ -200,4 +206,4 @@ class EnsembleModel:
         base = Path(directory)
         self._lstm.load(base / "lstm.pt")
         self._xgb.load(base / "xgb.ubj")
-        log.info("Ensemble models loaded from %s", base)
+        log.debug("Ensemble models loaded from %s", base)

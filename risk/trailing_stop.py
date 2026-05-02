@@ -105,7 +105,23 @@ class TrailingStopManager:
         for pos in positions:
             shares = int(pos.get("quantity", 0) or 0)
             if shares <= 0:
-                continue  # long-only for now
+                # Long-only codepath.  Surface the skip explicitly so an
+                # unexpected short (e.g. an orphan bracket leg that fired
+                # after a market close) shows up in the daily log instead
+                # of vanishing silently.
+                action = TrailingStopAction(
+                    symbol=pos.get("symbol", "?"),
+                    action="SKIPPED",
+                    shares=shares,
+                    reason=(
+                        f"non-long position (quantity={shares}) — "
+                        "long-only trailing stops"
+                    ),
+                )
+                action.run_id = run_id
+                actions.append(action)
+                self._persist(action)
+                continue
             action = self._evaluate_position(pos, shares, open_orders)
             if action is not None:
                 action.run_id = run_id

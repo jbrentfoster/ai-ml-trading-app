@@ -12,8 +12,19 @@ Returns 0.0 when:
 from __future__ import annotations
 
 import math
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+# Silence HuggingFace startup noise BEFORE transformers/huggingface_hub are
+# imported anywhere.  Without these, FinBERT load spams the daily log with:
+#   * tqdm "Loading weights: ... 201/201" progress bar
+#   * "BertForSequenceClassification LOAD REPORT" verbose model-load summary
+#   * "You are sending unauthenticated requests to the HF Hub" warning
+# All three go to stdout/stderr and end up in the daily batch-file log.
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 
 import pandas as pd
 
@@ -49,6 +60,8 @@ class FinBERTModel(BaseModel):
                 or FinBERTModel._shared_model_name != self._model_name):
             try:
                 from transformers import pipeline  # type: ignore
+                from transformers import logging as hf_logging  # type: ignore
+                hf_logging.set_verbosity_error()
                 FinBERTModel._shared_pipeline = pipeline(
                     "text-classification",
                     model=self._model_name,

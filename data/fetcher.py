@@ -57,7 +57,7 @@ class DataFetcher:
             )
 
         start = (datetime.now(timezone.utc) - timedelta(days=days_back)).strftime("%Y-%m-%d")
-        log.info("Fetching %s | interval=%s | start=%s", symbol, interval, start)
+        log.debug("Fetching %s | interval=%s | start=%s", symbol, interval, start)
 
         try:
             raw = yf.Ticker(symbol).history(
@@ -73,7 +73,11 @@ class DataFetcher:
 
         df = self._normalise(raw)
         n = upsert_bars(df, symbol, interval)
-        log.info("Stored %d new bar(s) for %s (%s)", n, symbol, interval)
+        # n=0 is the steady-state no-op (data already current); only surface real activity.
+        if n > 0:
+            log.info("Stored %d new bar(s) for %s (%s)", n, symbol, interval)
+        else:
+            log.debug("Stored 0 new bar(s) for %s (%s) — already current", symbol, interval)
 
         return get_bars(symbol, interval, limit=max(days_back * 2, 500))
 

@@ -7,7 +7,7 @@
 # This floods the terminal with hundreds of ModuleNotFoundError lines.
 #
 # Trade-off: you must manually restart the app (Ctrl-C, then re-run
-# `streamlit run dashboard/app.py`) after editing source files.
+# `streamlit run dashboard/1_Market_Data.py`) after editing source files.
 fileWatcherType = "none"
 
 [browser]

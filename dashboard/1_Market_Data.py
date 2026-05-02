@@ -5,7 +5,7 @@ Candlestick chart with overlay toggles, RSI, MACD, ATR panels,
 volume bar chart, and a full OHLCV + indicator data table with CSV export.
 
 Run with:
-    streamlit run dashboard/app.py
+    streamlit run dashboard/1_Market_Data.py
 """
 
 from __future__ import annotations

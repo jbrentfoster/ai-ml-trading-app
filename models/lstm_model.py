@@ -138,6 +138,7 @@ class LSTMModel(BaseModel):
         self._epochs      = cfg.lstm_epochs
         self._batch_size  = cfg.lstm_batch_size
         self._lr          = cfg.lstm_learning_rate
+        self._seed        = cfg.lstm_random_seed
 
         self._dataset  = DatasetBuilder(self._seq_len, _FEATURE_COLS)
         self._net: _LSTMNet | None = None
@@ -150,6 +151,10 @@ class LSTMModel(BaseModel):
         import torch
         import torch.nn as nn
         from torch.utils.data import DataLoader, TensorDataset
+
+        if self._seed is not None:
+            torch.manual_seed(self._seed)
+            np.random.seed(self._seed)
 
         self._dataset.fit(train_df)
         X, y = self._dataset.build(train_df)
@@ -293,4 +298,4 @@ class LSTMModel(BaseModel):
             std_raw = pd.Series(std_raw.numpy(), index=cols)
         self._dataset._mean = mean_raw
         self._dataset._std  = std_raw
-        log.info("LSTM loaded from %s", path)
+        log.debug("LSTM loaded from %s", path)

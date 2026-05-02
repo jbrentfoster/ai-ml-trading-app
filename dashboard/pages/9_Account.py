@@ -1,13 +1,12 @@
 """
-Account & Portfolio — Page 5
+Account & Portfolio — Page 9
 ==============================
 Shows live IBKR account summary, open positions (enriched with live prices
-via yfinance), open orders, recent executed signals from SQLite, and a
-daily P&L chart if signal history exists.
+via yfinance and risk levels from `order_decisions`), and open orders.
 
 Connects to TWS on demand when the user clicks Refresh — no persistent
 connection is held between renders.  If TWS is not running the page
-degrades gracefully to show cached/signal data only.
+shows the connection error and waits for the next refresh.
 """
 
 from __future__ import annotations
@@ -26,7 +25,6 @@ asyncio.set_event_loop(asyncio.new_event_loop())
 
 from config.settings import config, TradingMode
 from data.database import get_latest_risk_levels
-from data.ui_queries import query_signal_log
 
 # ── Page config ───────────────────────────────────────────────────────────────
 
@@ -393,51 +391,6 @@ if st.session_state.ibkr_data:
             }),
             use_container_width=True,
         )
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SIGNAL HISTORY (always shown — no TWS required)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-st.markdown("---")
-st.subheader("Recent Executed Signals")
-
-sig_df = query_signal_log(limit=200)
-
-if sig_df.empty:
-    st.info(
-        "No signals in the database yet.  "
-        "Run the ML pipeline to generate and log signals."
-    )
-else:
-    # ── Executed (gate-passing) signals ───────────────────────────────────────
-    executed = sig_df[sig_df["Passed Gate"] == True].copy()  # noqa: E712
-
-    if executed.empty:
-        st.info("No gate-passing signals logged yet.")
-    else:
-        st.markdown("Signals where all three gate filters were satisfied:")
-
-        exec_cols = ["Date", "Symbol", "Signal", "Ensemble Score",
-                     "LSTM Score", "XGB Score", "FinBERT Score", "Regime"]
-        exec_cols = [c for c in exec_cols if c in executed.columns]
-
-        def _sig_style(val) -> str:
-            if val == "BUY":
-                return "background-color: rgba(38,166,154,0.2); color: #26a69a; font-weight:bold"
-            if val == "SELL":
-                return "background-color: rgba(239,83,80,0.2); color: #ef5350; font-weight:bold"
-            return ""
-
-        score_cols = [c for c in ["Ensemble Score", "LSTM Score", "XGB Score", "FinBERT Score"]
-                      if c in executed.columns]
-        st.dataframe(
-            executed[exec_cols].style
-                .map(_sig_style, subset=["Signal"])
-                .format({c: "{:+.3f}" for c in score_cols}, na_rep="—"),
-            use_container_width=True,
-            height=min(40 + len(executed) * 38, 400),
-        )
-
 
 # ── Footer ────────────────────────────────────────────────────────────────────
 

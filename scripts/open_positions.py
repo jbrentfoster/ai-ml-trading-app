@@ -20,8 +20,9 @@ Usage — closing (requires `--close` + one selector):
 
 Notes:
   * `--qty` is only valid with a single `--symbol` (can't split a qty across symbols).
-  * Only long positions are closed (short positions are ignored with a warning).
-  * Each close is a market SELL order — fills at the next available price.
+  * Long positions are flattened with a market SELL; short positions with a
+    market BUY (cover).  Either way the position ends at zero shares.
+  * Each close fills at the next available price.
 
 Pre-requisites:
   * IB Gateway is running and API connections are enabled
@@ -115,22 +116,25 @@ async def run(
     else:
         targets = [s.upper() for s in (symbols or [])]
 
-    # Validate & filter to long positions only
-    to_close: list[tuple[str, int]] = []   # (symbol, qty_to_sell)
+    # Validate & resolve closing action per symbol.  Longs flatten with SELL;
+    # shorts cover with BUY.  qty (if given) is the absolute share count.
+    to_close: list[tuple[str, str, int]] = []   # (symbol, action, qty)
     for sym in targets:
         if sym not in pos_map:
             print(f"{WARN} No open position for {sym} — skipping.")
             continue
         held = int(pos_map[sym])
-        if held <= 0:
-            print(f"{WARN} {sym}: position is {held} shares (short or flat) — skipping.")
+        if held == 0:
+            print(f"{WARN} {sym}: position is flat — skipping.")
             continue
 
-        sell_qty = qty if (qty is not None and len(targets) == 1) else held
-        if sell_qty > held:
-            print(f"{WARN} {sym}: requested qty {sell_qty} > held {held}. Capping to {held}.")
-            sell_qty = held
-        to_close.append((sym, sell_qty))
+        action = "SELL" if held > 0 else "BUY"
+        held_abs = abs(held)
+        close_qty = qty if (qty is not None and len(targets) == 1) else held_abs
+        if close_qty > held_abs:
+            print(f"{WARN} {sym}: requested qty {close_qty} > held {held_abs}. Capping to {held_abs}.")
+            close_qty = held_abs
+        to_close.append((sym, action, close_qty))
 
     if not to_close:
         print(f"{FAIL} Nothing to close.")
@@ -139,20 +143,20 @@ async def run(
 
     # Confirm for --all
     if close_all and not skip_confirm:
-        preview = ", ".join(f"{s} x{q}" for s, q in to_close)
+        preview = ", ".join(f"{a} {s} x{q}" for s, a, q in to_close)
         resp = input(f"Close ALL {len(to_close)} positions ({preview})? [y/N] ").strip().lower()
         if resp not in ("y", "yes"):
             print("Aborted.")
             await conn.disconnect()
             return False
 
-    # ── Place market sell orders ──────────────────────────────────────────────
+    # ── Place market orders ───────────────────────────────────────────────────
     print(f"Closing {len(to_close)} position(s) …")
     filled = 0
-    for sym, sell_qty in to_close:
-        print(f"  SELL {sell_qty} {sym} @ MKT …")
+    for sym, action, close_qty in to_close:
+        print(f"  {action} {close_qty} {sym} @ MKT …")
         try:
-            order = await conn.place_market_order(sym, "SELL", sell_qty)
+            order = await conn.place_market_order(sym, action, close_qty)
             print(f"    {PASS} {order}")
             filled += 1
         except Exception as exc:

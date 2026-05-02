@@ -477,6 +477,71 @@ class TestOrderManager:
             config.trading.allow_short_selling  = original_short
             config.trading.paper_orders_enabled = original_enabled
 
+    def test_close_long_cancels_orphan_bracket_children(self, mem_engine):
+        """SELL + held long must cancel any open SELL LMT (TP) and SELL STP
+        legs before flattening.  Without this, the orphan stops remain live
+        and a later trigger opens an unintended SHORT against zero shares —
+        exactly the SLV bug from 2026-04-29."""
+        import asyncio
+        from config.settings import config
+        from risk.order_manager import OrderManager
+
+        original_short   = config.trading.allow_short_selling
+        original_enabled = config.trading.paper_orders_enabled
+        config.trading.allow_short_selling  = False
+        config.trading.paper_orders_enabled = True
+
+        try:
+            loop = asyncio.new_event_loop()
+
+            async def _orders():
+                return [
+                    {"order_id": 100, "symbol": "AAPL", "action": "SELL",
+                     "order_type": "LMT", "limit_price": 220.0, "stop_price": None},
+                    {"order_id": 101, "symbol": "AAPL", "action": "SELL",
+                     "order_type": "STP", "limit_price": None, "stop_price": 170.0},
+                    # Unrelated orders that must NOT be cancelled
+                    {"order_id": 200, "symbol": "MSFT", "action": "SELL",
+                     "order_type": "STP", "limit_price": None, "stop_price": 380.0},
+                    {"order_id": 201, "symbol": "AAPL", "action": "BUY",
+                     "order_type": "LMT", "limit_price": 180.0, "stop_price": None},
+                ]
+
+            async def _cancel(order_id):
+                return True
+
+            async def _market(*_a, **_k):
+                return True
+
+            ibkr_mock = MagicMock()
+            ibkr_mock.get_open_orders = MagicMock(side_effect=lambda: _orders())
+            ibkr_mock.cancel_order    = MagicMock(side_effect=lambda oid: _cancel(oid))
+            ibkr_mock.place_market_order = MagicMock(side_effect=lambda *a, **k: _market())
+
+            mgr = OrderManager(
+                ibkr_connection=ibkr_mock, dry_run=False, event_loop=loop,
+            )
+            positions = {"AAPL": {"shares": 25, "entry_price": 180.0, "current_price": 190.0}}
+
+            with patch("risk.order_manager.OrderManager._get_latest_close", return_value=190.0):
+                decision = mgr.process(
+                    signal_result=self._signal_result("AAPL", "SELL"),
+                    equity=100_000,
+                    positions=positions,
+                )
+
+            assert decision.decision == "CLOSED_LONG"
+            cancelled_ids = [c.args[0] for c in ibkr_mock.cancel_order.call_args_list]
+            assert 100 in cancelled_ids   # SELL LMT (TP) cancelled
+            assert 101 in cancelled_ids   # SELL STP cancelled
+            assert 200 not in cancelled_ids  # different symbol untouched
+            assert 201 not in cancelled_ids  # BUY LMT untouched
+            ibkr_mock.place_market_order.assert_called_once()
+            loop.close()
+        finally:
+            config.trading.allow_short_selling  = original_short
+            config.trading.paper_orders_enabled = original_enabled
+
     def test_sell_signal_ignored_when_no_long_held(self, mem_engine):
         """SELL + no existing position → REJECTED_NO_POSITION, no order placed."""
         from config.settings import config

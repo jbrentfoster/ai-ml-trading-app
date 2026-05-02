@@ -154,6 +154,7 @@ class MLConfig:
     lstm_epochs:          int  = 50
     lstm_batch_size:      int  = 32
     lstm_learning_rate:   float = 1e-3
+    lstm_random_seed:     int | None = 42   # set to None for non-deterministic training
 
     # ── XGBoost ───────────────────────────────────────────────────────────────
     xgb_n_estimators:    int   = 300
@@ -261,6 +262,20 @@ class RiskConfig:
     # atr_stop_multiplier so the initial trail stop isn't looser than the
     # bracket's original stop)
     trailing_stop_trail_atr: float = 2.0
+
+    # ── Walk-forward bracket simulation (Phase 4.5 — Phase A) ────────────────
+    # When the walk-forward simulator fills a stop intra-bar, the realised
+    # exit price is worse than the trigger by `stop_slippage_multiplier × slippage_pct`.
+    # Gap-through stops (Open already through the trigger) are NOT charged
+    # this extra — the gap itself IS the slippage.  Default 2.0 reflects the
+    # typical relationship between a quiet quote and a stop-hunt fill.
+    stop_slippage_multiplier: float = 2.0
+
+    # ── Realised-Kelly (Phase C — not yet wired) ─────────────────────────────
+    # Minimum closed trades for `compute_realised_kelly` to produce a sized
+    # output; below this threshold, PositionSizer falls back to the
+    # |ensemble_score| proxy used today.
+    min_trades_for_realised_kelly: int = 30
 
 
 @dataclass
