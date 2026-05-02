@@ -144,8 +144,9 @@ streamlit run dashboard/1_Market_Data.py
 | **5 — Settings** | Full YAML config editor: data, universe, trading, ML, news, IBKR, logging |
 | **6 — Data Status** | One row per symbol — bar counts, news coverage by source, model status |
 | **7 — Universe** | Funnel overview, active candidates, size history, manual refresh controls |
-| **8 — Risk & Portfolio** | Circuit breaker, signal runner log, order decisions + position summary, risk config |
-| **Account** | Live IBKR account summary, positions, orders (requires active IB Gateway/TWS) |
+| **8 — Risk & Portfolio** | Circuit breaker, signal runner log, order decisions, trailing-stop log, risk config |
+| **9 — Account** | Live IBKR account summary, positions, orders (requires active IB Gateway/TWS) |
+| **10 — Trade History** | Closed trades from `trade_log` (WF-simulated + live fills): net P&L, indicative ST/LT tax view, exit-reason breakdown, per-symbol stats |
 
 ---
 
@@ -202,7 +203,7 @@ Open PowerShell **as Administrator** and run:
 
 ```powershell
 # Mon–Sat at 09:40 AM
-schtasks /create /tn "TradingApp\DailyRun" /tr '"C:\Users\jbren\OneDrive\Documents\VS_Code\trading_app\run_daily.bat"' /sc WEEKLY /d MON,TUE,WED,THU,FRI,SAT /st 09:40 /rl HIGHEST /f
+schtasks /create /tn "TradingApp\DailyRun" /tr '"C:\Users\jbren\OneDrive\Documents\VS_Code\trading_app\run_daily.bat"' /sc WEEKLY /d MON,TUE,WED,THU,FRI /st 09:40 /rl HIGHEST /f
 
 # Sunday at 01:00 AM
 schtasks /create /tn "TradingApp\WeeklyRun" /tr '"C:\Users\jbren\OneDrive\Documents\VS_Code\trading_app\run_weekly.bat"' /sc WEEKLY /d SUN /st 01:00 /rl HIGHEST /f
@@ -298,14 +299,16 @@ Key settings:
 | `trading.mode` | SIMULATION | SIMULATION or LIVE |
 | `trading.paper_equity` | $100,000 | Assumed equity for dry-run sizing when no IBKR connection |
 | `trading.cash_reserve_pct` | 0.20 | Fraction of equity kept in cash; positions sized against the rest |
-| `trading.max_position_size_pct` | 0.05 | Hard cap on any single position (5% of equity) |
 | `trading.paper_orders_enabled` | False | Set True to submit to IBKR paper account |
+| `trading.allow_short_selling` | False | When False, SELL signals only close existing longs — never open shorts |
 | `ml.signal_threshold` | 0.35 | Minimum ensemble score to generate a signal |
 | `ml.signal_confirmation` | 2 | Models that must agree (of 3) |
 | `ml.wf_n_splits` | 5 | Walk-forward folds per training run |
 | `risk.kelly_fraction` | 0.25 | Quarter-Kelly multiplier for position sizing |
+| `risk.kelly_max_position_pct` | 0.10 | Hard cap on any single position regardless of Kelly output (10%) |
 | `risk.atr_stop_multiplier` | 2.0 | Stop = entry ± ATR × this |
 | `risk.atr_take_profit_multiplier` | 3.0 | Take-profit = entry ± ATR × this |
+| `risk.max_bar_staleness_days` | 3 | Drop a symbol if its newest cached bar is older than this (handles weekends without false positives) |
 | `risk.circuit_breaker_daily_loss_pct` | 0.03 | 3% daily loss triggers trading halt |
 | `risk.trailing_stop_enabled` | False | Opt-in: convert bracket TPs to trailing stops once a position is +N ATR in profit |
 | `risk.trailing_stop_activation_atr` | 2.0 | Convert once `price ≥ entry + N × ATR` |
@@ -346,19 +349,21 @@ signal_runner.py    →  loads checkpoints, generates signals, logs decisions
 
 ## Risk management
 
-Every signal passes through a seven-check sequential guard before an order is considered:
+Before any guard runs, signal generation itself drops symbols whose newest cached daily bar is older than `risk.max_bar_staleness_days` (default 3) — this prevents week-old prices from producing live orders if the data pipeline missed a run.
 
-1. **Circuit breaker** — halt active? (3% daily / 7% weekly loss triggers)
+Every surviving signal then passes through a seven-check sequential guard:
+
+1. **Circuit breaker** — halt active? (3% daily / 7% weekly loss triggers; the daily runner self-checks realised + unrealised P&L against an equity baseline at the start of each Phase 1 and auto-trips the halt — no manual click required)
 2. **Stop-price sanity** — stop on the loss side of entry? (BUY needs `stop < entry`, SELL needs `stop > entry`; catches bad ATR → zero-distance stops)
 3. **Portfolio drawdown** — portfolio-wide loss exceeds limit?
-4. **Position size** — proposed size exceeds `max_position_size_pct`?
+4. **Position size** — proposed size exceeds `kelly_max_position_pct`?
 5. **Sector exposure** — adding this position would exceed 30% in one sector?
 6. **Correlation** — too many highly correlated positions already held?
 7. **Duplicate** — already holding this symbol? (GOOG/GOOGL treated as same underlying)
 
 Sizing additionally short-circuits to `REJECTED_TOO_SMALL` if Kelly output is below 1 share, so 0-share bracket orders never reach IBKR. Position sizing uses fractional Kelly criterion (quarter-Kelly by default) with **ATR-based stops** — the stop distance adapts to each stock's typical daily volatility instead of using a fixed percentage. When there is insufficient signal history (<10 trades), a fixed fallback sizes to risk 1% of investable equity per trade.
 
-For SELL signals with `allow_short_selling=False` (the default), the order manager intercepts before sizing: if a long is held the position is flattened (`CLOSED_LONG`); otherwise the signal is ignored (`REJECTED_NO_POSITION`). Shorts are never opened.
+For SELL signals with `allow_short_selling=False` (the default), the order manager intercepts before sizing: if a long is held the position is flattened (`CLOSED_LONG`); otherwise the signal is ignored (`REJECTED_NO_POSITION`). Shorts are never opened. The same long-only gate is enforced inside the walk-forward bracket simulator so backtest P&L reflects the live execution path.
 
 Approved orders are submitted as **bracket orders** — three linked legs (entry + stop + take-profit) so risk and reward are both defined before the trade is on. All legs are GTC so they survive outside regular trading hours. When `trailing_stop_enabled=True`, each daily run evaluates every open long and may replace its bracket TP+stop with a **standalone trailing stop** once the position is sufficiently in profit — the stop then ratchets up with price and only triggers on reversal. See [docs/08-risk-management.md](docs/08-risk-management.md) for ATR fundamentals, bracket-order mechanics, and the trailing-stop conversion rules.
 
@@ -391,7 +396,7 @@ Tests use mocks for all external dependencies — no live IBKR connection, yfina
 
 ## Database
 
-SQLite at `db/trading.db` (auto-created on first run). Key tables:
+SQLite at `db/trading.db` (auto-created on first run). Schema migrations are handled by `_migrate()` in `data/database.py` — runs idempotently at every engine init.
 
 | Table | Contents |
 |-------|----------|
@@ -400,8 +405,12 @@ SQLite at `db/trading.db` (auto-created on first run). Key tables:
 | `fundamental_data` | P/E, revenue growth, margins etc. (24h cache) |
 | `news_cache` | Headlines + FinBERT sentiment scores |
 | `signal_log` | Every ensemble prediction and gate result |
+| `ensemble_weight_history` | Per-fold ensemble weight snapshots after each rebalance |
 | `walk_forward_results` | Per-fold Sharpe, drawdown, win rate |
+| `trade_log` | Closed trades (WF-simulated and, with Phase B, live IBKR fills) — entry/exit, P&L, exit reason |
 | `universe_assets` | Dynamic universe candidates and their scores |
-| `order_decisions` | Every DRY_RUN / APPROVED / REJECTED decision |
+| `universe_run_log` | Per-stage timing + symbol counts for each universe refresh |
+| `order_decisions` | Every DRY_RUN / APPROVED / REJECTED / CLOSED_LONG decision |
 | `circuit_breaker_log` | All halt trigger and reset events |
-| `signal_runner_log` | Daily run summaries |
+| `trailing_stop_log` | Per-position evaluation by `TrailingStopManager` (CONVERTED / SKIPPED / FAILED) |
+| `signal_runner_log` | Daily run summaries (signals generated, orders submitted, longs closed, etc.) |

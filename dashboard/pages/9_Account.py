@@ -222,9 +222,13 @@ if st.session_state.ibkr_data:
     c2.metric("Total Cash",      f"${summary.total_cash:,.2f}")
     c3.metric("Buying Power",    f"${summary.buying_power:,.2f}")
     c4.metric("Unrealized P&L",  f"${summary.unrealized_pnl:+,.2f}")
-    c5.metric("Realized P&L",    f"${summary.realized_pnl:+,.2f}")
+    c5.metric("Realized P&L (today)", f"${summary.realized_pnl:+,.2f}")
 
-    st.caption(f"Account ID: {summary.account_id}  |  Currency: {summary.currency}")
+    st.caption(
+        f"Account ID: {summary.account_id}  |  Currency: {summary.currency}  |  "
+        "Realized P&L is the intraday figure from IBKR — it resets at session start. "
+        "Cumulative realized P&L will be available on the Trade History page once live-fill ingestion (Phase B) lands."
+    )
 
     # ── Open positions ────────────────────────────────────────────────────────
     st.markdown("---")
