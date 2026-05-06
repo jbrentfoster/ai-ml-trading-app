@@ -51,6 +51,7 @@ from core.logger import get_logger
 from data.database import (
     get_equity_snapshot_on_or_before,
     log_equity_snapshot,
+    log_signal,
     log_signal_runner_run,
 )
 from risk.circuit_breaker import CircuitBreaker
@@ -201,6 +202,70 @@ def _check_loss_limits_against_baseline(cb: CircuitBreaker) -> tuple[bool, str]:
             pass
 
 
+def _fetch_held_long_symbols() -> set[str]:
+    """
+    Pull the set of symbols with an open long position from IBKR.
+
+    Used by Phase 1 to ensure that any held long is included in the operational
+    symbol list — even if Stage-3 universe rescore has dropped it.  Without
+    this, an orphan held position stops getting OHLCV refreshes (Phase 2),
+    receives no signal evaluation / SELL exit path (Phase 3), and is evaluated
+    by the trailing-stop manager against a stale cached close (Phase 3.5).
+
+    Mirrors the connect/use/disconnect pattern in
+    ``_check_loss_limits_against_baseline``.  Returns an empty set when:
+      * mode is dry-run / SIMULATION without paper_orders_enabled (no IBKR)
+      * IBKR connect fails
+      * the positions call raises
+    """
+    needs_ibkr = (
+        config.trading.mode == TradingMode.LIVE
+        or (
+            config.trading.mode == TradingMode.SIMULATION
+            and config.trading.paper_orders_enabled
+        )
+    )
+    if not needs_ibkr:
+        return set()
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    ibkr = None
+    try:
+        from execution.ibkr_connection import IBKRConnection
+        ibkr = IBKRConnection()
+        connected = loop.run_until_complete(ibkr.connect())
+        if not connected:
+            log.warning("Held-position fetch skipped: IBKR connect failed.")
+            return set()
+
+        raw = loop.run_until_complete(ibkr.get_positions())
+        held: set[str] = set()
+        for p in raw:
+            shares = int(p.get("quantity", 0) or 0)
+            sym    = p.get("symbol")
+            if shares > 0 and sym:
+                held.add(sym)
+        return held
+    except Exception as exc:
+        log.warning("Could not fetch held positions: %s", exc, exc_info=True)
+        return set()
+    finally:
+        if ibkr is not None:
+            try:
+                loop.run_until_complete(ibkr.disconnect())
+            except Exception:
+                pass
+        try:
+            loop.close()
+        except Exception:
+            pass
+        try:
+            asyncio.set_event_loop(None)
+        except Exception:
+            pass
+
+
 def _phase1_startup(dry_run: bool, symbol_filter: str) -> tuple[list[str], bool, str]:
     """
     Return (symbols, is_halted, halt_reason).
@@ -236,20 +301,39 @@ def _phase1_startup(dry_run: bool, symbol_filter: str) -> tuple[list[str], bool,
         mode_label = "LIVE"
     print(f"  Mode: {mode_label}")
 
-    # Symbol list
+    # Symbol list — universe (or static watchlist) plus any held longs that
+    # have been dropped by the latest universe rescore.  Without the union,
+    # an orphan held position is invisible to Phases 2/3 and trailing-stop
+    # activation runs against a stale cached close.
     if symbol_filter:
         symbols = [symbol_filter.upper()]
     elif config.universe.enabled:
         try:
             from data.database import get_universe_assets
             df = get_universe_assets(active_only=True)
-            symbols = df["symbol"].tolist() if not df.empty else config.data.watchlist
+            symbols = df["symbol"].tolist() if not df.empty else list(config.data.watchlist)
         except Exception:
-            symbols = config.data.watchlist
+            symbols = list(config.data.watchlist)
     else:
         symbols = list(config.data.watchlist)
 
-    print(f"  Symbols ({len(symbols)}): {symbols[:10]}{'...' if len(symbols) > 10 else ''}")
+    # Held-position override.  Single-symbol runs are exempt — the user has
+    # explicitly asked for one symbol and we should honour that.
+    held_extras: list[str] = []
+    if not symbol_filter and not dry_run:
+        held = _fetch_held_long_symbols()
+        existing = set(symbols)
+        held_extras = sorted(s for s in held if s not in existing)
+        if held_extras:
+            symbols = symbols + held_extras
+
+    if held_extras:
+        print(
+            f"  Symbols ({len(symbols)}): {len(symbols) - len(held_extras)} from "
+            f"universe + {len(held_extras)} held-only ({held_extras})"
+        )
+    else:
+        print(f"  Symbols ({len(symbols)}): {symbols[:10]}{'...' if len(symbols) > 10 else ''}")
     print()
     return symbols, halted, reason
 
@@ -335,6 +419,23 @@ def _phase3_signals(symbols: list[str]) -> tuple[list[tuple], int]:
         try:
             scores = ensemble.predict(df)
             result = gate.evaluate(sym, df, scores)
+
+            # Persist every result (HOLD / BUY / SELL — passed or failed gate)
+            # so Page 3's score-history view reflects what the daily runner
+            # actually produced.  log_signal swallows its own errors.
+            log_signal({
+                "symbol":         result.symbol,
+                "generated_at":   result.generated_at,
+                "bar_timestamp":  result.bar_timestamp,
+                "lstm_score":     result.lstm_score,
+                "xgb_score":      result.xgb_score,
+                "finbert_score":  result.finbert_score,
+                "ensemble_score": result.ensemble_score,
+                "regime":         result.regime.value,
+                "signal":         result.signal,
+                "passed_gate":    result.passed_gate,
+                "gate_reason":    result.gate_reason,
+            })
 
             ind = get_latest_indicators(sym, "1d")
             atr = ind["atr_14"] if ind else None

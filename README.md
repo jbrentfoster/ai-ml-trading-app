@@ -146,7 +146,7 @@ streamlit run dashboard/1_Market_Data.py
 | **7 — Universe** | Funnel overview, active candidates, size history, manual refresh controls |
 | **8 — Risk & Portfolio** | Circuit breaker, signal runner log, order decisions, trailing-stop log, risk config |
 | **9 — Account** | Live IBKR account summary, positions, orders (requires active IB Gateway/TWS) |
-| **10 — Trade History** | Closed trades from `trade_log` (WF-simulated + live fills): net P&L, indicative ST/LT tax view, exit-reason breakdown, per-symbol stats |
+| **10 — Trade History** | Closed trades from `trade_log` (WF-simulated + live fills): net P&L, indicative ST/LT tax view, exit-reason breakdown, per-symbol stats. Sidebar "Dedupe to latest run per symbol" toggle (default ON) hides stale rows from prior weekly retrains by sourcing the latest `run_id` from `walk_forward_results` |
 
 ---
 
@@ -339,9 +339,11 @@ Each symbol passes through three models whose scores are combined into an ensemb
 
 Models are trained using time-series cross-validation to prevent lookahead bias. Default: 5 folds × (120 train + 21 test bars). After all folds, the ensemble is retrained on the full dataset for live inference.
 
+Each fold's test window is run through a **bracket simulator** that mirrors the live execution path: signals at bar `t` close enter at bar `t+1` open, ATR-based stop/take-profit levels are placed at entry, and intra-bar fills resolve under a worst-case rule (when both stop and TP lie inside `[Low, High]` on the same bar, the stop fills). Trailing-stop conversion, gap-throughs, and the `allow_short_selling` gate are all modelled. Each closed trade is written to the `trade_log` table with `source='walk_forward'`, an `exit_reason` (`stop` / `tp` / `trailing` / `signal_flip` / `fold_end` / `manual_close`), and net P&L after slippage and commissions — surfaced on the Trade History page.
+
 ```
 run_pipeline.py     →  data in SQLite
-train_models.py     →  models/cache/{symbol}/lstm.pt + xgb.ubj
+train_models.py     →  models/cache/{symbol}/lstm.pt + xgb.ubj  +  trade_log rows
 signal_runner.py    →  loads checkpoints, generates signals, logs decisions
 ```
 

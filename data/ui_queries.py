@@ -615,6 +615,55 @@ def query_trailing_stop_log(
 
 # ── Trade history (closed trades from trade_log) ──────────────────────────────
 
+def _keep_latest_run_per_symbol(df: pd.DataFrame) -> pd.DataFrame:
+    """Collapse walk_forward rows to the latest training run_id per symbol.
+
+    The "latest run_id" is sourced from `walk_forward_results`, NOT from
+    trade_log itself.  Reason: a fresh training run that produces zero
+    closed trades (e.g. long-only gate suppressing every short, no buys
+    firing in the test window) inserts no rows into trade_log.  Picking
+    "latest run_id present in trade_log" then silently falls back to the
+    *previous* run, surfacing stale pre-fix history that the current model
+    no longer produces.  walk_forward_results writes one row per
+    (run_id, symbol, fold_index) on every fold regardless of trade count,
+    so it always reflects the current training session.
+
+    Symbols whose latest WF run produced zero trades correctly disappear
+    from the deduped view — that's the right semantic for "no trades in
+    current model" (vs. "stale rows from a previous model").  Live rows
+    pass through untouched.
+    """
+    if df.empty or "recorded_at" not in df.columns:
+        return df
+    wf_mask = df["source"] == "walk_forward"
+    if not wf_mask.any():
+        return df
+
+    # Latest WF run_id per symbol from the per-fold results table.
+    engine = get_engine()
+    with Session(engine) as session:
+        wf_runs = session.query(
+            WalkForwardResult.symbol,
+            WalkForwardResult.run_id,
+            WalkForwardResult.recorded_at,
+        ).all()
+    if not wf_runs:
+        return df  # No WF training has run yet — nothing authoritative to dedup against.
+
+    runs_df = pd.DataFrame(wf_runs, columns=["symbol", "run_id", "recorded_at"])
+    latest = (
+        runs_df.groupby(["symbol", "run_id"])["recorded_at"].max()
+              .reset_index()
+              .sort_values("recorded_at", ascending=False)
+              .drop_duplicates("symbol")[["symbol", "run_id"]]
+    )
+
+    wf = df[wf_mask]
+    other = df[~wf_mask]
+    wf_kept = wf.merge(latest, on=["symbol", "run_id"], how="inner")
+    return pd.concat([wf_kept, other], ignore_index=True)
+
+
 @st.cache_data(ttl=300)
 def query_trade_log(
     source: str | None = None,
@@ -623,6 +672,7 @@ def query_trade_log(
     end_date=None,
     exit_reasons: tuple[str, ...] | None = None,
     run_id: str = "",
+    dedup_to_latest_run: bool = True,
 ) -> pd.DataFrame:
     """
     Return closed-trade rows from trade_log with derived columns.
@@ -635,6 +685,13 @@ def query_trade_log(
     Date range is applied against exit_ts (the realisation date — what matters
     for tax-year bucketing).  Symbols and exit_reasons are tuples so the
     @st.cache_data hash is stable.
+
+    When `dedup_to_latest_run=True` (default) and no specific `run_id` is
+    requested, walk_forward rows are collapsed to the latest training run per
+    symbol — without this, every weekly `--force` retrain stacks an extra copy
+    of every closed trade onto the page and inflates summary metrics.  Pass
+    `False` to see the full multi-run history (or filter by a specific run_id,
+    which short-circuits the dedup).
     """
     df = get_trade_log(source=source if source else None)
     if df.empty:
@@ -652,6 +709,8 @@ def query_trade_log(
         df = df[df["exit_reason"].isin(exit_reasons)]
     if run_id:
         df = df[df["run_id"] == run_id]
+    elif dedup_to_latest_run:
+        df = _keep_latest_run_per_symbol(df)
 
     if df.empty:
         return df
@@ -678,6 +737,7 @@ def query_trade_summary(
     end_date=None,
     exit_reasons: tuple[str, ...] | None = None,
     run_id: str = "",
+    dedup_to_latest_run: bool = True,
 ) -> dict:
     """
     Aggregates for the summary cards on the Trade History page.
@@ -689,6 +749,7 @@ def query_trade_summary(
         source=source, symbols=symbols,
         start_date=start_date, end_date=end_date,
         exit_reasons=exit_reasons, run_id=run_id,
+        dedup_to_latest_run=dedup_to_latest_run,
     )
     if df.empty:
         return {
@@ -721,6 +782,7 @@ def query_tax_breakdown(
     end_date=None,
     exit_reasons: tuple[str, ...] | None = None,
     run_id: str = "",
+    dedup_to_latest_run: bool = True,
 ) -> dict:
     """
     Short-term vs long-term realised gain/loss aggregates.
@@ -738,6 +800,7 @@ def query_tax_breakdown(
         source=source, symbols=symbols,
         start_date=start_date, end_date=end_date,
         exit_reasons=exit_reasons, run_id=run_id,
+        dedup_to_latest_run=dedup_to_latest_run,
     )
     if df.empty:
         return {

@@ -104,6 +104,21 @@ with st.sidebar:
         help="Empty = all exit reasons.  stop / tp / trailing / signal_flip / fold_end / manual_close.",
     )
 
+    # Dedup toggle — defaults ON because every weekly --force retrain inserts
+    # a fresh batch of WF trades with new run_ids; without dedup the page
+    # stacks every historical run on top of itself and inflates summary cards.
+    # Off = full multi-run history (useful for auditing model drift over time).
+    dedup_to_latest = st.checkbox(
+        "Dedupe to latest run per symbol",
+        value=True,
+        help=(
+            "ON (default): for walk_forward rows, keep only the latest training "
+            "run per symbol — current model only.  OFF: show every weekly "
+            "retrain stacked together (Nx duplicates after N runs).  Has no "
+            "effect on live rows or when a specific Run ID is selected below."
+        ),
+    )
+
     # Run-ID dropdown — populated from trade_log directly so we only show
     # run_ids that actually exist.  Different scope from Page 8's run_ids
     # (those come from order_decisions / signal_runner runs).
@@ -189,6 +204,7 @@ filter_kwargs = dict(
     end_date=end_date,
     exit_reasons=tuple(selected_reasons) if selected_reasons else None,
     run_id=run_id_filter,
+    dedup_to_latest_run=dedup_to_latest,
 )
 
 trades_df = query_trade_log(**filter_kwargs)
@@ -321,6 +337,7 @@ display_df = trades_df.rename(columns={
     "exit_reason":   "Exit Reason",
     "source":        "Source",
     "run_id":        "Run ID",
+    "recorded_at":   "Recorded At",
 })
 display_df["ST/LT"]  = display_df["Days"].apply(lambda d: "LT" if d > 365 else "ST")
 display_df["Run ID"] = display_df["Run ID"].fillna("").astype(str).str.slice(0, 8)
@@ -330,7 +347,7 @@ final_cols = [
     "Symbol", "Signal", "Entry Date", "Exit Date", "Days", "ST/LT",
     "Shares", "Entry $", "Exit $",
     "Gross P&L", "Fees", "Net P&L", "P&L %",
-    "Exit Reason", "Source", "Run ID",
+    "Exit Reason", "Source", "Run ID", "Recorded At",
 ]
 final_cols = [c for c in final_cols if c in display_df.columns]
 

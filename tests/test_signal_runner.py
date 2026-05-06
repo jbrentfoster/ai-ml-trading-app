@@ -16,6 +16,7 @@ import pytest
 from scripts.signal_runner import (
     EQUIVALENT_PAIRS,
     _check_loss_limits_against_baseline,
+    _fetch_held_long_symbols,
     _phase3_signals,
     _phase4_risk_orders,
 )
@@ -26,6 +27,30 @@ from scripts.signal_runner import (
 def _make_signal(symbol: str, signal: str = "BUY") -> SimpleNamespace:
     """Return a minimal signal_result-like object."""
     return SimpleNamespace(symbol=symbol, signal=signal, ensemble_score=0.8, passed_gate=True)
+
+
+def _make_signal_result(
+    symbol: str,
+    signal: str = "HOLD",
+    passed_gate: bool = False,
+    ensemble_score: float = 0.0,
+    gate_reason: str = "",
+) -> SimpleNamespace:
+    """SignalResult-shaped mock with every field log_signal reads."""
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    return SimpleNamespace(
+        symbol=symbol,
+        signal=signal,
+        passed_gate=passed_gate,
+        ensemble_score=ensemble_score,
+        gate_reason=gate_reason,
+        bar_timestamp=now,
+        generated_at=now,
+        lstm_score=0.0,
+        xgb_score=0.0,
+        finbert_score=0.0,
+        regime=SimpleNamespace(value="MEAN_REVERTING"),
+    )
 
 
 def _make_decision(symbol: str, decision: str = "DRY_RUN", signal: str = "BUY") -> MagicMock:
@@ -169,15 +194,16 @@ class TestStaleBarGate:
         ensemble = MagicMock()
         ensemble.predict.return_value = pd.Series([0.0])
         gate = MagicMock()
-        gate.evaluate.return_value = SimpleNamespace(
-            symbol="AAPL", signal="HOLD", ensemble_score=0.1,
-            passed_gate=False, gate_reason="below threshold",
+        gate.evaluate.return_value = _make_signal_result(
+            "AAPL", signal="HOLD", passed_gate=False,
+            ensemble_score=0.1, gate_reason="below threshold",
         )
 
         with patch("scripts.signal_runner._load_ensemble", return_value=ensemble), \
              patch("data.indicators.IndicatorEngine", return_value=self._patch_engine(fresh)), \
              patch("models.signal_gate.SignalGate", return_value=gate), \
-             patch("data.database.get_latest_indicators", return_value={"atr_14": 1.5}):
+             patch("data.database.get_latest_indicators", return_value={"atr_14": 1.5}), \
+             patch("scripts.signal_runner.log_signal"):
             actionable, skipped_stale = _phase3_signals(["AAPL"])
 
         assert skipped_stale == 0
@@ -334,3 +360,170 @@ def _async_value(value):
     async def _coro():
         return value
     return _coro()
+
+
+# ── Held-position override (orphan-position guard) ────────────────────────────
+
+class TestHeldLongSymbols:
+    """
+    _fetch_held_long_symbols ensures held longs are tracked even after a
+    universe rescore drops them — without it the trailing-stop manager
+    evaluates against a stale cached close.
+    """
+
+    def _enable_paper(self, monkeypatch):
+        from config.settings import config as cfg, TradingMode
+        monkeypatch.setattr(cfg.trading, "mode", TradingMode.SIMULATION)
+        monkeypatch.setattr(cfg.trading, "paper_orders_enabled", True)
+
+    def test_returns_long_position_symbols(self, monkeypatch):
+        """Held longs (shares > 0) are included; flats and shorts are not."""
+        self._enable_paper(monkeypatch)
+
+        ibkr = MagicMock()
+        ibkr.connect = MagicMock(return_value=_async_value(True))
+        ibkr.disconnect = MagicMock(return_value=_async_value(None))
+        ibkr.get_positions = MagicMock(return_value=_async_value([
+            {"symbol": "TMUS", "quantity": 204, "avg_cost": 195.41},
+            {"symbol": "WFC",  "quantity": 500, "avg_cost":  79.94},
+            {"symbol": "FLAT", "quantity":   0, "avg_cost":  10.00},
+            {"symbol": "SHORT", "quantity": -100, "avg_cost":  50.00},
+        ]))
+
+        with patch("execution.ibkr_connection.IBKRConnection", return_value=ibkr):
+            held = _fetch_held_long_symbols()
+
+        assert held == {"TMUS", "WFC"}
+
+    def test_paper_disabled_returns_empty(self, monkeypatch):
+        """No IBKR connection attempted when paper_orders_enabled=False."""
+        from config.settings import config as cfg, TradingMode
+        monkeypatch.setattr(cfg.trading, "mode", TradingMode.SIMULATION)
+        monkeypatch.setattr(cfg.trading, "paper_orders_enabled", False)
+
+        with patch("execution.ibkr_connection.IBKRConnection") as mock_ibkr:
+            held = _fetch_held_long_symbols()
+
+        assert held == set()
+        mock_ibkr.assert_not_called()
+
+    def test_connect_failure_returns_empty(self, monkeypatch):
+        """connect() returning False → empty set, no exception."""
+        self._enable_paper(monkeypatch)
+
+        ibkr = MagicMock()
+        ibkr.connect = MagicMock(return_value=_async_value(False))
+        ibkr.disconnect = MagicMock(return_value=_async_value(None))
+
+        with patch("execution.ibkr_connection.IBKRConnection", return_value=ibkr):
+            held = _fetch_held_long_symbols()
+
+        assert held == set()
+        ibkr.get_positions.assert_not_called()
+
+    def test_get_positions_exception_returns_empty(self, monkeypatch):
+        """get_positions raising → empty set, no exception bubbles up."""
+        self._enable_paper(monkeypatch)
+
+        async def _raise():
+            raise RuntimeError("API error")
+
+        ibkr = MagicMock()
+        ibkr.connect = MagicMock(return_value=_async_value(True))
+        ibkr.disconnect = MagicMock(return_value=_async_value(None))
+        ibkr.get_positions = MagicMock(return_value=_raise())
+
+        with patch("execution.ibkr_connection.IBKRConnection", return_value=ibkr):
+            held = _fetch_held_long_symbols()
+
+        assert held == set()
+
+
+# ── signal_log persistence ────────────────────────────────────────────────────
+
+class TestSignalLogPersistence:
+    """
+    _phase3_signals must write every SignalResult to signal_log so Page 3's
+    score-history view reflects the daily runner's output (HOLD / BUY / SELL,
+    passed or failed gate).
+    """
+
+    def _patch_engine(self, df_by_sym):
+        engine = MagicMock()
+        engine.run.side_effect = lambda sym, interval="1d": df_by_sym.get(sym, pd.DataFrame())
+        return engine
+
+    def test_log_signal_called_for_passed_gate(self):
+        """A BUY that passes the gate is persisted with passed_gate=True."""
+        today = datetime.now(timezone.utc).date()
+        fresh = {"AAPL": _make_df(today)}
+
+        ensemble = MagicMock()
+        ensemble.predict.return_value = {"lstm": 0.7, "xgb": 0.6, "finbert": 0.5, "ensemble": 0.65}
+        gate = MagicMock()
+        gate.evaluate.return_value = _make_signal_result(
+            "AAPL", signal="BUY", passed_gate=True, ensemble_score=0.65,
+        )
+
+        with patch("scripts.signal_runner._load_ensemble", return_value=ensemble), \
+             patch("data.indicators.IndicatorEngine", return_value=self._patch_engine(fresh)), \
+             patch("models.signal_gate.SignalGate", return_value=gate), \
+             patch("data.database.get_latest_indicators", return_value={"atr_14": 1.5}), \
+             patch("scripts.signal_runner.log_signal") as mock_log:
+            _phase3_signals(["AAPL"])
+
+        mock_log.assert_called_once()
+        record = mock_log.call_args[0][0]
+        assert record["symbol"]      == "AAPL"
+        assert record["signal"]      == "BUY"
+        assert record["passed_gate"] is True
+        assert record["regime"]      == "MEAN_REVERTING"
+        # Field shape matches data/database.SignalLog columns
+        for field in ("generated_at", "bar_timestamp", "lstm_score",
+                      "xgb_score", "finbert_score", "ensemble_score",
+                      "gate_reason"):
+            assert field in record
+
+    def test_log_signal_called_for_failed_gate(self):
+        """HOLDs that fail the gate are still persisted (Page 3 needs them)."""
+        today = datetime.now(timezone.utc).date()
+        fresh = {"AAPL": _make_df(today)}
+
+        ensemble = MagicMock()
+        ensemble.predict.return_value = {"lstm": 0.1, "xgb": 0.1, "finbert": 0.0, "ensemble": 0.07}
+        gate = MagicMock()
+        gate.evaluate.return_value = _make_signal_result(
+            "AAPL", signal="HOLD", passed_gate=False,
+            ensemble_score=0.07, gate_reason="Filter1 fail: |0.07| < threshold 0.50",
+        )
+
+        with patch("scripts.signal_runner._load_ensemble", return_value=ensemble), \
+             patch("data.indicators.IndicatorEngine", return_value=self._patch_engine(fresh)), \
+             patch("models.signal_gate.SignalGate", return_value=gate), \
+             patch("data.database.get_latest_indicators", return_value={"atr_14": 1.5}), \
+             patch("scripts.signal_runner.log_signal") as mock_log:
+            _phase3_signals(["AAPL"])
+
+        mock_log.assert_called_once()
+        record = mock_log.call_args[0][0]
+        assert record["signal"]      == "HOLD"
+        assert record["passed_gate"] is False
+        assert "Filter1 fail" in record["gate_reason"]
+
+    def test_log_signal_skipped_when_gate_raises(self):
+        """If gate.evaluate raises, log_signal is NOT called (no partial row)."""
+        today = datetime.now(timezone.utc).date()
+        fresh = {"AAPL": _make_df(today)}
+
+        ensemble = MagicMock()
+        ensemble.predict.return_value = {"lstm": 0.0, "xgb": 0.0, "finbert": 0.0, "ensemble": 0.0}
+        gate = MagicMock()
+        gate.evaluate.side_effect = RuntimeError("regime detector blew up")
+
+        with patch("scripts.signal_runner._load_ensemble", return_value=ensemble), \
+             patch("data.indicators.IndicatorEngine", return_value=self._patch_engine(fresh)), \
+             patch("models.signal_gate.SignalGate", return_value=gate), \
+             patch("scripts.signal_runner.log_signal") as mock_log:
+            _phase3_signals(["AAPL"])
+
+        mock_log.assert_not_called()
