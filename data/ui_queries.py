@@ -680,8 +680,15 @@ def query_trade_log(
     Adds:
       - holding_days  = (exit_ts − entry_ts).days
       - is_long_term  = holding_days > 365
-      - net_pnl       = pnl − costs_charged
+      - net_pnl       = pnl                    # ``pnl`` is *already* net of costs
+      - gross_pnl     = pnl + costs_charged    # back-derived for display
 
+    The ``trade_log.pnl`` column is written by ``walk_forward.py:_close_trade``
+    as ``pnl_pct × entry_px × shares`` — and ``pnl_pct = gross_pct − total_costs``,
+    so the stored ``pnl`` is the realised *net* dollar P&L.  Subtracting
+    ``costs_charged`` again here would double-count fees.  Phase A picked this
+    convention so that ``pnl_pct`` remains a valid input for realised-Kelly
+    (Phase C); this query layer just exposes both views to the dashboard.
     Date range is applied against exit_ts (the realisation date — what matters
     for tax-year bucketing).  Symbols and exit_reasons are tuples so the
     @st.cache_data hash is stable.
@@ -719,7 +726,10 @@ def query_trade_log(
     # holding_days math is in UTC — same instant in every timezone).
     df["holding_days"] = (df["exit_ts"] - df["entry_ts"]).dt.days
     df["is_long_term"] = df["holding_days"] > 365
-    df["net_pnl"]      = df["pnl"] - df["costs_charged"].fillna(0.0)
+    # ``pnl`` is already net of costs (see docstring); back-derive gross for display.
+    costs              = df["costs_charged"].fillna(0.0)
+    df["net_pnl"]      = df["pnl"]
+    df["gross_pnl"]    = df["pnl"] + costs
 
     # Display columns shifted to local for readability.
     df["entry_ts"]    = _to_local_series(df["entry_ts"])
@@ -760,7 +770,9 @@ def query_trade_summary(
             "win_rate":    0.0,
         }
     n_trades  = len(df)
-    gross_pnl = float(df["pnl"].sum())
+    # gross_pnl is back-derived in query_trade_log — using df["pnl"] here would
+    # display the *net* number under a "Gross" label (the original Page 10 bug).
+    gross_pnl = float(df["gross_pnl"].sum())
     total_costs = float(df["costs_charged"].fillna(0.0).sum())
     net_pnl   = float(df["net_pnl"].sum())
     n_wins    = int((df["net_pnl"] > 0).sum())

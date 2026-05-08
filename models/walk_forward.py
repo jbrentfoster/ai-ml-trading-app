@@ -27,6 +27,7 @@ from data.database import log_trades_bulk, log_walk_forward_result
 from models.ensemble import EnsembleModel
 from models.finbert_model import FinBERTModel
 from models.signal_gate import SignalGate, SignalResult
+from risk.position_sizer import PositionSizer, compute_realised_kelly
 from config.settings import config
 from typing import TYPE_CHECKING
 
@@ -57,6 +58,7 @@ class MLWalkForwardOrchestrator:
             gap_bars   = cfg.wf_gap_bars,
         )
         self._gate              = SignalGate()
+        self._sizer             = PositionSizer()
         self._ensemble: EnsembleModel | None = None
         self._run_id            = str(uuid.uuid4())
         self._universe_selector = universe_selector
@@ -113,10 +115,35 @@ class MLWalkForwardOrchestrator:
             ensemble = EnsembleModel(symbol=self._symbol)
             ensemble.train(fold.train_df)
 
+            # Realised-Kelly history from prior folds of this run only.
+            # ``entry_ts < fold.test_start`` excludes any current-fold trade
+            # naturally (current-fold trades open inside this window).  Scoping
+            # to ``run_id=self._run_id`` prevents contamination from earlier
+            # runs whose ensemble weights / thresholds may differ.
+            kelly_history = compute_realised_kelly(
+                symbol=self._symbol,
+                as_of=fold.test_start,
+                source="walk_forward",
+                run_id=self._run_id,
+            )
+            if kelly_history is not None:
+                log.info(
+                    "Fold %d: realised-Kelly history n=%d win_rate=%.2f f*=%s",
+                    fold.fold_index + 1,
+                    kelly_history.get("n_trades", 0),
+                    kelly_history.get("win_rate", 0.0),
+                    (
+                        f"{kelly_history['f_star']:.3f}"
+                        if kelly_history.get("f_star") is not None
+                        else "n/a"
+                    ),
+                )
+
             signals, fold_returns, finbert_coverage, fold_trades = self._run_test_window(
                 ensemble, fold.train_df, fold.test_df,
                 suppress_finbert=suppress_finbert,
                 fold_index=fold.fold_index,
+                kelly_history=kelly_history,
             )
             if fold_trades:
                 try:
@@ -213,6 +240,7 @@ class MLWalkForwardOrchestrator:
         test_df:  pd.DataFrame,
         suppress_finbert: bool = False,
         fold_index: int = 0,
+        kelly_history: dict | None = None,
     ) -> tuple[list[SignalResult], pd.Series, float, list[dict]]:
         """
         Simulate bar-by-bar signal generation + bracket-order management.
@@ -253,6 +281,16 @@ class MLWalkForwardOrchestrator:
         window (test period predates news_available_from) and its weight is
         split equally between LSTM and XGBoost.
 
+        Phase C — position sizing: ``kelly_history`` (the optional output of
+        ``compute_realised_kelly`` over prior folds of the same run) is
+        threaded into ``PositionSizer.calculate`` at each entry.  The sizer
+        returns the Kelly-sized share count (or 0 when undersized); a
+        zero-share entry is skipped — the gate keeps emitting signals on
+        subsequent bars but no trade opens.  Per-bar P&L stays size-agnostic
+        (Sharpe is invariant to a constant per-fold ``position_pct``); only
+        ``trade_log`` rows reflect the Kelly-sized share count, dollar P&L,
+        and dollar costs.
+
         Returns (signals, return_series, finbert_coverage, trades) where
         finbert_coverage is the fraction of bars [0, 1] for which FinBERT
         returned a non-zero score, and `trades` is a list of dicts ready for
@@ -273,6 +311,7 @@ class MLWalkForwardOrchestrator:
         activation_atr = cfg_risk.trailing_stop_activation_atr
         trail_atr_mult = cfg_risk.trailing_stop_trail_atr
         allow_short    = cfg_trading.allow_short_selling
+        wf_equity      = float(cfg_trading.paper_equity)
 
         has_atr = "atr_14" in test_df.columns
 
@@ -294,6 +333,13 @@ class MLWalkForwardOrchestrator:
         pending_entry:   str   | None = None    # 'BUY' or 'SELL' from prior bar
         prev_close:      float | None = None    # for mark-to-market
 
+        # Phase C — Kelly-sized share count for the active trade (1.0 when
+        # PositionSizer was unable to size, e.g. entry_price=0; the resulting
+        # trade still flows through the simulator at notional 1-share semantics
+        # so per-bar P&L math is preserved).
+        trade_shares:    float = 1.0
+        trade_method:    str   = "fixed"
+
         recorded_at = datetime.now(timezone.utc).replace(tzinfo=None)
 
         def _close_trade(
@@ -304,6 +350,11 @@ class MLWalkForwardOrchestrator:
             (exit_only_cost, trade_pnl_pct) for bar-P&L bookkeeping.
             ``exit_only_cost`` is the fractional cost charged to *this bar*
             (entry cost was already charged on the entry bar).
+
+            Phase C: ``shares`` reflects the Kelly-sized share count captured
+            at entry; ``pnl`` and ``costs_charged`` are the corresponding
+            dollar values.  ``pnl_pct`` stays as the per-position fractional
+            return so it remains a valid input for future Kelly recomputes.
             """
             entry_cost = slippage + commission / entry_px
             exit_cost  = slippage + commission / exit_px_
@@ -329,10 +380,10 @@ class MLWalkForwardOrchestrator:
                                   if hasattr(exit_ts, "to_pydatetime") else exit_ts),
                 "exit_px":       float(exit_px_),
                 "exit_reason":   reason,
-                "shares":        1.0,
-                "pnl":           pnl_pct * float(entry_px),
+                "shares":        float(trade_shares),
+                "pnl":           pnl_pct * float(entry_px) * float(trade_shares),
                 "pnl_pct":       pnl_pct,
-                "costs_charged": total_costs * float(entry_px),
+                "costs_charged": total_costs * float(entry_px) * float(trade_shares),
                 "recorded_at":   recorded_at,
             })
             return exit_cost, pnl_pct
@@ -352,13 +403,9 @@ class MLWalkForwardOrchestrator:
 
             # ── 1. Execute pending entry at Open ──────────────────────────
             if pending_entry is not None and position == 0 and open_px > 0:
-                entry_px      = open_px
-                entry_signal  = pending_entry
-                entry_bar_ts  = (bar_ts.to_pydatetime()
-                                 if hasattr(bar_ts, "to_pydatetime") else bar_ts)
-                position      = 1 if pending_entry == "BUY" else -1
-
                 # ATR from the bar BEFORE entry — strictly no-lookahead.
+                # Computed first because the sizer also uses it (and so does
+                # the bracket-level math below).
                 atr_for_entry: float | None = None
                 if has_atr:
                     bar_idx = n_train + i - 1
@@ -367,30 +414,64 @@ class MLWalkForwardOrchestrator:
                         if pd.notna(a) and a > 0:
                             atr_for_entry = float(a)
 
-                if atr_for_entry is not None:
-                    if position == 1:
-                        stop_px = entry_px - atr_stop_mult * atr_for_entry
-                        tp_px   = entry_px + atr_tp_mult   * atr_for_entry
+                # Phase C — size the position from realised-Kelly history.
+                # When ``kelly_history`` has insufficient trades the sizer
+                # falls back to the signal_log proxy, then to fixed sizing;
+                # all paths return a non-negative share count.  A 0-share
+                # output means the position would round to zero at this
+                # equity / entry price — skip the entry rather than open a
+                # phantom trade.
+                pos = self._sizer.calculate(
+                    symbol=self._symbol,
+                    signal=pending_entry,
+                    equity=wf_equity,
+                    entry_price=open_px,
+                    atr=atr_for_entry,
+                    kelly_history=kelly_history,
+                )
+                if pos.shares < 1:
+                    pending_entry = None
+                    prev_close = close_px
+                    # Skip gate eval / trail update / signal-flip /
+                    # fold-end exit blocks below — there's no position to
+                    # manage; bar_pnl stays 0 and we still need to record a
+                    # signal for this bar (handled in the gate-eval block).
+                    # We rely on Python's structured flow: the rest of the
+                    # iteration still runs.
+
+                if pos.shares >= 1:
+                    entry_px      = open_px
+                    entry_signal  = pending_entry
+                    entry_bar_ts  = (bar_ts.to_pydatetime()
+                                     if hasattr(bar_ts, "to_pydatetime") else bar_ts)
+                    position      = 1 if pending_entry == "BUY" else -1
+                    trade_shares  = float(pos.shares)
+                    trade_method  = pos.method
+
+                    if atr_for_entry is not None:
+                        if position == 1:
+                            stop_px = entry_px - atr_stop_mult * atr_for_entry
+                            tp_px   = entry_px + atr_tp_mult   * atr_for_entry
+                        else:
+                            stop_px = entry_px + atr_stop_mult * atr_for_entry
+                            tp_px   = entry_px - atr_tp_mult   * atr_for_entry
                     else:
-                        stop_px = entry_px + atr_stop_mult * atr_for_entry
-                        tp_px   = entry_px - atr_tp_mult   * atr_for_entry
-                else:
-                    stop_px = None       # No ATR → no bracket
-                    tp_px   = None
+                        stop_px = None       # No ATR → no bracket
+                        tp_px   = None
 
-                trail_active = False
-                peak_px      = None
-                trail_amount = None
+                    trail_active = False
+                    peak_px      = None
+                    trail_amount = None
 
-                # Entry cost (fractional return units, anchored to entry_px)
-                entry_cost = slippage + commission / entry_px
-                bar_pnl   -= entry_cost
-                # Mark-to-market across the entry bar: open → close
-                bar_pnl   += position * (close_px - entry_px) / entry_px
+                    # Entry cost (fractional return units, anchored to entry_px)
+                    entry_cost = slippage + commission / entry_px
+                    bar_pnl   -= entry_cost
+                    # Mark-to-market across the entry bar: open → close
+                    bar_pnl   += position * (close_px - entry_px) / entry_px
 
-                prev_close   = close_px
-                just_entered = True
-                pending_entry = None
+                    prev_close   = close_px
+                    just_entered = True
+                    pending_entry = None
 
             # ── 2 & 3. Bracket exit checks (in position, brackets armed) ──
             elif position != 0 and stop_px is not None and prev_close is not None:

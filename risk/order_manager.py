@@ -36,7 +36,7 @@ from data.database import log_order_decision
 from models.signal_gate import SignalResult
 from risk.circuit_breaker import CircuitBreaker
 from risk.portfolio_guard import PortfolioGuard
-from risk.position_sizer import PositionSizer
+from risk.position_sizer import PositionSizer, compute_realised_kelly
 
 log = get_logger("risk.order_manager")
 
@@ -118,12 +118,20 @@ class OrderManager:
         # ── Position sizing ───────────────────────────────────────────────────
         # Use latest close from bars as entry price if not provided
         entry_price = self._get_latest_close(symbol)
+
+        # Phase C — pull realised-Kelly history from prior live fills.
+        # ``source='live'`` scopes to actual broker fills written by the
+        # Phase B subscription (when wired up); until then, the result is
+        # ``None`` and the sizer falls back to the signal_log proxy.
+        kelly_history = compute_realised_kelly(symbol=symbol, source="live")
+
         pos_size = self._sizer.calculate(
             symbol=symbol,
             signal=signal,
             equity=equity,
             entry_price=entry_price,
             atr=atr,
+            kelly_history=kelly_history,
         )
 
         # ── Minimum-size reject ───────────────────────────────────────────────

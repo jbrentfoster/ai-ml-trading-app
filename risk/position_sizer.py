@@ -9,6 +9,16 @@ Fractional Kelly:
     position_pct = kelly_fraction * f*
     (capped at kelly_max_position_pct; floored at 0)
 
+Two Kelly sources are supported:
+    1. ``kelly_realised`` — derived from the realised pnl_pct of closed trades
+       in ``trade_log`` via :func:`compute_realised_kelly`.  This is the
+       Phase C path; it kicks in once a symbol has at least
+       ``RiskConfig.min_trades_for_realised_kelly`` closed trades.
+    2. ``kelly_proxy`` — the legacy cold-start fallback.  Reads ensemble
+       scores from ``signal_log`` and treats ``ensemble_score > 0`` as a
+       win, ``< 0`` as a loss.  Used until enough realised history has
+       accumulated.
+
 Stop / take-profit placement:
     BUY:  stop  = entry - atr * atr_stop_multiplier
           tp    = entry + atr * atr_take_profit_multiplier
@@ -16,16 +26,14 @@ Stop / take-profit placement:
           tp    = entry - atr * atr_take_profit_multiplier
     Fallback when ATR = 0: fixed stop at fixed_stop_loss_pct distance.
 
-If there is insufficient signal-log history (< kelly_min_trades), the sizer
-falls back to a fixed-stop sizing: risk 1% of equity per trade.
+If neither realised nor proxy Kelly is available, the sizer falls back to a
+fixed-stop sizing: risk 1% of equity per trade.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
-
-import pandas as pd
+from datetime import datetime
 
 from config.settings import config
 from core.logger import get_logger
@@ -44,7 +52,96 @@ class PositionSize:
     position_value:    float
     position_pct:      float       # fraction of equity
     kelly_fraction_used: float     # effective kelly fraction (0 if fallback)
-    method:            str         # "kelly" | "fixed"
+    method:            str         # "kelly_realised" | "kelly_proxy" | "fixed"
+
+
+def compute_realised_kelly(
+    symbol: str,
+    as_of: datetime | None = None,
+    lookback_n: int = 100,
+    source: str | None = None,
+    run_id: str | None = None,
+) -> dict | None:
+    """
+    Compute realised-Kelly statistics from closed trades in ``trade_log``.
+
+    Returns a dict with keys ``n_trades``, ``win_rate``, ``avg_win_pct``,
+    ``avg_loss_pct``, ``b``, ``f_star`` — or ``None`` when no trades match
+    the filter (treated as cold start by callers).
+
+    All metrics are derived from ``pnl_pct`` (signed fractional return on the
+    position).  Winners are ``pnl_pct > 0``, losers are ``pnl_pct < 0``;
+    zero-P&L trades are excluded from the win/loss aggregates but still count
+    towards ``n_trades``.
+
+    Forward-only safety: when ``as_of`` is provided, only trades with
+    ``entry_ts < as_of`` are considered.  This is what the walk-forward
+    orchestrator relies on to ensure a fold cannot see its own trades.
+
+    When the matched window contains all wins or all losses, Kelly is
+    undefined: ``b`` and ``f_star`` are returned as ``None`` and the caller
+    falls back to the cold-start path.
+    """
+    try:
+        from data.database import get_engine, TradeLog
+        from sqlalchemy import desc as _desc
+        from sqlalchemy.orm import Session as _Session
+    except Exception:
+        return None
+
+    try:
+        engine = get_engine()
+        with _Session(engine) as session:
+            q = session.query(TradeLog).filter(TradeLog.symbol == symbol)
+            if as_of is not None:
+                q = q.filter(TradeLog.entry_ts < as_of)
+            if source is not None:
+                q = q.filter(TradeLog.source == source)
+            if run_id is not None:
+                q = q.filter(TradeLog.run_id == run_id)
+            q = q.order_by(_desc(TradeLog.entry_ts)).limit(lookback_n)
+            rows = q.all()
+            pnl_pcts = [float(r.pnl_pct) for r in rows]
+    except Exception as exc:
+        log.warning("compute_realised_kelly DB error for %s: %s", symbol, exc)
+        return None
+
+    if not pnl_pcts:
+        return None
+
+    wins   = [x for x in pnl_pcts if x > 0]
+    losses = [-x for x in pnl_pcts if x < 0]   # absolute values
+    n      = len(pnl_pcts)
+    n_w    = len(wins)
+    n_l    = len(losses)
+
+    avg_win  = (sum(wins)   / n_w) if n_w else 0.0
+    avg_loss = (sum(losses) / n_l) if n_l else 0.0
+
+    if n_w == 0 or n_l == 0 or avg_loss <= 0:
+        # Kelly is undefined — return the inputs so callers can see the data
+        # exists, but mark b/f_star as None so they fall back.
+        return {
+            "n_trades":     n,
+            "win_rate":     n_w / n if n > 0 else 0.0,
+            "avg_win_pct":  avg_win,
+            "avg_loss_pct": avg_loss,
+            "b":            None,
+            "f_star":       None,
+        }
+
+    b      = avg_win / avg_loss
+    p      = n_w / n
+    f_star = (p * b - (1 - p)) / b   # may be negative when edge is unfavourable
+
+    return {
+        "n_trades":     n,
+        "win_rate":     p,
+        "avg_win_pct":  avg_win,
+        "avg_loss_pct": avg_loss,
+        "b":            b,
+        "f_star":       f_star,
+    }
 
 
 class PositionSizer:
@@ -60,11 +157,20 @@ class PositionSizer:
         equity: float,
         entry_price: float,
         atr: float | None = None,
+        kelly_history: dict | None = None,
     ) -> PositionSize:
         """
-        Calculate a position size for `signal` ("BUY" or "SELL") given
-        current `equity` and `entry_price`.  `atr` is the 14-bar ATR;
-        pass None or 0 to use the fixed-stop fallback.
+        Calculate a position size for ``signal`` ("BUY" or "SELL") given
+        current ``equity`` and ``entry_price``.  ``atr`` is the 14-bar ATR;
+        pass ``None`` or 0 to use the fixed-stop fallback.
+
+        ``kelly_history`` is the optional output of
+        :func:`compute_realised_kelly` — when provided AND the symbol has
+        ``>= RiskConfig.min_trades_for_realised_kelly`` closed trades AND
+        Kelly is well-defined, the sizer uses realised win-rate / avg-win /
+        avg-loss to compute ``f*``.  Below that threshold, or when
+        ``kelly_history is None``, the sizer falls back to the legacy
+        signal_log proxy and finally to a fixed-stop sizing.
         """
         atr_val = atr if atr and atr > 0 else 0.0
 
@@ -79,7 +185,7 @@ class PositionSizer:
         # are naturally smaller when a cash reserve is configured.
         investable_equity = equity * (1.0 - max(self._trading.cash_reserve_pct, 0.0))
 
-        kelly_f, method = self._kelly_fraction(symbol)
+        kelly_f, method = self._kelly_fraction(symbol, kelly_history)
         # Cap at both the Kelly max and the portfolio guard's hard size limit
         # so the sizer never proposes a position the guard will always reject.
         hard_cap = min(self._cfg.kelly_max_position_pct,
@@ -126,12 +232,40 @@ class PositionSizer:
         else:  # SELL
             return entry + stop_dist, entry - tp_dist
 
-    def _kelly_fraction(self, symbol: str) -> tuple[float, str]:
-        """
-        Return (effective_kelly_fraction, method_label).
+    def _kelly_fraction(
+        self,
+        symbol: str,
+        kelly_history: dict | None = None,
+    ) -> tuple[float, str]:
+        """Return ``(effective_kelly_fraction, method_label)``.
 
-        Reads from the signal_log to compute win rate and win/loss ratio.
-        Falls back to a fixed 1%-of-equity risk sizing when insufficient history.
+        Priority:
+          1. ``kelly_realised`` — realised history with ``n_trades >=
+             min_trades_for_realised_kelly`` and a defined ``f_star``.
+          2. ``kelly_proxy``    — signal_log ``|ensemble_score|`` proxy.
+          3. ``fixed``          — fallback when neither produces a usable
+             estimate.
+        """
+        if kelly_history is not None:
+            n_trades = int(kelly_history.get("n_trades", 0) or 0)
+            f_star   = kelly_history.get("f_star")
+            if (
+                n_trades >= self._cfg.min_trades_for_realised_kelly
+                and f_star is not None
+            ):
+                f_frac = max(float(f_star) * self._cfg.kelly_fraction, 0.0)
+                return f_frac, "kelly_realised"
+
+        return self._kelly_fraction_proxy(symbol)
+
+    def _kelly_fraction_proxy(self, symbol: str) -> tuple[float, str]:
+        """
+        Cold-start ``|ensemble_score|`` proxy from ``signal_log``.
+
+        This is the legacy path used before realised P&L was plumbed through
+        ``trade_log``.  It treats positive ensemble scores as wins and
+        negative as losses; the resulting Kelly is a quality-of-signal proxy,
+        not a P&L-based estimate.
         """
         try:
             from data.database import get_engine, SignalLog
@@ -174,10 +308,10 @@ class PositionSizer:
 
             f_star = (p * b - q) / b
             f_frac = max(f_star * self._cfg.kelly_fraction, 0.0)
-            return f_frac, "kelly"
+            return f_frac, "kelly_proxy"
 
         except Exception as exc:
-            log.warning("Kelly calculation failed for %s: %s — using fixed sizing", symbol, exc)
+            log.warning("Kelly proxy calculation failed for %s: %s — using fixed sizing", symbol, exc)
             return self._fixed_kelly_equivalent(), "fixed"
 
     def _fixed_kelly_equivalent(self) -> float:

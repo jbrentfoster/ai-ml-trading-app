@@ -775,7 +775,100 @@ class TestBracketSimulation:
         assert t["fold_index"] == 3
         assert t["symbol"]     == "TEST"
         assert t["signal"]     == "BUY"
-        assert t["shares"]     == 1.0
-        # pnl and costs_charged are denominated in entry-price-anchored dollars (1-share notional).
-        assert t["pnl"]            == pytest.approx(t["pnl_pct"] * t["entry_px"])
+        # Phase C: Kelly-sized position; shares >= 1 (cold-start fallback path
+        # still produces a positive share count at typical test prices).
+        assert t["shares"]     >= 1
+        # pnl and costs_charged are dollar-denominated and scale with shares.
+        assert t["pnl"]            == pytest.approx(t["pnl_pct"] * t["entry_px"] * t["shares"])
         assert t["costs_charged"]  > 0
+
+    def test_realised_kelly_history_drives_trade_shares(self):
+        """Phase C: when ``kelly_history`` carries enough trades and a positive
+        ``f_star``, ``_run_test_window`` sizes positions via realised Kelly —
+        the resulting ``trades[*]['shares']`` matches what PositionSizer would
+        return given the same kelly_history input.
+
+        This is the primary integration test for the WF wiring; it isolates
+        the sizer hookup without depending on whatever happens to live in
+        the production trade_log table.
+        """
+        from config.settings import config
+        from risk.position_sizer import PositionSizer
+
+        rows = [
+            {"Close": 100},
+            {"Open": 100, "High": 102, "Low":  99, "Close": 101},   # bar 1 entry
+            {"Open": 101, "High": 102, "Low": 100, "Close": 102},   # bar 2 held
+        ]
+        df = _ohlc_df(rows, atr=2.0)
+        orch, ensemble = _build_orchestrator(["BUY", "HOLD", "HOLD"])
+
+        # 60% wins at +3%, 40% losses at -2% → b=1.5, f*=(0.6*1.5-0.4)/1.5≈0.333.
+        kelly_history = {
+            "n_trades":     max(config.risk.min_trades_for_realised_kelly, 30),
+            "win_rate":     0.60,
+            "avg_win_pct":  0.03,
+            "avg_loss_pct": 0.02,
+            "b":            1.5,
+            "f_star":       (0.60 * 1.5 - 0.40) / 1.5,
+        }
+
+        # Predict what PositionSizer would do at entry (bar 1 open=100).
+        expected = PositionSizer().calculate(
+            symbol="TEST",
+            signal="BUY",
+            equity=float(config.trading.paper_equity),
+            entry_price=100.0,
+            atr=2.0,
+            kelly_history=kelly_history,
+        )
+
+        _, _, _, trades = orch._run_test_window(
+            ensemble, df.iloc[:0], df, kelly_history=kelly_history,
+        )
+
+        assert len(trades) == 1
+        t = trades[0]
+        # The sizer claimed kelly_realised at this kelly_history, and the
+        # trade row should reflect those Kelly-sized shares.
+        assert expected.method == "kelly_realised"
+        assert expected.shares >= 1
+        assert t["shares"]     == pytest.approx(float(expected.shares))
+        # Dollar P&L scales with the Kelly-sized share count.
+        assert t["pnl"]            == pytest.approx(t["pnl_pct"] * t["entry_px"] * t["shares"])
+        assert t["costs_charged"]  > 0
+
+    def test_zero_share_kelly_skips_entry(self):
+        """Phase C: when PositionSizer would return ``shares < 1`` (e.g.
+        Kelly says abstain or notional is too small), ``_run_test_window``
+        skips the entry rather than opening a phantom 0-share trade.
+
+        We force this by patching ``self._sizer.calculate`` to always return
+        a 0-share PositionSize; the simulator should then log no trades
+        and produce zero per-bar P&L throughout the window.
+        """
+        from risk.position_sizer import PositionSize
+
+        rows = [
+            {"Close": 100},
+            {"Open": 100, "High": 102, "Low":  99, "Close": 101},
+            {"Open": 101, "High": 102, "Low": 100, "Close": 102},
+        ]
+        df = _ohlc_df(rows, atr=2.0)
+        orch, ensemble = _build_orchestrator(["BUY", "HOLD", "HOLD"])
+
+        zero_size = PositionSize(
+            symbol="TEST", signal="BUY", shares=0,
+            entry_price=100.0, stop_price=96.0, take_profit_price=106.0,
+            position_value=0.0, position_pct=0.0,
+            kelly_fraction_used=0.0, method="kelly_realised",
+        )
+        orch._sizer = MagicMock()
+        orch._sizer.calculate.return_value = zero_size
+
+        _, returns, _, trades = orch._run_test_window(
+            ensemble, df.iloc[:0], df,
+        )
+
+        assert trades == []
+        assert (returns == 0).all()

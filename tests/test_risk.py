@@ -84,7 +84,8 @@ class TestPositionSizer:
 
         sizer = self._sizer()
         result = sizer.calculate("AAPL", "BUY", equity=100_000, entry_price=200.0, atr=4.0)
-        assert result.method == "kelly"
+        # Cold-start path uses signal_log proxy; realised Kelly requires trade_log history.
+        assert result.method == "kelly_proxy"
         assert 0 < result.position_pct <= 0.10   # capped at kelly_max_position_pct
 
     def test_position_capped_at_max(self, mem_engine):
@@ -132,6 +133,211 @@ class TestPositionSizer:
         result = sizer.calculate("AAPL", "BUY", equity=100_000, entry_price=entry, atr=0.0)
         expected_stop = entry * (1 - config.risk.fixed_stop_loss_pct)
         assert abs(result.stop_price - expected_stop) < 0.01
+
+    def test_realised_kelly_history_used_when_threshold_met(self, mem_engine):
+        """When ``kelly_history`` carries enough trades and a positive ``f_star``,
+        the sizer reports ``method='kelly_realised'`` and the position is sized
+        from Kelly (capped at the hard limit)."""
+        from config.settings import config
+        sizer = self._sizer()
+        # Fabricate a realised history that clears min_trades_for_realised_kelly
+        # with a healthy edge (60% win rate, b=1.5).
+        kelly_history = {
+            "n_trades":     max(config.risk.min_trades_for_realised_kelly, 30),
+            "win_rate":     0.60,
+            "avg_win_pct":  0.03,
+            "avg_loss_pct": 0.02,
+            "b":            1.5,
+            "f_star":       (0.60 * 1.5 - 0.40) / 1.5,   # 0.333
+        }
+        result = sizer.calculate(
+            "AAPL", "BUY", equity=100_000, entry_price=200.0, atr=4.0,
+            kelly_history=kelly_history,
+        )
+        assert result.method == "kelly_realised"
+        assert 0 < result.position_pct <= config.risk.kelly_max_position_pct
+
+    def test_realised_kelly_below_threshold_falls_back_to_proxy(self, mem_engine):
+        """``n_trades < min_trades_for_realised_kelly`` falls back to the
+        signal_log proxy (or fixed when signal_log is also empty)."""
+        sizer = self._sizer()
+        kelly_history = {
+            "n_trades":     5,         # below default 30
+            "win_rate":     0.6,
+            "avg_win_pct":  0.03,
+            "avg_loss_pct": 0.02,
+            "b":            1.5,
+            "f_star":       0.333,
+        }
+        result = sizer.calculate(
+            "AAPL", "BUY", equity=100_000, entry_price=200.0, atr=4.0,
+            kelly_history=kelly_history,
+        )
+        # Empty signal_log → proxy falls through to fixed.
+        assert result.method == "fixed"
+
+    def test_realised_kelly_undefined_falls_back(self, mem_engine):
+        """``f_star=None`` (e.g. all-wins or all-losses history) is treated as
+        insufficient and falls back to the proxy/fixed path."""
+        sizer = self._sizer()
+        kelly_history = {
+            "n_trades":     50,
+            "win_rate":     1.0,
+            "avg_win_pct":  0.03,
+            "avg_loss_pct": 0.0,
+            "b":            None,
+            "f_star":       None,
+        }
+        result = sizer.calculate(
+            "AAPL", "BUY", equity=100_000, entry_price=200.0, atr=4.0,
+            kelly_history=kelly_history,
+        )
+        assert result.method == "fixed"
+
+    def test_realised_kelly_negative_fstar_floors_to_zero(self, mem_engine):
+        """A negative ``f_star`` (lose-heavy history) yields ``position_pct=0``
+        — the sizer never proposes a negative or below-zero position."""
+        sizer = self._sizer()
+        kelly_history = {
+            "n_trades":     50,
+            "win_rate":     0.30,
+            "avg_win_pct":  0.01,
+            "avg_loss_pct": 0.04,
+            "b":            0.25,
+            "f_star":       (0.30 * 0.25 - 0.70) / 0.25,   # negative
+        }
+        result = sizer.calculate(
+            "AAPL", "BUY", equity=100_000, entry_price=200.0, atr=4.0,
+            kelly_history=kelly_history,
+        )
+        # Method label still reflects the realised path; pct is floored at 0.
+        assert result.method == "kelly_realised"
+        assert result.position_pct == 0.0
+        assert result.shares == 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# compute_realised_kelly
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestComputeRealisedKelly:
+    """Phase C — realised-Kelly statistics from ``trade_log``."""
+
+    def _seed_trade(
+        self,
+        engine,
+        symbol: str = "AAPL",
+        pnl_pct: float = 0.05,
+        entry_ts: datetime | None = None,
+        source: str = "walk_forward",
+        run_id: str = "run-A",
+        fold_index: int = 0,
+    ) -> None:
+        from data.database import TradeLog
+        ts = entry_ts or _now()
+        with Session(engine) as session:
+            session.add(TradeLog(
+                source=source,
+                run_id=run_id,
+                fold_index=fold_index,
+                symbol=symbol,
+                signal="BUY",
+                entry_ts=ts,
+                entry_px=100.0,
+                exit_ts=ts + timedelta(days=1),
+                exit_px=100.0 * (1 + pnl_pct),
+                exit_reason="tp" if pnl_pct > 0 else "stop",
+                shares=10.0,
+                pnl=pnl_pct * 100.0 * 10.0,
+                pnl_pct=pnl_pct,
+                costs_charged=0.0,
+                recorded_at=ts,
+            ))
+            session.commit()
+
+    def test_returns_none_when_no_trades(self, mem_engine):
+        from risk.position_sizer import compute_realised_kelly
+        assert compute_realised_kelly("AAPL") is None
+
+    def test_basic_win_loss_stats(self, mem_engine):
+        """Mixed wins and losses produce sensible (p, b, f*)."""
+        from risk.position_sizer import compute_realised_kelly
+        # 6 wins at +5%, 4 losses at -2.5% → p=0.6, b=2.0, f*=(0.6*2-0.4)/2=0.4
+        for _ in range(6):
+            self._seed_trade(mem_engine, pnl_pct=0.05)
+        for _ in range(4):
+            self._seed_trade(mem_engine, pnl_pct=-0.025)
+
+        out = compute_realised_kelly("AAPL")
+        assert out is not None
+        assert out["n_trades"]    == 10
+        assert out["win_rate"]    == pytest.approx(0.6)
+        assert out["avg_win_pct"] == pytest.approx(0.05)
+        assert out["avg_loss_pct"] == pytest.approx(0.025)
+        assert out["b"]           == pytest.approx(2.0)
+        assert out["f_star"]      == pytest.approx(0.4)
+
+    def test_forward_only_invariant_via_as_of(self, mem_engine):
+        """``as_of`` filters out trades whose entry_ts is on or after the cutoff —
+        the WF orchestrator relies on this to avoid lookahead."""
+        from risk.position_sizer import compute_realised_kelly
+        now = _now()
+        # Two old wins (entry_ts < cutoff) and one future loss (entry_ts > cutoff).
+        self._seed_trade(mem_engine, pnl_pct=+0.05, entry_ts=now - timedelta(days=10))
+        self._seed_trade(mem_engine, pnl_pct=+0.05, entry_ts=now - timedelta(days=5))
+        self._seed_trade(mem_engine, pnl_pct=-0.10, entry_ts=now + timedelta(days=1))
+
+        out = compute_realised_kelly("AAPL", as_of=now)
+        assert out is not None
+        # Only the two old wins should be counted.
+        assert out["n_trades"] == 2
+        # All wins → Kelly undefined.
+        assert out["f_star"]   is None
+
+    def test_run_id_filter(self, mem_engine):
+        """``run_id`` scopes the query so a fresh WF run cannot pick up trades
+        from a previous run with different ensemble weights."""
+        from risk.position_sizer import compute_realised_kelly
+        for _ in range(5):
+            self._seed_trade(mem_engine, pnl_pct=+0.05, run_id="run-OLD")
+        for _ in range(3):
+            self._seed_trade(mem_engine, pnl_pct=-0.025, run_id="run-NEW")
+
+        out_new = compute_realised_kelly("AAPL", run_id="run-NEW")
+        assert out_new is not None
+        assert out_new["n_trades"] == 3
+
+        out_old = compute_realised_kelly("AAPL", run_id="run-OLD")
+        assert out_old is not None
+        assert out_old["n_trades"] == 5
+
+    def test_source_filter(self, mem_engine):
+        """``source='live'`` excludes walk_forward rows so OrderManager sizes
+        from real fills only, not WF backtest noise."""
+        from risk.position_sizer import compute_realised_kelly
+        self._seed_trade(mem_engine, source="walk_forward")
+        self._seed_trade(mem_engine, source="walk_forward")
+        self._seed_trade(mem_engine, source="live")
+
+        out_live = compute_realised_kelly("AAPL", source="live")
+        assert out_live is not None
+        assert out_live["n_trades"] == 1
+
+        out_wf = compute_realised_kelly("AAPL", source="walk_forward")
+        assert out_wf is not None
+        assert out_wf["n_trades"] == 2
+
+    def test_all_wins_returns_undefined_kelly(self, mem_engine):
+        """All-winners history → b/f_star=None; the sizer treats this as
+        insufficient and falls back to the cold-start path."""
+        from risk.position_sizer import compute_realised_kelly
+        for _ in range(5):
+            self._seed_trade(mem_engine, pnl_pct=+0.05)
+        out = compute_realised_kelly("AAPL")
+        assert out is not None
+        assert out["n_trades"] == 5
+        assert out["b"]        is None
+        assert out["f_star"]   is None
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -330,7 +330,10 @@ display_df = trades_df.rename(columns={
     "shares":        "Shares",
     "entry_px":      "Entry $",
     "exit_px":       "Exit $",
-    "pnl":           "Gross P&L",
+    # ``pnl`` is already net of costs (see ui_queries.query_trade_log
+    # docstring).  Display the back-derived ``gross_pnl`` under "Gross P&L"
+    # and the stored ``pnl`` (== net_pnl) under "Net P&L".
+    "gross_pnl":     "Gross P&L",
     "costs_charged": "Fees",
     "net_pnl":       "Net P&L",
     "pnl_pct":       "P&L %",
@@ -405,9 +408,9 @@ with chart_l:
         "*gross* curve in your head — the gap is what fees cost you."
     )
 
-    cum_df = trades_df.sort_values("exit_ts")[["exit_ts", "net_pnl", "pnl"]].copy()
+    cum_df = trades_df.sort_values("exit_ts")[["exit_ts", "net_pnl", "gross_pnl"]].copy()
     cum_df["Net Cumulative"]   = cum_df["net_pnl"].cumsum()
-    cum_df["Gross Cumulative"] = cum_df["pnl"].cumsum()
+    cum_df["Gross Cumulative"] = cum_df["gross_pnl"].cumsum()
 
     cum_fig = go.Figure()
     cum_fig.add_trace(go.Scatter(
@@ -509,7 +512,9 @@ with st.expander("📊  Per-symbol breakdown"):
         n           = len(g)
         wins        = int((g["net_pnl"] > 0).sum())
         win_rate    = wins / n if n else 0.0
-        gross_pnl   = float(g["pnl"].sum())
+        # ``gross_pnl`` is the back-derived column from query_trade_log;
+        # ``pnl`` would mistakenly equal net here (see double-counting bug).
+        gross_pnl   = float(g["gross_pnl"].sum())
         costs       = float(g["costs_charged"].fillna(0.0).sum())
         net_pnl     = float(g["net_pnl"].sum())
         avg_hold    = float(g["holding_days"].mean())
