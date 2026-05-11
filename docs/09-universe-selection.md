@@ -34,7 +34,7 @@ All US-listed equities (via Alpaca)    ~10,000 symbols
               ▼
         Liquid, mid-to-large cap        ~300 symbols
               │
-              │ Stage 3: XGBoost ranking
+              │ Stage 3: Momentum + liquidity rank-percentile
               ▼
         Top 50 candidates               50 symbols
               │
@@ -97,39 +97,27 @@ $5M/day ensures the system can enter and exit positions without significant mark
 
 ---
 
-## Stage 3: XGBoost ranking
+## Stage 3: Momentum + liquidity rank-percentile
 
-Stage 3 ranks the surviving ~300 candidates and selects the top `stage3_max` (default 50) based on a composite score.
-
-### Scoring model
-
-If an XGBoost checkpoint exists (from `train_models.py`), it's loaded and used to score each candidate:
+Stage 3 ranks the surviving ~300 candidates and selects the top `stage3_max` (default 50) on a transparent two-factor blend:
 
 ```python
-features = [
-    market_cap, avg_dollar_volume,
-    pe_ratio, forward_pe, price_to_book,
-    revenue_growth, earnings_growth,
-    profit_margin, roe, debt_to_equity,
-    ...
-]
-score = xgb_model.predict(features)
+score = 0.5 × pct_rank(20-day return)
+      + 0.5 × pct_rank(avg_dollar_volume)
 ```
 
-Candidates are ranked by score, highest first, and the top 50 are selected.
+Both inputs use **rank-percentile** rather than the raw value — that means:
+- A single mega-cap with $10B/day ADV doesn't dominate the score scale; it just gets the top liquidity rank.
+- Scaling either input by a constant (or any monotonic transform) doesn't change the ordering.
+- The score is always in `[0, 1]` regardless of input units.
 
-### Fallback: market cap ranking
+Symbols missing OHLCV bars after the pre-stage backfill (fewer than 21 cached bars) get the worst momentum rank automatically.
 
-If no XGBoost checkpoint exists (e.g., before initial training), Stage 3 falls back to simple market cap ranking — larger companies first. This is a reasonable proxy because large-cap stocks are generally more liquid and have more reliable data.
+### Why not an ML model?
 
-### Why XGBoost for ranking?
+The previous Stage 3 ranker loaded one symbol's XGBoost checkpoint (whichever was first alphabetically in `models/cache/`) and applied it as a universal classifier to every other Stage 2 survivor. That's not a meaningful question — the per-symbol model only learned its own price/indicator history, not a general "is this stock attractive" function. The 2026-05-10 weekly run dropped INTC, BA, AZN, VALE, and UAL — five of the universe's top WF-Sharpe symbols — because the AAOI model rated them poorly.
 
-XGBoost captures non-linear interactions between factors:
-- High growth + reasonable valuation → high score
-- High growth + extreme valuation → lower score (growth already priced in)
-- High market cap + low volume → flag as potentially illiquid despite size
-
-A linear ranking model would miss these interactions.
+A proper cross-sectional ranker (a model trained explicitly on `(symbol, current_indicators) → forward return` pairs across the whole universe) would be a multi-day project; for the role Stage 3 actually plays — pre-filtering 300 candidates down to 50 worth training deep models on — momentum + liquidity is enough. The per-symbol ensemble in walk-forward is what's supposed to predict returns.
 
 ---
 
@@ -163,9 +151,9 @@ Fixtures bypass all three funnel stages and are never removed by the scoring pro
 | Run | When | What happens |
 |-----|------|-------------|
 | Full refresh | Sunday 01:00 | All three stages; new candidates replace old universe |
-| Daily rescore | Mon–Sat 05:30 | Stage 3 only; XGBoost re-scores existing candidates; doesn't add new symbols |
+| Daily rescore | Mon–Sat 05:30 | Stage 3 only; re-ranks existing candidates by current momentum + ADV; doesn't add new symbols |
 
-The daily rescore is fast (seconds) because it skips the expensive Alpaca API call (Stage 1) and liquidity filter (Stage 2). It just re-ranks the already-approved candidate pool with the latest fundamental data.
+The daily rescore is fast (seconds) because it skips the expensive Alpaca API call (Stage 1) and liquidity filter (Stage 2). It just re-ranks the already-approved candidate pool with the latest 20-day momentum and dollar-volume figures.
 
 ### Why not refresh daily?
 
@@ -187,7 +175,7 @@ One row per candidate symbol:
 | `stage` | Which stage it passed through (1, 2, or 3) |
 | `market_cap` | Market capitalization from fundamentals |
 | `avg_dollar_volume` | 20-bar average dollar volume |
-| `xgb_score` | Stage 3 XGBoost score |
+| `stage3_score` | Stage 3 rank-percentile blend of 20d return + ADV, in [0, 1] |
 | `added_at` | When it entered the universe |
 | `last_scored_at` | When it was last rescored |
 | `removed_at` | When it was removed (if not active) |

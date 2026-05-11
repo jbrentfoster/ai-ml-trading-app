@@ -29,7 +29,7 @@ def _make_asset(symbol: str, is_fixture: bool = False,
         "is_fixture":        is_fixture,
         "market_cap":        market_cap,
         "avg_dollar_volume": avg_dollar_volume,
-        "xgb_score":         None,
+        "stage3_score":      None,
         "active":            True,
         "added_at":          _now(),
         "last_scored_at":    None,
@@ -65,7 +65,6 @@ class TestStage1:
 
             sel = UniverseSelector.__new__(UniverseSelector)
             sel._cfg = mock_cfg.universe
-            sel._xgb = None
 
             with patch("alpaca.trading.client.TradingClient",
                        side_effect=RuntimeError("network error")):
@@ -98,7 +97,6 @@ class TestStage1:
 
             sel = UniverseSelector.__new__(UniverseSelector)
             sel._cfg = mock_cfg.universe
-            sel._xgb = None
 
             assets = sel._stage1_fetch(run_id="test-run")
 
@@ -120,7 +118,6 @@ class TestStage1:
 
             sel = UniverseSelector.__new__(UniverseSelector)
             sel._cfg = mock_cfg.universe
-            sel._xgb = None
 
             with pytest.raises(UniverseError, match="ALPACA_API_KEY"):
                 sel._stage1_fetch(run_id="test-run")
@@ -133,7 +130,6 @@ class TestStage2:
     def _sel(self, min_mkt_cap=1e9, min_dv=5e6):
         from data.universe import UniverseSelector
         sel = UniverseSelector.__new__(UniverseSelector)
-        sel._xgb = None
         sel._cfg = MagicMock()
         sel._cfg.min_market_cap        = min_mkt_cap
         sel._cfg.min_avg_dollar_volume = min_dv
@@ -213,75 +209,129 @@ class TestStage2:
 
 class TestStage3:
 
-    def _sel(self, xgb_model=None, stage3_max=3):
+    def _sel(self, stage3_max=3):
         from data.universe import UniverseSelector
         sel = UniverseSelector.__new__(UniverseSelector)
-        sel._xgb = xgb_model
         sel._cfg = MagicMock()
         sel._cfg.stage3_max = stage3_max
         sel._cfg.permanent_fixtures = []
         return sel
 
-    def test_stage3_no_xgb_sorts_by_market_cap(self):
-        """When xgb_model is None, top-N by market_cap are selected."""
-        assets = [
-            _make_asset("BIG",   market_cap=100e9),
-            _make_asset("MED",   market_cap=50e9),
-            _make_asset("SMALL", market_cap=5e9),
-            _make_asset("TINY",  market_cap=1e9),
-        ]
-        with patch("data.universe.log_universe_run"):
-            result = self._sel(stage3_max=2)._stage3_score(assets, "r1")
-        syms = [a["symbol"] for a in result]
-        assert syms == ["BIG", "MED"]
+    def _bars_with_return(self, ret_pct: float) -> pd.DataFrame:
+        """21-bar OHLCV frame whose 20-bar return equals ret_pct (e.g. 0.05 = +5%)."""
+        idx   = pd.date_range("2024-01-01", periods=21, freq="B")
+        close = [100.0] * 20 + [100.0 * (1.0 + ret_pct)]
+        return pd.DataFrame({
+            "Open": close, "High": close, "Low": close,
+            "Close": close, "Volume": 1_000_000,
+        }, index=idx)
 
-    def test_stage3_with_xgb_uses_scores(self):
-        """XGBoost scores determine ranking when model is provided."""
+    def _patch_get_bars(self, return_map: dict[str, float]):
+        """Returns a side_effect for get_bars that serves per-symbol returns."""
+        def _side_effect(sym, interval, limit=None):
+            ret = return_map.get(sym)
+            if ret is None:
+                return pd.DataFrame()    # no bars -> momentum = NaN
+            return self._bars_with_return(ret)
+        return _side_effect
+
+    def test_stage3_ranks_by_momentum_plus_liquidity(self):
+        """Top-ranked symbol leads on both 20-day return AND ADV."""
         assets = [
-            _make_asset("LOW_CAP_HIGH_SCORE", market_cap=1e9),
-            _make_asset("HIGH_CAP_LOW_SCORE", market_cap=100e9),
+            _make_asset("WINNER",   avg_dollar_volume=100e6),  # high ADV
+            _make_asset("MIDDLE",   avg_dollar_volume=20e6),
+            _make_asset("LOSER",    avg_dollar_volume=5e6),    # low ADV
         ]
-        mock_xgb = MagicMock()
-        # Low-cap symbol gets higher XGB score
-        mock_xgb.predict.side_effect = lambda df: (
-            0.9 if df is not None else 0.0
-        )
+        return_map = {"WINNER": 0.10, "MIDDLE": 0.02, "LOSER": -0.05}
 
         with patch("data.universe.log_universe_run"), \
-             patch("data.universe.IndicatorEngine") as mock_ie:
+             patch("data.universe.get_bars",
+                   side_effect=self._patch_get_bars(return_map)), \
+             patch("data.universe.DataFetcher"):
+            result = self._sel(stage3_max=1)._stage3_score(assets, "r1")
 
-            mock_ie.return_value.run.return_value = pd.DataFrame({"Close": [100]})
-            # Patch predict to return different scores per call
-            scores = iter([0.9, 0.1])
-            mock_xgb.predict.side_effect = lambda df: next(scores)
-            result = self._sel(xgb_model=mock_xgb, stage3_max=1)._stage3_score(assets, "r1")
+        assert result[0]["symbol"] == "WINNER"
 
-        assert result[0]["symbol"] == "LOW_CAP_HIGH_SCORE"
+    def test_stage3_scale_invariant_in_adv(self):
+        """Scaling one symbol's ADV up 1000x doesn't change scores when
+        the ADV ordering is preserved — rank-percentile is what matters."""
+        from data.universe import UniverseSelector
+
+        return_map = {"A": 0.05, "B": 0.02, "C": -0.01}
+
+        def _scored(adv_top: float) -> dict[str, float]:
+            assets = [
+                _make_asset("A", avg_dollar_volume=adv_top),
+                _make_asset("B", avg_dollar_volume=20e6),
+                _make_asset("C", avg_dollar_volume=10e6),
+            ]
+            with patch("data.universe.log_universe_run"), \
+                 patch("data.universe.get_bars",
+                       side_effect=self._patch_get_bars(return_map)), \
+                 patch("data.universe.DataFetcher"):
+                result = self._sel(stage3_max=3)._stage3_score(assets, "r1")
+            return {a["symbol"]: a["stage3_score"] for a in result}
+
+        baseline = _scored(50e6)         # A is the highest, modestly
+        stretched = _scored(50_000e6)    # A is the highest by 1000x
+
+        for sym in ("A", "B", "C"):
+            assert abs(baseline[sym] - stretched[sym]) < 1e-9, (
+                f"{sym} score changed under ADV scaling: "
+                f"{baseline[sym]} vs {stretched[sym]}"
+            )
 
     def test_stage3_fixtures_always_included(self):
         """Fixtures are retained even if they would be below the top-N cutoff."""
-        fixture = _make_asset("SPY", is_fixture=True, market_cap=500e9)
-        others  = [_make_asset(f"SYM{i}", market_cap=float(10 - i) * 1e9) for i in range(5)]
+        fixture = _make_asset("SPY", is_fixture=True, avg_dollar_volume=50e6)
+        others  = [_make_asset(f"SYM{i}", avg_dollar_volume=10e6) for i in range(5)]
+        return_map = {f"SYM{i}": 0.01 * (i + 1) for i in range(5)}
 
-        with patch("data.universe.log_universe_run"):
+        with patch("data.universe.log_universe_run"), \
+             patch("data.universe.get_bars",
+                   side_effect=self._patch_get_bars(return_map)), \
+             patch("data.universe.DataFetcher"):
             result = self._sel(stage3_max=2)._stage3_score([fixture] + others, "r1")
 
         syms = [a["symbol"] for a in result]
         assert "SPY" in syms
 
-    def test_stage3_handles_xgb_exception(self):
-        """XGB exception per symbol is caught; score defaults to 0.0."""
-        assets   = [_make_asset("ERRSY", market_cap=5e9)]
-        mock_xgb = MagicMock()
-        mock_xgb.predict.side_effect = RuntimeError("model error")
+    def test_stage3_missing_bars_falls_back_to_zero_momentum(self):
+        """Symbol with no cached bars gets the worst momentum percentile."""
+        assets = [
+            _make_asset("HAS_BARS",    avg_dollar_volume=10e6),
+            _make_asset("NO_BARS",     avg_dollar_volume=10e6),
+        ]
+        # NO_BARS returns empty DataFrame
+        return_map = {"HAS_BARS": 0.05}
 
         with patch("data.universe.log_universe_run"), \
-             patch("data.universe.IndicatorEngine") as mock_ie:
+             patch("data.universe.get_bars",
+                   side_effect=self._patch_get_bars(return_map)), \
+             patch("data.universe.DataFetcher"):
+            result = self._sel(stage3_max=2)._stage3_score(assets, "r1")
 
-            mock_ie.return_value.run.return_value = pd.DataFrame({"Close": [100]})
-            result = self._sel(xgb_model=mock_xgb, stage3_max=5)._stage3_score(assets, "r1")
+        scored = {a["symbol"]: a["stage3_score"] for a in result}
+        # Tied liquidity (both 0.5 pct rank), but HAS_BARS leads on momentum.
+        assert scored["HAS_BARS"] > scored["NO_BARS"]
 
-        assert result[0]["xgb_score"] == 0.0
+    def test_stage3_score_in_zero_one_range(self):
+        """stage3_score is always in [0, 1] regardless of input scale."""
+        assets = [
+            _make_asset(f"SYM{i}", avg_dollar_volume=float(i + 1) * 1e6)
+            for i in range(10)
+        ]
+        # Wild range of returns including negative
+        return_map = {f"SYM{i}": (i - 5) * 0.05 for i in range(10)}
+
+        with patch("data.universe.log_universe_run"), \
+             patch("data.universe.get_bars",
+                   side_effect=self._patch_get_bars(return_map)), \
+             patch("data.universe.DataFetcher"):
+            result = self._sel(stage3_max=10)._stage3_score(assets, "r1")
+
+        for a in result:
+            assert 0.0 <= a["stage3_score"] <= 1.0
 
 
 # ── Run result / persistence ──────────────────────────────────────────────────
@@ -381,7 +431,7 @@ class TestDbHelpers:
             "stage":             3,
             "market_cap":        5e9,
             "avg_dollar_volume": 10e6,
-            "xgb_score":         0.42,
+            "stage3_score":      0.42,
             "active":            True,
             "added_at":          _now(),
             "last_scored_at":    _now(),
@@ -391,7 +441,7 @@ class TestDbHelpers:
         df = get_universe_assets(active_only=True)
         assert len(df) == 1
         assert df.iloc[0]["symbol"] == "TEST"
-        assert abs(df.iloc[0]["xgb_score"] - 0.42) < 1e-6
+        assert abs(df.iloc[0]["stage3_score"] - 0.42) < 1e-6
 
     def test_log_universe_run_roundtrip(self, db_engine):
         from data.database import log_universe_run, get_universe_run_log

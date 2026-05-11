@@ -133,7 +133,7 @@ col2.metric("Stage 2 — Liquidity Filter",   f"{s2:,}" if s2 else "—",
             help=f"Market cap ≥ ${config.universe.min_market_cap/1e9:.1f}B AND "
                  f"avg daily $ vol ≥ ${config.universe.min_avg_dollar_volume/1e6:.0f}M")
 col3.metric("Stage 3 — Final Candidates",   f"{s3:,}" if s3 else "—",
-            help="Top symbols by XGBoost score (or market cap if no model)")
+            help="Top symbols by 20-day return + avg dollar volume (rank-percentile blend)")
 
 if s1 > 0:
     fig_funnel = go.Figure(go.Funnel(
@@ -153,9 +153,10 @@ if s1 > 0:
         "**How to read this chart:** each bar shows how many symbols survived "
         "that stage. Stage 1 starts with all active, tradable US equities on "
         "Alpaca. Stage 2 drops anything below the market-cap and dollar-volume "
-        "thresholds. Stage 3 keeps the top-ranked names by XGBoost score "
-        "(or market cap when no model is available). Permanent fixtures — index "
-        "and sector ETFs — are always included regardless of score."
+        "thresholds. Stage 3 ranks the survivors on a 50/50 blend of 20-day "
+        "return percentile and average-dollar-volume percentile, then keeps "
+        "the top `stage3_max`. Permanent fixtures — index and sector ETFs — "
+        "are always included regardless of score."
     )
 else:
     st.info(
@@ -183,7 +184,7 @@ else:
     # Format for display
     display_cols = [c for c in
                     ["Symbol", "Name", "Class", "Fixture", "Stage",
-                     "Market Cap", "Avg $ Volume", "XGB Score", "Added", "Last Scored"]
+                     "Market Cap", "Avg $ Volume", "Stage 3 Score", "Added", "Last Scored"]
                     if c in df_active.columns]
     df_show = df_active[display_cols].copy()
 
@@ -195,8 +196,8 @@ else:
         df_show["Avg $ Volume"] = df_show["Avg $ Volume"].apply(
             lambda v: f"${v/1e6:.1f}M" if pd.notna(v) and v else "—"
         )
-    if "XGB Score" in df_show.columns:
-        df_show["XGB Score"] = df_show["XGB Score"].apply(
+    if "Stage 3 Score" in df_show.columns:
+        df_show["Stage 3 Score"] = df_show["Stage 3 Score"].apply(
             lambda v: f"{v:.3f}" if pd.notna(v) and v is not None else "—"
         )
 
@@ -208,8 +209,8 @@ else:
         "**Market Cap** — from yfinance fundamentals (24h cache). "
         "**Avg $ Volume** — average daily dollar volume = "
         "(close price × volume).mean() over most-recent 20 trading days. "
-        "**XGB Score** — XGBoost model score in [-1, 1]; higher = more bullish. "
-        "Blank when no model was loaded for Stage 3."
+        "**Stage 3 Score** — `0.5 × pct_rank(20d_return) + 0.5 × pct_rank(ADV)` "
+        "in [0, 1]; higher = stronger combination of recent momentum and liquidity."
     )
 
 

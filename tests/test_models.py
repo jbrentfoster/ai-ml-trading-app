@@ -134,6 +134,65 @@ class TestXGBoostModel:
             score = model.predict(df)
             assert -1.0 <= score <= 1.0
 
+    def test_inf_fundamentals_replaced_with_zero(self):
+        """POET 2026-05-11: yfinance returned forward_pe=inf, crashing XGBoost training.
+
+        Backstop in _build_features must replace ±inf with 0.0 so training and
+        prediction never see non-finite values.
+        """
+        import math
+        from models.xgboost_model import XGBoostModel
+        with patch("models.xgboost_model.FundamentalsClient") as MockFund:
+            MockFund.return_value.get_feature_vector.return_value = {
+                "forward_pe":     math.inf,
+                "pe_ratio":      -math.inf,
+                "ev_to_ebitda":   math.nan,
+                "market_cap":     1.5e9,
+            }
+            model = XGBoostModel(symbol="POET")
+            df = _make_bars(200)
+            # Would raise XGBoostError before the fix
+            model.train(df)
+            score = model.predict(df)
+            assert -1.0 <= score <= 1.0
+
+
+# ── FundamentalsClient ────────────────────────────────────────────────────────
+
+class TestFundamentalsHelpers:
+
+    def test_safe_float_rejects_inf(self):
+        import math
+        from data.fundamentals import _safe_float
+        assert _safe_float(math.inf) is None
+        assert _safe_float(-math.inf) is None
+        assert _safe_float(math.nan) is None
+        assert _safe_float(42.0) == 42.0
+        assert _safe_float(None, fallback=0.0) == 0.0
+
+    def test_get_feature_vector_replaces_inf_from_cache(self):
+        """Existing cached fundamentals rows (pre-fix) may still contain inf
+        for up to 24h until the TTL refresh writes a None instead. Read path
+        must coerce inf to 0.0 so XGBoost never sees it."""
+        import math
+        from data.fundamentals import FundamentalsClient
+        cached = {
+            "fetched_at":      datetime.now(timezone.utc).replace(tzinfo=None),
+            "market_cap":      1.5e9,
+            "forward_pe":      math.inf,
+            "pe_ratio":       -math.inf,
+            "ev_to_ebitda":    math.nan,
+            "revenue_growth":  0.1,
+        }
+        with patch("data.fundamentals.get_fundamentals", return_value=cached):
+            client = FundamentalsClient()
+            vec = client.get_feature_vector("POET")
+        assert vec["forward_pe"]    == 0.0
+        assert vec["pe_ratio"]      == 0.0
+        assert vec["ev_to_ebitda"]  == 0.0
+        assert vec["market_cap"]    == 1.5e9
+        assert vec["revenue_growth"] == pytest.approx(0.1)
+
 
 # ── FinBERTModel ──────────────────────────────────────────────────────────────
 

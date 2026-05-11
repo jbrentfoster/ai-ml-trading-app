@@ -299,7 +299,7 @@ def query_universe_assets(active_only: bool = True) -> pd.DataFrame:
         "stage":             "Stage",
         "market_cap":        "Market Cap",
         "avg_dollar_volume": "Avg $ Volume",
-        "xgb_score":         "XGB Score",
+        "stage3_score":      "Stage 3 Score",
         "active":            "Active",
         "added_at":          "Added",
         "last_scored_at":    "Last Scored",

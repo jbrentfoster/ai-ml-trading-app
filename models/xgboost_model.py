@@ -77,7 +77,11 @@ class XGBoostModel(BaseModel):
         for col in _FUNDAMENTAL_FEATURES:
             feat[col] = fund_vec.get(col, 0.0)
 
-        return feat.fillna(0.0)
+        # Backstop: yfinance can return inf for undefined ratios (e.g. forward P/E
+        # with zero forward earnings), and indicator NaN-divisions could also leak
+        # non-finite values. XGBoost rejects inf unless `missing=inf` is set; we
+        # treat inf the same as NaN — fill with 0.0.
+        return feat.replace([np.inf, -np.inf], 0.0).fillna(0.0)
 
     def _build_labels(self, df: pd.DataFrame) -> pd.Series:
         """Binary label: 1 if close is higher _FORWARD_BARS bars later, else 0."""

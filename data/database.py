@@ -228,7 +228,7 @@ class UniverseAsset(Base):
     stage           = Column(Integer)       # last funnel stage reached (1/2/3)
     market_cap      = Column(Float)
     avg_dollar_volume = Column(Float)       # (close x volume).mean() over 20 bars
-    xgb_score       = Column(Float)        # Stage 3 XGBoost score; None if not scored
+    stage3_score    = Column(Float)        # Stage 3 rank-percentile blend of 20d return + ADV; None if not scored
     active          = Column(Boolean, default=True)
     added_at        = Column(DateTime, nullable=False)
     last_scored_at  = Column(DateTime)
@@ -423,6 +423,14 @@ def _migrate(engine) -> None:
                 ))
                 conn.commit()
                 log.info("Migration applied: universe_assets.exchange")
+            # universe_assets.xgb_score → stage3_score (Stage 3 ranker switched
+            # from per-symbol XGBoost hijack to momentum + ADV rank-percentile)
+            if "xgb_score" in ua_cols and "stage3_score" not in ua_cols:
+                conn.execute(text(
+                    "ALTER TABLE universe_assets RENAME COLUMN xgb_score TO stage3_score"
+                ))
+                conn.commit()
+                log.info("Migration applied: universe_assets.xgb_score -> stage3_score")
 
         # signal_runner_log.skipped_duplicates + longs_closed  (added for GOOG/GOOGL dedup
         # and long-only SELL tracking)
@@ -861,7 +869,7 @@ def get_universe_assets(active_only: bool = True) -> pd.DataFrame:
         "stage":             r.stage,
         "market_cap":        r.market_cap,
         "avg_dollar_volume": r.avg_dollar_volume,
-        "xgb_score":         r.xgb_score,
+        "stage3_score":      r.stage3_score,
         "active":            r.active,
         "added_at":          r.added_at,
         "last_scored_at":    r.last_scored_at,

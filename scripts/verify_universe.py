@@ -113,7 +113,7 @@ def main() -> int:
             stage1_assets = [
                 {"symbol": s, "name": s, "asset_class": "etf",
                  "is_fixture": True, "market_cap": None, "avg_dollar_volume": None,
-                 "xgb_score": None, "active": True}
+                 "stage3_score": None, "active": True}
                 for s in config.universe.permanent_fixtures
             ]
             _result(True,
@@ -169,7 +169,7 @@ def main() -> int:
             "stage":             3,
             "market_cap":        1e9,
             "avg_dollar_volume": 5e6,
-            "xgb_score":         0.5,
+            "stage3_score":      0.5,
             "active":            True,
             "added_at":          now,
             "last_scored_at":    now,

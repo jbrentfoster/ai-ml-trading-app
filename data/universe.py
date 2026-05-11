@@ -7,7 +7,8 @@ Three-stage funnel:
   Stage 2 — Liquidity / market-cap filter:
              market_cap >= min_market_cap AND
              avg_daily_dollar_volume >= min_avg_dollar_volume
-  Stage 3 — XGBoost ranking (or market-cap ranking if no model):
+  Stage 3 — Rank-percentile blend of 20-day return + average dollar volume:
+             score = 0.5 * pct_rank(20d_return) + 0.5 * pct_rank(ADV)
              keep top stage3_max candidates
 
 Permanent fixtures (SPY, QQQ, sector ETFs, etc.) bypass every filter and
@@ -22,7 +23,6 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING
 
 import pandas as pd
 
@@ -38,10 +38,6 @@ from data.database import (
 )
 from data.fetcher import DataFetcher
 from data.fundamentals import FundamentalsClient
-from data.indicators import IndicatorEngine
-
-if TYPE_CHECKING:
-    from models.xgboost_model import XGBoostModel
 
 log = get_logger("data.universe")
 
@@ -65,17 +61,15 @@ class UniverseSelector:
     """
     Drives the three-stage universe selection funnel.
 
-    Parameters
-    ----------
-    xgb_model:
-        Optional trained XGBoostModel instance.  When provided it is used to
-        score symbols in Stage 3.  When None, Stage 3 falls back to sorting
-        by market cap descending.
+    Stage 3 ranks candidates by a transparent rank-percentile blend of
+    20-day price return and 20-bar average dollar volume.  No ML model
+    is involved — see Known Issue history for why the previous XGBoost
+    path (which loaded one symbol's checkpoint and applied it to every
+    other symbol) was removed.
     """
 
-    def __init__(self, xgb_model: XGBoostModel | None = None) -> None:
+    def __init__(self) -> None:
         self._cfg = config.universe
-        self._xgb = xgb_model
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -362,66 +356,74 @@ class UniverseSelector:
 
     def _stage3_score(self, assets: list[dict], run_id: str) -> list[dict]:
         """
-        Score assets and keep the top stage3_max.
+        Rank non-fixture candidates by a transparent momentum + liquidity blend:
 
-        If self._xgb is available, calls xgb_model.predict(indicator_df) per symbol.
-        Otherwise sorts by market_cap descending (None treated as 0).
+            score = 0.5 * rank_pct(20d_return) + 0.5 * rank_pct(avg_dollar_volume)
+
+        Both axes use rank-percentile so the score is robust to outliers
+        (a single mega-cap with $10B/day ADV doesn't dominate) and
+        invariant to monotonic transformations of either input.
+
+        Symbols missing OHLCV bars get backfilled first; if a candidate still
+        has fewer than 21 bars after backfill, its momentum input is treated
+        as missing and contributes 0 to that half of the score.
+
         Fixtures are always retained regardless of score / rank.
         """
-        t0      = time.monotonic()
+        t0       = time.monotonic()
         run_type = "rescore" if run_id else "full"
-        now     = datetime.now(timezone.utc).replace(tzinfo=None)
+        now      = datetime.now(timezone.utc).replace(tzinfo=None)
 
-        fixtures      = [a for a in assets if a.get("is_fixture")]
-        non_fixtures  = [a for a in assets if not a.get("is_fixture")]
+        fixtures     = [a for a in assets if a.get("is_fixture")]
+        non_fixtures = [a for a in assets if not a.get("is_fixture")]
 
-        if self._xgb is not None:
-            # Backfill OHLCV for any candidate lacking bars — otherwise Stage 3
-            # would assign xgb_score=0.0 and systematically drop new entrants,
-            # reinforcing whatever universe was tracked in previous runs.
-            fetcher = DataFetcher()
-            missing = [a["symbol"] for a in non_fixtures
-                       if get_bars(a["symbol"], "1d", limit=1).empty]
-            if missing:
-                log.info("[universe] Stage 3: backfilling bars for %d new candidates", len(missing))
-                t_bf = time.monotonic()
-                backfilled = 0
-                for sym in missing:
-                    try:
-                        df = fetcher.fetch_symbol(sym, interval="1d", days_back=365)
-                        if not df.empty:
-                            backfilled += 1
-                    except Exception as exc:
-                        log.debug("[universe] Stage 3 backfill failed for %s: %s", sym, exc)
-                log.info("[universe] Stage 3: backfilled %d/%d candidates (%.1fs)",
-                         backfilled, len(missing), time.monotonic() - t_bf)
-
-            engine = IndicatorEngine()
-            scored = 0
-            zero_scored = 0
-            for asset in non_fixtures:
-                sym = asset["symbol"]
+        # Backfill OHLCV for any candidate lacking bars — without this Stage 3
+        # would treat new entrants as missing-data and rank them last,
+        # reinforcing whatever universe was tracked in previous runs.
+        fetcher = DataFetcher()
+        missing = [a["symbol"] for a in non_fixtures
+                   if get_bars(a["symbol"], "1d", limit=1).empty]
+        if missing:
+            log.info("[universe] Stage 3: backfilling bars for %d new candidates", len(missing))
+            t_bf = time.monotonic()
+            backfilled = 0
+            for sym in missing:
                 try:
-                    ind_df = engine.run(sym)
-                    if ind_df.empty:
-                        asset["xgb_score"] = 0.0
-                        zero_scored += 1
-                    else:
-                        asset["xgb_score"] = float(self._xgb.predict(ind_df))
-                        scored += 1
+                    df = fetcher.fetch_symbol(sym, interval="1d", days_back=365)
+                    if not df.empty:
+                        backfilled += 1
                 except Exception as exc:
-                    log.debug("[universe] Stage 3 XGB score failed for %s: %s", sym, exc)
-                    asset["xgb_score"] = 0.0
-                    zero_scored += 1
-            log.info("[universe] Stage 3 scoring: %d scored, %d zero-score fallback",
-                     scored, zero_scored)
-            non_fixtures.sort(key=lambda a: a.get("xgb_score") or 0.0, reverse=True)
-        else:
-            for a in non_fixtures:
-                a["xgb_score"] = None
-            non_fixtures.sort(
-                key=lambda a: a.get("market_cap") or 0.0, reverse=True
-            )
+                    log.debug("[universe] Stage 3 backfill failed for %s: %s", sym, exc)
+            log.info("[universe] Stage 3: backfilled %d/%d candidates (%.1fs)",
+                     backfilled, len(missing), time.monotonic() - t_bf)
+
+        # Compute raw momentum (20-day return) and liquidity (ADV) per symbol.
+        momentum_raw  = []
+        liquidity_raw = []
+        no_bars       = 0
+        for asset in non_fixtures:
+            bars = get_bars(asset["symbol"], "1d", limit=21)
+            if len(bars) >= 21:
+                close_now  = float(bars["Close"].iloc[-1])
+                close_then = float(bars["Close"].iloc[0])
+                ret_20 = (close_now / close_then) - 1.0 if close_then > 0 else None
+            else:
+                ret_20 = None
+                no_bars += 1
+            momentum_raw.append(ret_20)
+            adv = asset.get("avg_dollar_volume")
+            liquidity_raw.append(adv if adv and adv > 0 else None)
+
+        # Rank-percentile both axes; missing values get 0 (worst).
+        mom_pct = pd.Series(momentum_raw, dtype="float64").rank(pct=True).fillna(0.0)
+        liq_pct = pd.Series(liquidity_raw, dtype="float64").rank(pct=True).fillna(0.0)
+
+        for asset, m, l in zip(non_fixtures, mom_pct.tolist(), liq_pct.tolist()):
+            asset["stage3_score"] = 0.5 * float(m) + 0.5 * float(l)
+
+        log.info("[universe] Stage 3 scoring: %d scored, %d missing-bar fallback",
+                 len(non_fixtures) - no_bars, no_bars)
+        non_fixtures.sort(key=lambda a: a.get("stage3_score") or 0.0, reverse=True)
 
         # Take top N non-fixtures; always keep all fixtures
         top_n    = non_fixtures[: self._cfg.stage3_max]
@@ -429,8 +431,8 @@ class UniverseSelector:
 
         # Tag each asset with stage / timestamps
         for a in selected:
-            a["stage"]         = 3
-            a["active"]        = True
+            a["stage"]          = 3
+            a["active"]         = True
             a["last_scored_at"] = now
             a.setdefault("added_at", now)
 

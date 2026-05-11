@@ -17,8 +17,8 @@ Usage:
                                                # AFTER train_models.py has caught up on
                                                # freshly promoted symbols.
 
-The scheduler tries to load a saved XGBoost model for Stage-3 scoring.
-If no checkpoint is found it falls back to market-cap ranking.
+Stage 3 ranks candidates by 20-day return + average dollar volume — no ML
+model is loaded here.
 """
 
 import argparse
@@ -37,38 +37,10 @@ from data.universe import UniverseSelector
 log = get_logger("universe_scheduler")
 
 
-def _load_xgb_model():
-    """
-    Attempt to load a saved XGBoostModel checkpoint.
-    Returns the model instance, or None if no checkpoint exists.
-    """
-    cache_root = Path("models/cache")
-    if not cache_root.exists():
-        return None
-
-    # Look for the first symbol that has a saved xgb checkpoint
-    for sym_dir in sorted(cache_root.iterdir()):
-        ckpt = sym_dir / "xgb.ubj"
-        if ckpt.exists():
-            try:
-                from models.xgboost_model import XGBoostModel
-                model = XGBoostModel()
-                model.load(str(ckpt))
-                log.info("Loaded XGBoost checkpoint from %s for universe scoring", ckpt)
-                return model
-            except Exception as exc:
-                log.warning("Could not load XGBoost checkpoint %s: %s", ckpt, exc)
-
-    log.info("No XGBoost checkpoint found — Stage 3 will use market-cap ranking.")
-    return None
-
-
 def _run_full() -> None:
     log.info("=== Universe: full refresh ===")
     try:
-        xgb   = _load_xgb_model()
-        sel   = UniverseSelector(xgb_model=xgb)
-        result = sel.run_full()
+        result = UniverseSelector().run_full()
         log.info(
             "Full refresh done: S1=%d S2=%d S3=%d  (%.1fs)",
             result.stage1_count, result.stage2_count, result.stage3_count,
@@ -82,9 +54,7 @@ def _run_full() -> None:
 def _run_rescore(run_signals: bool = True) -> None:
     log.info("=== Universe: Stage-3 re-score ===")
     try:
-        xgb    = _load_xgb_model()
-        sel    = UniverseSelector(xgb_model=xgb)
-        result = sel.run_rescore()
+        result = UniverseSelector().run_rescore()
         log.info(
             "Re-score done: %d candidates  (%.1fs)",
             result.stage3_count, result.duration_seconds,

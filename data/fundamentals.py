@@ -22,11 +22,16 @@ _CACHE_TTL_HOURS = 24
 
 
 def _safe_float(value, fallback: float | None = None) -> float | None:
-    """Convert a potentially missing/NaN value to float or fallback."""
+    """Convert a potentially missing/NaN/inf value to float or fallback.
+
+    Why: yfinance returns inf for undefined ratios (e.g. forward P/E when
+    forward earnings are zero — POET 2026-05-11 crashed XGBoost training
+    with `Input data contains 'inf' or a value too large`).
+    """
     try:
         v = float(value)
         import math
-        return fallback if math.isnan(v) else v
+        return fallback if (math.isnan(v) or math.isinf(v)) else v
     except (TypeError, ValueError):
         return fallback
 
@@ -86,8 +91,9 @@ class FundamentalsClient:
     def get_feature_vector(self, symbol: str) -> dict[str, float]:
         """
         Return a normalised feature dict suitable for XGBoost input.
-        Missing values are filled with 0.0.
+        Missing / non-finite values are filled with 0.0.
         """
+        import math
         raw = self.get(symbol)
         feature_keys = [
             "market_cap", "pe_ratio", "forward_pe", "price_to_book",
@@ -95,4 +101,12 @@ class FundamentalsClient:
             "profit_margin", "roe", "debt_to_equity", "current_ratio",
             "free_cashflow", "analyst_target",
         ]
-        return {k: float(raw.get(k) or 0.0) for k in feature_keys}
+        out: dict[str, float] = {}
+        for k in feature_keys:
+            v = raw.get(k)
+            try:
+                f = float(v) if v is not None else 0.0
+            except (TypeError, ValueError):
+                f = 0.0
+            out[k] = 0.0 if (math.isnan(f) or math.isinf(f)) else f
+        return out
