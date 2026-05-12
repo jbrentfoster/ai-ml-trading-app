@@ -127,7 +127,17 @@ class RegimeDetector:
 
     @staticmethod
     def _compute_adx(df: pd.DataFrame, period: int = 14) -> float | None:
-        """Return the most recent ADX value, or None if not enough data."""
+        """Return the most recent ADX value, or None if not enough data.
+
+        Uses Wilder's smoothing (alpha=1/period, equivalent to span=2*period-1)
+        as defined in the original 1978 ADX specification.  The earlier
+        ``ewm(span=period, ...)`` here gave alpha=2/(period+1) ~ 2x faster than
+        Wilder's smoothing, which made ADX too reactive and biased the
+        TRENDING-regime threshold downward — visible across the universe as
+        more frequent TRENDING classifications than a textbook ADX would
+        produce.  Comparison at period=14: Wilder alpha=0.071 vs old code
+        alpha=0.133.
+        """
         needed = ["High", "Low", "Close"]
         if not all(c in df.columns for c in needed) or len(df) < period * 2:
             return None
@@ -147,11 +157,12 @@ class RegimeDetector:
         dm_plus  = dm_plus.where(dm_plus > dm_minus, 0)
         dm_minus = dm_minus.where(dm_minus > dm_plus, 0)
 
-        atr   = tr.ewm(span=period, adjust=False).mean()
-        di_p  = 100 * dm_plus.ewm(span=period, adjust=False).mean() / atr.replace(0, float("nan"))
-        di_m  = 100 * dm_minus.ewm(span=period, adjust=False).mean() / atr.replace(0, float("nan"))
+        alpha = 1.0 / period
+        atr   = tr.ewm(alpha=alpha, adjust=False).mean()
+        di_p  = 100 * dm_plus.ewm(alpha=alpha, adjust=False).mean() / atr.replace(0, float("nan"))
+        di_m  = 100 * dm_minus.ewm(alpha=alpha, adjust=False).mean() / atr.replace(0, float("nan"))
         dx    = 100 * (di_p - di_m).abs() / (di_p + di_m).replace(0, float("nan"))
-        adx   = dx.ewm(span=period, adjust=False).mean()
+        adx   = dx.ewm(alpha=alpha, adjust=False).mean()
 
         val = adx.iloc[-1]
         return None if pd.isna(val) else float(val)

@@ -355,6 +355,55 @@ class TestRegimeDetector:
             r   = det.detect(_make_bars(50))
             assert r == RegimeType.HIGH_VOLATILITY
 
+    def test_adx_uses_wilder_smoothing(self):
+        """Pin the smoothing factor at alpha = 1/period (Wilder), not 2/(N+1).
+
+        Before the 2026-05-12 fix, ``_compute_adx`` used
+        ``ewm(span=period, adjust=False)`` — alpha=2/15≈0.133 for period=14,
+        roughly twice Wilder's alpha=1/14≈0.071.  This test computes the
+        expected ADX via the Wilder formula and asserts ``_compute_adx``
+        matches.  If someone reverts to span-based EMA the assertion fails.
+        """
+        from models.regime_detector import RegimeDetector
+        df = _make_bars(120)
+        period = 14
+        alpha = 1.0 / period
+
+        high, low, close = df["High"], df["Low"], df["Close"]
+        tr = pd.concat([
+            high - low,
+            (high - close.shift(1)).abs(),
+            (low - close.shift(1)).abs(),
+        ], axis=1).max(axis=1)
+        dm_p = (high - high.shift(1)).clip(lower=0)
+        dm_n = (low.shift(1) - low).clip(lower=0)
+        dm_p_z = dm_p.where(dm_p > dm_n, 0)
+        dm_n_z = dm_n.where(dm_n > dm_p, 0)
+        atr  = tr.ewm(alpha=alpha, adjust=False).mean()
+        di_p = 100 * dm_p_z.ewm(alpha=alpha, adjust=False).mean() / atr.replace(0, float("nan"))
+        di_m = 100 * dm_n_z.ewm(alpha=alpha, adjust=False).mean() / atr.replace(0, float("nan"))
+        dx   = 100 * (di_p - di_m).abs() / (di_p + di_m).replace(0, float("nan"))
+        expected = float(dx.ewm(alpha=alpha, adjust=False).mean().iloc[-1])
+
+        actual = RegimeDetector._compute_adx(df, period=period)
+        assert actual is not None
+        assert actual == pytest.approx(expected, rel=1e-9)
+
+    def test_adx_strong_trend_exceeds_threshold(self):
+        """A clean monotonic uptrend should produce ADX > 25 (TRENDING)."""
+        from models.regime_detector import RegimeDetector
+        n = 80
+        idx = pd.date_range("2023-01-01", periods=n, freq="B")
+        closes = pd.Series(np.linspace(100, 200, n), index=idx)
+        df = pd.DataFrame({
+            "High":  closes + 0.5,
+            "Low":   closes - 0.5,
+            "Close": closes,
+        }, index=idx)
+        adx = RegimeDetector._compute_adx(df, period=14)
+        assert adx is not None
+        assert adx > 25, f"Strong trend should yield ADX > 25, got {adx:.2f}"
+
 
 # ── SignalGate ─────────────────────────────────────────────────────────────────
 
