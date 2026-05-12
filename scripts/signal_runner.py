@@ -677,6 +677,10 @@ def _phase4_risk_orders(
                 rejected += 1
                 print(f"  {decision.symbol}: REJECTED_TOO_SMALL — {decision.reject_reason}")
             elif decision.decision == "REJECTED_NO_POSITION":
+                # Long-only gate intercepts SELL-from-flat; still a rejection so
+                # signal_runner_log.orders_rejected reflects what `order_decisions`
+                # shows (Page 8 / daily-review parity).
+                rejected += 1
                 print(f"  {decision.symbol}: {decision.reject_reason}")
             elif decision.decision == "CLOSED_LONG":
                 longs_closed += 1

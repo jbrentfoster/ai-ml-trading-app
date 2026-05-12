@@ -6,9 +6,12 @@ Filter 1 — Threshold:
     |ensemble_score| >= base_threshold (default 0.35)
 
 Filter 2 — Regime-adjusted threshold:
-    HIGH_VOLATILITY regime raises the threshold by 50 %
-    TRENDING lowers it by 10 %
-    MEAN_REVERTING: base threshold used unchanged
+    HIGH_VOLATILITY regime scales by ``high_vol_threshold_multiplier`` (1.5).
+    TRENDING scales by ``trending_threshold_multiplier`` (1.2 — stricter,
+        because XGBoost is mean-reversion-biased and emits unreliable SELLs
+        when indicators are at extremes; pair with the XGBoost downweight
+        in EnsembleModel.predict).
+    MEAN_REVERTING: base threshold used unchanged.
 
 Filter 3 — 2-of-3 model confirmation:
     At least `min_confirmations` (default 2) of the 3 sub-models must
@@ -73,7 +76,7 @@ class SignalGate:
         `scores` must contain keys: lstm, xgb, finbert, ensemble.
         `df`     is used by the regime detector (needs OHLCV columns).
         """
-        regime    = self._regime_detector.detect(df)
+        regime    = scores.get("regime") or self._regime_detector.detect(df)
         ensemble  = scores.get("ensemble", 0.0)
         bar_ts    = df.index[-1].to_pydatetime() if hasattr(df.index[-1], "to_pydatetime") else df.index[-1]
 
@@ -130,8 +133,9 @@ class SignalGate:
         return result
 
     def _adjusted_threshold(self, regime: RegimeType) -> float:
+        cfg = config.ml
         if regime == RegimeType.HIGH_VOLATILITY:
-            return self._base_threshold * 1.5
+            return self._base_threshold * cfg.high_vol_threshold_multiplier
         if regime == RegimeType.TRENDING:
-            return self._base_threshold * 0.9
+            return self._base_threshold * cfg.trending_threshold_multiplier
         return self._base_threshold

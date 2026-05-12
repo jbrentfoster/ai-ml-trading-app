@@ -84,7 +84,11 @@ class TestTrailingStopManager:
         )
         mgr = TrailingStopManager(ibkr, loop)
 
-        with patch("risk.trailing_stop.config") as cfg:
+        with (
+            patch("risk.trailing_stop.config") as cfg,
+            patch("data.database.get_bars",
+                  return_value=pd.DataFrame({"Close": [108.5]})),
+        ):
             cfg.risk.trailing_stop_enabled = True
             cfg.risk.trailing_stop_activation_atr = 1.0
             cfg.risk.trailing_stop_trail_atr = 2.0
@@ -93,8 +97,54 @@ class TestTrailingStopManager:
         assert len(actions) == 1
         assert actions[0].action == "SKIPPED"
         assert "already active" in actions[0].reason
+        # Entry and current price should be populated from data we already have
+        # (avg_cost + latest close).  atr / trail_amount stay None — the trail
+        # was sized in a prior run; today's ATR isn't what's protecting it.
+        assert actions[0].entry_price   == pytest.approx(100.0)
+        assert actions[0].current_price == pytest.approx(108.5)
+        assert actions[0].atr is None
+        assert actions[0].trail_amount is None
         ibkr.cancel_order.assert_not_called()
         ibkr.place_trailing_stop.assert_not_called()
+
+    def test_trail_already_active_persists_null_for_unmeasured_fields(
+        self, loop, monkeypatch
+    ):
+        """Regression: the "already active" branch used to write 0.0 to atr /
+        trail_amount in trailing_stop_log, silently skewing any dashboard
+        aggregation. Must persist as None so the DB stores NULL."""
+        ibkr = _ibkr_stub(
+            positions=[{"symbol": "SNOW", "quantity": 200, "avg_cost": 175.50}],
+            open_orders=[
+                {"order_id": 3001, "symbol": "SNOW", "action": "SELL",
+                 "order_type": "TRAIL", "limit_price": None, "stop_price": 8.0,
+                 "quantity": 200, "status": "Submitted"},
+            ],
+        )
+        mgr = TrailingStopManager(ibkr, loop)
+
+        captured: list[dict] = []
+        import data.database as db
+        monkeypatch.setattr(db, "log_trailing_stop_action",
+                            lambda rec: captured.append(rec))
+
+        with (
+            patch("risk.trailing_stop.config") as cfg,
+            patch("data.database.get_bars",
+                  return_value=pd.DataFrame({"Close": [192.75]})),
+        ):
+            cfg.risk.trailing_stop_enabled = True
+            cfg.risk.trailing_stop_activation_atr = 2.0
+            cfg.risk.trailing_stop_trail_atr = 2.0
+            mgr.manage(run_id="snow-trail-test")
+
+        assert len(captured) == 1
+        rec = captured[0]
+        assert rec["action"]        == "SKIPPED"
+        assert rec["entry_price"]   == pytest.approx(175.50)
+        assert rec["current_price"] == pytest.approx(192.75)
+        assert rec["atr"]          is None     # NULL in SQLite
+        assert rec["trail_amount"] is None     # NULL in SQLite
 
     def test_skips_below_activation_threshold(self, loop):
         """Price has not moved +1 ATR yet → no conversion."""

@@ -38,16 +38,23 @@ log = get_logger("risk.trailing_stop")
 
 @dataclass
 class TrailingStopAction:
-    """One row per position evaluated during a trailing-stop cycle."""
+    """One row per position evaluated during a trailing-stop cycle.
+
+    Price/ATR fields are Optional so that paths which legitimately don't have
+    a measurement (e.g. the "trailing stop already active" idempotency branch,
+    where re-fetching ATR would be wasted I/O) can write NULL to
+    trailing_stop_log instead of misleading 0.0 values that quietly skew any
+    dashboard aggregation.
+    """
     symbol:        str
     action:        str        # "CONVERTED" | "SKIPPED" | "FAILED"
-    shares:        int   = 0
-    entry_price:   float = 0.0
-    current_price: float = 0.0
-    atr:           float = 0.0
-    trail_amount:  float = 0.0
-    reason:        str   = ""
-    run_id:        str   = ""
+    shares:        int                  = 0
+    entry_price:   Optional[float]      = None
+    current_price: Optional[float]      = None
+    atr:           Optional[float]      = None
+    trail_amount:  Optional[float]      = None
+    reason:        str                  = ""
+    run_id:        str                  = ""
     timestamp:     datetime = field(
         default_factory=lambda: datetime.now(timezone.utc).replace(tzinfo=None)
     )
@@ -141,8 +148,18 @@ class TrailingStopManager:
             o.get("symbol") == symbol and o.get("order_type") == "TRAIL"
             for o in open_orders
         ):
+            # Populate the cheap-to-fetch fields so the trailing_stop_log row
+            # is informative ("we're at $X, entry was $Y") rather than
+            # all-zeros.  atr / trail_amount stay None — the trail was sized
+            # at the moment of conversion in a prior run; the current ATR is
+            # not what's protecting this position anymore, and writing
+            # today's value would be misleading.
+            entry_price   = float(pos.get("avg_cost", 0.0) or 0.0)
+            current_price = self._get_latest_close(symbol)
             return TrailingStopAction(
                 symbol=symbol, action="SKIPPED", shares=shares,
+                entry_price=entry_price if entry_price > 0 else None,
+                current_price=current_price if current_price > 0 else None,
                 reason="trailing stop already active",
             )
 

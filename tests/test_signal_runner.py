@@ -166,6 +166,31 @@ class TestPhase4Deduplication:
         assert rejected       == 1
         assert skipped        == 1
 
+    def test_rejected_no_position_counts_toward_rejected_total(self):
+        """REJECTED_NO_POSITION (long-only gate firing on SELL-from-flat) must
+        contribute to the rejected counter so signal_runner_log.orders_rejected
+        matches what `order_decisions` shows (Page 8 / daily-review parity).
+        Regression: 2026-05-12 run had 17 REJECTED_NO_POSITION rows but the
+        Phase 5 summary printed "Orders rejected: 2"."""
+        actionable = [
+            (_make_signal("AAPL", signal="SELL"), 2.5),
+            (_make_signal("MSFT", signal="SELL"), 3.0),
+            (_make_signal("GOOG", signal="SELL"), 1.5),
+        ]
+        decisions = [
+            _make_decision("AAPL", decision="REJECTED_NO_POSITION", signal="SELL"),
+            _make_decision("MSFT", decision="REJECTED_NO_POSITION", signal="SELL"),
+            _make_decision("GOOG", decision="REJECTED_NO_POSITION", signal="SELL"),
+        ]
+        approved, dry_run_logged, rejected, skipped, longs_closed = self._run(
+            actionable, decisions
+        )
+        assert approved       == 0
+        assert dry_run_logged == 0
+        assert rejected       == 3
+        assert skipped        == 0
+        assert longs_closed   == 0
+
 
 # ── Stale-bar gate ────────────────────────────────────────────────────────────
 

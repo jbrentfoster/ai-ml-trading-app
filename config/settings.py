@@ -184,6 +184,19 @@ class MLConfig:
     signal_confirmation:    int   = 2       # models that must agree (of 3)
     signal_lookback_days:   int   = 365     # default date range on Model Signals page
 
+    # ── Regime-aware adjustments ──────────────────────────────────────────────
+    # XGBoost is a 5-bar mean-reversion classifier and emits systematically
+    # bearish scores in trending markets (RSI/MACD/BB hit extreme regions and
+    # the model bets on revert). Downweighting it in TRENDING regimes lets
+    # LSTM (sequence) and FinBERT (news) dominate.
+    xgb_trending_weight_multiplier: float = 0.5
+
+    # Regime-adjusted signal-gate threshold multipliers. TRENDING was 0.9
+    # (more permissive — letting through SELL-dominated XGBoost output);
+    # set >1.0 to be stricter when XGBoost is structurally biased.
+    trending_threshold_multiplier: float = 1.2
+    high_vol_threshold_multiplier: float = 1.5
+
     # ── Walk-forward training ─────────────────────────────────────────────────
     # Defaults sized for a ~1-year daily dataset (~249 trading bars).
     # min_bars_required = train + gap + test = 120 + 1 + 21 = 142
@@ -365,10 +378,23 @@ _SECTION_MAP = {
 _SECRET_FIELDS = {"api_key", "secret_key"}
 
 
-def _apply_yaml_section(obj, values: dict) -> None:
-    """Write `values` dict onto a dataclass instance, converting types as needed."""
+def _apply_yaml_section(obj, values: dict, section_name: str = "") -> None:
+    """Write `values` dict onto a dataclass instance, converting types as needed.
+
+    Logs a warning for any YAML key that doesn't match a dataclass field on
+    `obj`. Without this, typos like `min_trades_for_realised_kellly`
+    (three L's — spotted 2026-05-07 during Phase C verification) silently
+    disable the intended override. Surfacing the typo at process start is
+    cheaper than waiting for the behavioural symptom downstream.
+    """
+    import warnings
+    valid_fields = {f.name for f in dataclasses.fields(obj)}
     for key, value in values.items():
-        if not hasattr(obj, key):
+        if key not in valid_fields:
+            label = f"{section_name}.{key}" if section_name else key
+            warnings.warn(
+                f"Unknown YAML key '{label}' in config/settings.yaml — ignored."
+            )
             continue
         current = getattr(obj, key)
         try:
@@ -392,12 +418,24 @@ def load_yaml_config() -> None:
     if not _YAML_PATH.exists():
         return
     try:
+        import warnings
         import yaml
         with open(_YAML_PATH, encoding="utf-8") as fh:
             data = yaml.safe_load(fh) or {}
+
+        # Warn on any top-level section that doesn't map to a config object.
+        # A typo in a section name (e.g. `mlmodels:` instead of `ml:`) would
+        # otherwise drop every override under it without complaint.
+        for section in data:
+            if section not in _SECTION_MAP:
+                warnings.warn(
+                    f"Unknown YAML section '{section}' in config/settings.yaml "
+                    f"— ignored."
+                )
+
         for section, getter in _SECTION_MAP.items():
             if section in data and isinstance(data[section], dict):
-                _apply_yaml_section(getter(), data[section])
+                _apply_yaml_section(getter(), data[section], section_name=section)
     except Exception as exc:
         # Never crash on a bad YAML file — just use defaults
         import warnings

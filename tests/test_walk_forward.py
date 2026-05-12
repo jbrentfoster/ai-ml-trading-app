@@ -331,6 +331,40 @@ def _build_orchestrator(signals: list[str]):
     return orch, ensemble
 
 
+class TestFormatKellyFstar:
+    """Phase C realised-Kelly diagnostic log line — negative f* must carry a
+    `(→ 0, would short)` suffix so the log doesn't read as "system about to
+    short N× capital" when ``PositionSizer._kelly_fraction`` will floor to 0
+    anyway."""
+
+    def test_positive_fstar_renders_three_decimals(self):
+        from models.walk_forward import MLWalkForwardOrchestrator
+        assert MLWalkForwardOrchestrator._format_kelly_fstar(0.18) == "0.180"
+
+    def test_zero_fstar_no_suffix(self):
+        """0 is non-negative — sizer floors to 0 trivially, no warning needed."""
+        from models.walk_forward import MLWalkForwardOrchestrator
+        assert MLWalkForwardOrchestrator._format_kelly_fstar(0.0) == "0.000"
+
+    def test_negative_fstar_appends_floor_marker(self):
+        """The TSCO Fold 5 / AEM-class regression: raw -2.177 must be marked."""
+        from models.walk_forward import MLWalkForwardOrchestrator
+        assert MLWalkForwardOrchestrator._format_kelly_fstar(-2.177) == (
+            "-2.177 (→ 0, would short)"
+        )
+
+    def test_negative_one_boundary(self):
+        from models.walk_forward import MLWalkForwardOrchestrator
+        assert MLWalkForwardOrchestrator._format_kelly_fstar(-1.0) == (
+            "-1.000 (→ 0, would short)"
+        )
+
+    def test_none_renders_na(self):
+        """compute_realised_kelly returns f*=None on all-wins / all-losses."""
+        from models.walk_forward import MLWalkForwardOrchestrator
+        assert MLWalkForwardOrchestrator._format_kelly_fstar(None) == "n/a"
+
+
 class TestCostModel:
     """Tests for the corrected WF cost model in _run_test_window.
 

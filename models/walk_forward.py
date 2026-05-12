@@ -63,6 +63,26 @@ class MLWalkForwardOrchestrator:
         self._run_id            = str(uuid.uuid4())
         self._universe_selector = universe_selector
 
+    @staticmethod
+    def _format_kelly_fstar(f_star) -> str:
+        """Render the Phase C realised-Kelly f* for the per-fold diagnostic.
+
+        ``f_star`` can be:
+          * ``None``    — history was undefined (all-wins or all-losses);
+                          rendered as ``n/a``.
+          * negative    — lose-heavy history; ``PositionSizer._kelly_fraction``
+                          floors to 0 so the bare ``f*=-2.177`` line in the log
+                          is misleading without context. Suffix makes the floor
+                          explicit so someone grepping the log doesn't read it
+                          as "system about to short 2× capital".
+          * non-negative — rendered as a 3-decimal float.
+        """
+        if f_star is None:
+            return "n/a"
+        if f_star < 0:
+            return f"{f_star:.3f} (→ 0, would short)"
+        return f"{f_star:.3f}"
+
     def run(self, df: pd.DataFrame) -> list[dict]:
         """
         Execute walk-forward training.
@@ -132,11 +152,7 @@ class MLWalkForwardOrchestrator:
                     fold.fold_index + 1,
                     kelly_history.get("n_trades", 0),
                     kelly_history.get("win_rate", 0.0),
-                    (
-                        f"{kelly_history['f_star']:.3f}"
-                        if kelly_history.get("f_star") is not None
-                        else "n/a"
-                    ),
+                    self._format_kelly_fstar(kelly_history.get("f_star")),
                 )
 
             signals, fold_returns, finbert_coverage, fold_trades = self._run_test_window(
@@ -342,6 +358,29 @@ class MLWalkForwardOrchestrator:
 
         recorded_at = datetime.now(timezone.utc).replace(tzinfo=None)
 
+        # ─────────────────────────────────────────────────────────────────
+        # `trade_log.pnl` semantics — DO NOT BREAK
+        # ─────────────────────────────────────────────────────────────────
+        # `pnl` is stored NET of costs:
+        #     pnl_pct       = gross_pct - total_costs        (line below)
+        #     pnl ($)       = pnl_pct * entry_px * shares
+        #     costs_charged = total_costs * entry_px * shares  (display only)
+        # NEVER compute `net_pnl = pnl - costs_charged` downstream — that
+        # double-counts fees.  The correct derivations are:
+        #     net_pnl   = pnl                        (already net)
+        #     gross_pnl = pnl + costs_charged        (back-derived)
+        # If you change this convention, also update — and re-run tests for:
+        #   1. `data/ui_queries.py:query_trade_log` derived columns
+        #      + `query_trade_summary` aggregation
+        #   2. `risk/position_sizer.py:compute_realised_kelly` (reads pnl_pct)
+        #   3. Phase B fill reconciliation (`source='live'` rows must follow
+        #      the same `pnl is net` rule when aggregating IBKR realisedPNL)
+        #   4. `dashboard/pages/10_Trade_History.py` column labels
+        #   5. `tests/test_ui_queries.py::test_net_pnl_equals_stored_pnl`
+        #      (the canary — fails explicitly on the buggy formula)
+        # Background: 2026-05-07 Page 10 SPY row read -$1,127.10 against a
+        # real -$966.79 net trade because the read path subtracted costs that
+        # were already deducted on the write path.
         def _close_trade(
             exit_ts, exit_px_, reason: str, gap_exit_: bool
         ) -> tuple[float, float]:

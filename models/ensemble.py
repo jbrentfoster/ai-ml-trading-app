@@ -17,6 +17,7 @@ from data.database import log_ensemble_weights
 from models.base_model import BaseModel
 from models.finbert_model import FinBERTModel
 from models.lstm_model import LSTMModel
+from models.regime_detector import RegimeDetector, RegimeType
 from models.xgboost_model import XGBoostModel
 
 log = get_logger("models.ensemble")
@@ -52,6 +53,7 @@ class EnsembleModel:
         self._lstm    = LSTMModel()
         self._xgb     = XGBoostModel(symbol=symbol)
         self._finbert = FinBERTModel()
+        self._regime_detector = RegimeDetector()
 
     # ── Training ──────────────────────────────────────────────────────────────
 
@@ -70,10 +72,12 @@ class EnsembleModel:
     # ── Inference ─────────────────────────────────────────────────────────────
 
     def predict(self, df: pd.DataFrame, suppress_finbert: bool = False,
-                as_of=None) -> dict[str, float]:
+                as_of=None, regime: RegimeType | None = None) -> dict:
         """
-        Return a dict with individual model scores and the weighted ensemble:
-            {"lstm": float, "xgb": float, "finbert": float, "ensemble": float}
+        Return a dict with individual model scores, the weighted ensemble, and
+        the detected regime:
+            {"lstm": float, "xgb": float, "finbert": float, "ensemble": float,
+             "regime": RegimeType}
         All scores are in [-1, 1].
 
         Parameters
@@ -84,6 +88,10 @@ class EnsembleModel:
         as_of :
             Bar timestamp to pass to FinBERT so only news published on or before
             this date is used.  Prevents lookahead bias during walk-forward.
+        regime :
+            Pre-computed regime. If None, detect from ``df``. Allowing the
+            caller to pass this avoids a duplicate detection when the signal
+            gate later calls RegimeDetector on the same dataframe.
         """
         lstm_score = self._lstm.predict(df)
         xgb_score  = self._xgb.predict(df)
@@ -100,6 +108,20 @@ class EnsembleModel:
             w_xgb     = self.weights["xgb"]
             w_finbert = self.weights["finbert"]
 
+        if regime is None:
+            regime = self._regime_detector.detect(df)
+
+        if regime == RegimeType.TRENDING:
+            mult = config.ml.xgb_trending_weight_multiplier
+            shed = w_xgb * (1.0 - mult)
+            w_xgb = w_xgb * mult
+            other = w_lstm + w_finbert
+            if other > 0:
+                w_lstm    += shed * (w_lstm / other)
+                w_finbert += shed * (w_finbert / other)
+            else:
+                w_lstm += shed
+
         ensemble = w_lstm * lstm_score + w_xgb * xgb_score + w_finbert * finbert_score
 
         return {
@@ -107,6 +129,7 @@ class EnsembleModel:
             "xgb":      xgb_score,
             "finbert":  finbert_score,
             "ensemble": max(-1.0, min(1.0, ensemble)),
+            "regime":   regime,
         }
 
     def evaluate(self, test_df: pd.DataFrame) -> dict[str, dict]:

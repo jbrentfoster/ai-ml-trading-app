@@ -156,6 +156,47 @@ class TestXGBoostModel:
             score = model.predict(df)
             assert -1.0 <= score <= 1.0
 
+    def test_extreme_finite_value_clamped(self):
+        """A finite-but-huge fundamental (e.g. ev_to_ebitda for a company with
+        near-zero EBITDA) hits the same gradient-index check as inf:
+        `Input data contains 'inf' or a value too large`. Backstop must clamp
+        any magnitude > _MAX_ABS_FEATURE_VALUE (1e10) to 0."""
+        from models.xgboost_model import XGBoostModel
+        with patch("models.xgboost_model.FundamentalsClient") as MockFund:
+            MockFund.return_value.get_feature_vector.return_value = {
+                "ev_to_ebitda":   1.5e18,   # finite but absurd
+                "forward_pe":    -9.99e15,  # finite but absurd
+                "market_cap":     1.5e9,    # legitimate mega-cap
+            }
+            model = XGBoostModel(symbol="POET")
+            df = _make_bars(200)
+            # Would raise XGBoostError before the clamp was added
+            model.train(df)
+            score = model.predict(df)
+            assert -1.0 <= score <= 1.0
+
+    def test_build_features_returns_finite_bounded_values(self):
+        """Direct check on _build_features: post-sanitisation, every cell must
+        be finite and within the clamp range."""
+        import math
+        import numpy as np
+        from models.xgboost_model import XGBoostModel
+        with patch("models.xgboost_model.FundamentalsClient") as MockFund:
+            MockFund.return_value.get_feature_vector.return_value = {
+                "ev_to_ebitda": 1e20,
+                "forward_pe":   math.inf,
+                "pe_ratio":     math.nan,
+                "market_cap":   1.5e9,
+            }
+            model = XGBoostModel(symbol="POET")
+            df = _make_bars(50)
+            feat = model._build_features(df)
+            arr = feat.to_numpy()
+            assert np.isfinite(arr).all(), "feature matrix must be all-finite"
+            assert (np.abs(arr) <= XGBoostModel._MAX_ABS_FEATURE_VALUE).all(), (
+                "feature magnitudes must respect _MAX_ABS_FEATURE_VALUE clamp"
+            )
+
 
 # ── FundamentalsClient ────────────────────────────────────────────────────────
 
@@ -224,6 +265,77 @@ class TestFinBERTModel:
             score = model.predict(pd.DataFrame(), symbol="AAPL")
             assert score > 0
 
+    def test_coerce_published_at_handles_all_provider_types(self):
+        """NewsClient providers return mixed types — IBKR datetime, Alpaca ISO
+        string, yfinance pd.Timestamp.  Coercion must handle all three plus
+        None / NaT / unparseable garbage without raising."""
+        from datetime import datetime as _dt
+        import pandas as _pd
+        from models.finbert_model import FinBERTModel
+        coerce = FinBERTModel._coerce_published_at
+
+        # datetime (tz-naive)        — pass through
+        naive = _dt(2026, 5, 12, 14, 0, 0)
+        assert coerce(naive) == naive
+
+        # ISO string                 — parse
+        result = coerce("2026-05-12T14:00:00")
+        assert result == _dt(2026, 5, 12, 14, 0, 0)
+        assert result.tzinfo is None
+
+        # pd.Timestamp (tz-naive)    — convert to datetime
+        ts = _pd.Timestamp("2026-05-12 14:00:00")
+        assert coerce(ts) == _dt(2026, 5, 12, 14, 0, 0)
+
+        # pd.Timestamp (tz-aware UTC) — strip tz, keep wall-clock
+        ts_utc = _pd.Timestamp("2026-05-12 14:00:00", tz="UTC")
+        result = coerce(ts_utc)
+        assert result == _dt(2026, 5, 12, 14, 0, 0)
+        assert result.tzinfo is None
+
+        # ISO string with timezone   — strip tz
+        result = coerce("2026-05-12T14:00:00+00:00")
+        assert result == _dt(2026, 5, 12, 14, 0, 0)
+        assert result.tzinfo is None
+
+        # None / NaT / garbage       — return None, don't raise
+        assert coerce(None) is None
+        assert coerce(_pd.NaT) is None
+        assert coerce("not a date") is None
+
+    def test_aggregate_sentiment_filters_string_published_at_without_typeerror(self):
+        """Regression: pre-fix, an Alpaca-style ISO string in published_at
+        would raise `TypeError: '<=' not supported between str and datetime`
+        in the as_of filter.  Coercion must convert it before the comparison."""
+        from models.finbert_model import FinBERTModel
+        as_of = datetime(2026, 5, 12, 14, 0, 0)
+        articles = [
+            # IBKR-style: native datetime
+            {"article_id": "1", "published_at": datetime(2026, 5, 12, 10, 0, 0),
+             "headline": "OK", "sentiment_score": 0.5},
+            # Alpaca-style: ISO string (the failure mode the audit flagged)
+            {"article_id": "2", "published_at": "2026-05-12T11:00:00",
+             "headline": "OK", "sentiment_score": 0.3},
+            # yfinance-style: pd.Timestamp
+            {"article_id": "3", "published_at": pd.Timestamp("2026-05-12 12:00:00"),
+             "headline": "OK", "sentiment_score": 0.4},
+            # Should be filtered out as future (after as_of)
+            {"article_id": "4", "published_at": "2026-05-13T10:00:00",
+             "headline": "Future", "sentiment_score": -0.9},
+            # Should be filtered out as garbage
+            {"article_id": "5", "published_at": "not a date",
+             "headline": "Bad", "sentiment_score": -0.9},
+        ]
+        with (
+            patch("models.finbert_model.get_recent_news", return_value=articles),
+            patch("models.finbert_model.NewsClient"),
+        ):
+            model = FinBERTModel()
+            # Must not raise TypeError; future + garbage rows dropped, so the
+            # weighted average should be positive (all three valid scores >0).
+            score = model.predict(pd.DataFrame(), symbol="AAPL", as_of=as_of)
+        assert 0 < score <= 1.0
+
 
 # ── RegimeDetector ────────────────────────────────────────────────────────────
 
@@ -289,3 +401,95 @@ class TestSignalGate:
             result = gate.evaluate("AAPL", df, scores)
         assert result.signal == "HOLD"
         assert "Filter2" in result.gate_reason
+
+    def test_trending_raises_threshold(self):
+        # Pre-fix the TRENDING multiplier was 0.9 (more permissive) — letting
+        # XGBoost-driven SELLs slip through in trending markets. The new
+        # default is 1.2 (stricter), pairing with the XGBoost weight halving
+        # in EnsembleModel.predict.
+        from models.signal_gate import SignalGate
+        from models.regime_detector import RegimeDetector, RegimeType
+        with patch.object(RegimeDetector, "detect", return_value=RegimeType.TRENDING):
+            gate = SignalGate()
+            gate._base_threshold = 0.35
+            df = _make_bars(50)
+            # ensemble = 0.40 passes base 0.35 but not 0.35*1.2 = 0.42
+            scores = {"lstm": 0.5, "xgb": 0.4, "finbert": 0.3, "ensemble": 0.40}
+            result = gate.evaluate("AAPL", df, scores)
+        assert result.signal == "HOLD"
+        assert "Filter2" in result.gate_reason
+
+    def test_signal_gate_reuses_regime_from_scores(self):
+        # EnsembleModel.predict now returns the regime in its scores dict so
+        # the gate doesn't re-detect. When ``scores["regime"]`` is present the
+        # gate must use it rather than calling RegimeDetector again.
+        from models.signal_gate import SignalGate
+        from models.regime_detector import RegimeDetector, RegimeType
+        with patch.object(RegimeDetector, "detect") as detect:
+            detect.return_value = RegimeType.MEAN_REVERTING
+            gate = SignalGate()
+            detect.reset_mock()
+            df = _make_bars(50)
+            scores = {
+                "lstm": 0.8, "xgb": 0.7, "finbert": 0.6, "ensemble": 0.7,
+                "regime": RegimeType.MEAN_REVERTING,
+            }
+            result = gate.evaluate("AAPL", df, scores)
+        assert result.signal == "BUY"
+        assert result.regime == RegimeType.MEAN_REVERTING
+        detect.assert_not_called()
+
+
+# ── EnsembleModel.predict regime adjustment ────────────────────────────────────
+
+class TestEnsemblePredictRegimeAdjust:
+
+    def _make_ensemble(self, lstm_score, xgb_score, finbert_score, regime):
+        from models.ensemble import EnsembleModel
+        from models.regime_detector import RegimeDetector
+
+        ens = EnsembleModel.__new__(EnsembleModel)
+        ens._symbol = "AAPL"
+        ens._nudge  = 0.10
+        ens._floor  = 0.10
+        ens.weights = {"lstm": 0.40, "xgb": 0.35, "finbert": 0.25}
+        ens._lstm    = MagicMock(); ens._lstm.predict.return_value    = lstm_score
+        ens._xgb     = MagicMock(); ens._xgb.predict.return_value     = xgb_score
+        ens._finbert = MagicMock(); ens._finbert.predict.return_value = finbert_score
+        ens._regime_detector = MagicMock(spec=RegimeDetector)
+        ens._regime_detector.detect.return_value = regime
+        return ens
+
+    def test_trending_halves_xgb_contribution(self):
+        from models.regime_detector import RegimeType
+
+        # All three component scores at +1 means the unweighted ensemble is +1.
+        # With baseline weights (0.40, 0.35, 0.25), ensemble = 1.0 regardless.
+        # The interesting test: XGB strongly negative, LSTM/FinBERT positive.
+        # Pre-fix: ensemble = 0.40*0.5 + 0.35*(-1.0) + 0.25*0.5 = -0.025
+        # Post-fix (TRENDING, xgb_mult=0.5): xgb weight halves to 0.175, the
+        # other 0.175 redistributes proportionally to lstm (0.40/0.65) and
+        # finbert (0.25/0.65). New weights ~ (0.508, 0.175, 0.317) → ensemble =
+        # 0.508*0.5 + 0.175*(-1.0) + 0.317*0.5 = +0.238 (positive!)
+        ens = self._make_ensemble(0.5, -1.0, 0.5, RegimeType.TRENDING)
+        out = ens.predict(_make_bars(50))
+        assert out["xgb"] == -1.0
+        assert out["lstm"] == 0.5
+        assert out["finbert"] == 0.5
+        assert out["ensemble"] > 0.20    # flipped from negative to positive
+        assert out["regime"] == RegimeType.TRENDING
+
+    def test_mean_reverting_leaves_weights_alone(self):
+        from models.regime_detector import RegimeType
+        ens = self._make_ensemble(0.5, -1.0, 0.5, RegimeType.MEAN_REVERTING)
+        out = ens.predict(_make_bars(50))
+        # Baseline weights: 0.40*0.5 + 0.35*(-1.0) + 0.25*0.5 = -0.025
+        assert abs(out["ensemble"] - (-0.025)) < 1e-6
+        assert out["regime"] == RegimeType.MEAN_REVERTING
+
+    def test_caller_can_pass_regime_to_skip_detection(self):
+        from models.regime_detector import RegimeType
+        ens = self._make_ensemble(0.0, 0.0, 0.0, RegimeType.MEAN_REVERTING)
+        out = ens.predict(_make_bars(50), regime=RegimeType.TRENDING)
+        assert out["regime"] == RegimeType.TRENDING
+        ens._regime_detector.detect.assert_not_called()

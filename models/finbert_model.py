@@ -112,6 +112,32 @@ class FinBERTModel(BaseModel):
         age_hours = (now - published_at).total_seconds() / 3600
         return math.exp(-math.log(2) * age_hours / self._half_life_h)
 
+    @staticmethod
+    def _coerce_published_at(value) -> datetime | None:
+        """Coerce a news article's ``published_at`` to a tz-naive datetime.
+
+        NewsClient has three providers (IBKR / Alpaca / yfinance) that don't
+        all return the same type — IBKR returns ``datetime``, Alpaca returns
+        ISO strings, yfinance may return ``pd.Timestamp``. Without this
+        coercion, the ``published_at <= now`` filter raises ``TypeError``
+        when comparing a string to a datetime, or quietly mis-orders a
+        tz-aware timestamp against the tz-naive DB convention.
+
+        Returns ``None`` when the value can't be parsed.
+        """
+        if value is None:
+            return None
+        try:
+            ts = pd.to_datetime(value, errors="coerce")
+        except Exception:
+            return None
+        if ts is pd.NaT or pd.isna(ts):
+            return None
+        # Strip timezone — the rest of the pipeline (DB, ``now``) is tz-naive UTC.
+        if getattr(ts, "tzinfo", None) is not None:
+            ts = ts.tz_convert(None)
+        return ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts
+
     def _aggregate_sentiment(self, symbol: str, as_of: datetime | None = None) -> float:
         """
         Fetch and score recent news for `symbol`.
@@ -131,6 +157,19 @@ class FinBERTModel(BaseModel):
         cutoff = now - timedelta(days=self._staleness_days)
 
         articles = get_recent_news(symbol, since=cutoff)
+
+        # Normalise published_at across all three NewsClient providers before
+        # any timestamp comparison.  Drop unparseable rows rather than letting
+        # them poison the weighted average.
+        normalised = []
+        for a in articles:
+            pub = self._coerce_published_at(a.get("published_at"))
+            if pub is None:
+                continue
+            a["published_at"] = pub
+            normalised.append(a)
+        articles = normalised
+
         # Filter out articles published after as_of (no lookahead during backtest)
         if as_of is not None:
             articles = [a for a in articles if a["published_at"] <= now]
@@ -138,6 +177,16 @@ class FinBERTModel(BaseModel):
         if not articles and as_of is None:
             # Only attempt a live fetch when running in real-time (not backtest)
             articles = self._news_client.fetch_news(symbol, days_back=self._staleness_days)
+            # Live-fetch path goes around get_recent_news, so it hasn't been
+            # normalised yet — apply the same coercion.
+            normalised = []
+            for a in articles:
+                pub = self._coerce_published_at(a.get("published_at"))
+                if pub is None:
+                    continue
+                a["published_at"] = pub
+                normalised.append(a)
+            articles = normalised
 
         if not articles:
             log.debug("No news for %s within %d days - returning 0.0", symbol, self._staleness_days)
@@ -148,9 +197,7 @@ class FinBERTModel(BaseModel):
         pipe = self._get_pipeline()
 
         for art in articles:
-            pub = art["published_at"]
-            if isinstance(pub, str):
-                pub = datetime.fromisoformat(pub)
+            pub = art["published_at"]   # already coerced above
 
             # Score only if not yet stored
             score = art.get("sentiment_score")

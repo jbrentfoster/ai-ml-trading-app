@@ -62,6 +62,14 @@ class XGBoostModel(BaseModel):
     def name(self) -> str:
         return "xgboost"
 
+    # Magnitudes above this are clamped to 0.  XGBoost's gradient-index histogram
+    # rejects "inf or a value too large"; a pathological fundamentals value like
+    # `enterpriseToEbitda` for a company with near-zero EBITDA can exceed the
+    # finite-but-safe range even after the inf replace.  $10B is a high enough
+    # cap to leave room for honest market_cap values (mega-caps top out around
+    # $4T but they're already pre-clipped by yfinance to finite floats).
+    _MAX_ABS_FEATURE_VALUE = 1e10
+
     def _build_features(self, df: pd.DataFrame, symbol: str | None = None) -> pd.DataFrame:
         """
         Build a feature matrix from indicator columns + fundamentals.
@@ -77,11 +85,18 @@ class XGBoostModel(BaseModel):
         for col in _FUNDAMENTAL_FEATURES:
             feat[col] = fund_vec.get(col, 0.0)
 
-        # Backstop: yfinance can return inf for undefined ratios (e.g. forward P/E
-        # with zero forward earnings), and indicator NaN-divisions could also leak
-        # non-finite values. XGBoost rejects inf unless `missing=inf` is set; we
-        # treat inf the same as NaN — fill with 0.0.
-        return feat.replace([np.inf, -np.inf], 0.0).fillna(0.0)
+        # Backstop sanitisation.  Two failure modes seen in production:
+        #   1. yfinance returns ±inf for undefined ratios (e.g. forward P/E with
+        #      zero forward earnings — POET 2026-05-11 crashed XGBoost training).
+        #   2. A finite-but-huge fundamental (e.g. ev_to_ebitda for a company
+        #      with near-zero EBITDA) trips the same gradient-index check with
+        #      "value too large".
+        # Force float64, replace any non-finite or out-of-range entry with 0.
+        arr = feat.to_numpy(dtype=np.float64, copy=True)
+        bad = ~np.isfinite(arr) | (np.abs(arr) > self._MAX_ABS_FEATURE_VALUE)
+        if bad.any():
+            arr[bad] = 0.0
+        return pd.DataFrame(arr, index=feat.index, columns=feat.columns)
 
     def _build_labels(self, df: pd.DataFrame) -> pd.Series:
         """Binary label: 1 if close is higher _FORWARD_BARS bars later, else 0."""
