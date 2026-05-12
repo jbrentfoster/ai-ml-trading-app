@@ -12,6 +12,7 @@ import pandas as pd
 
 from config.settings import config
 from data.ui_queries import query_universe_assets, query_universe_run_log
+from risk.portfolio_guard import get_sector
 
 st.set_page_config(page_title="Universe", page_icon="🌐", layout="wide")
 st.title("Universe Selection")
@@ -181,9 +182,14 @@ else:
         f"{len(df_active) - n_fixtures} funnel candidates"
     )
 
+    # Attach sector from the canonical SECTOR_MAP (risk/portfolio_guard.py).
+    # Unmapped symbols show as "Unknown" — same fall-through as PortfolioGuard.
+    df_active = df_active.copy()
+    df_active["Sector"] = df_active["Symbol"].apply(get_sector)
+
     # Format for display
     display_cols = [c for c in
-                    ["Symbol", "Name", "Class", "Fixture", "Stage",
+                    ["Symbol", "Name", "Sector", "Class", "Fixture", "Stage",
                      "Market Cap", "Avg $ Volume", "Stage 3 Score", "Added", "Last Scored"]
                     if c in df_active.columns]
     df_show = df_active[display_cols].copy()
@@ -211,6 +217,97 @@ else:
         "(close price × volume).mean() over most-recent 20 trading days. "
         "**Stage 3 Score** — `0.5 × pct_rank(20d_return) + 0.5 × pct_rank(ADV)` "
         "in [0, 1]; higher = stronger combination of recent momentum and liquidity."
+    )
+
+
+# ── Section 2.5: Sector composition ───────────────────────────────────────────
+
+st.header("Sector Composition")
+
+if df_active.empty:
+    st.info(
+        "No active universe candidates — sector composition will populate "
+        "once the funnel runs."
+    )
+else:
+    # Counts and share-of-universe by sector
+    sector_counts = (
+        df_active["Sector"]
+        .value_counts()
+        .rename_axis("Sector")
+        .reset_index(name="Count")
+    )
+    total = int(sector_counts["Count"].sum())
+    sector_counts["Share"] = sector_counts["Count"] / total
+
+    fixture_mask = df_active["Fixture"] == True if "Fixture" in df_active.columns else None
+    if fixture_mask is not None:
+        fixture_counts = (
+            df_active.loc[fixture_mask, "Sector"]
+            .value_counts()
+            .rename_axis("Sector")
+            .reset_index(name="Fixtures")
+        )
+        sector_counts = sector_counts.merge(fixture_counts, on="Sector", how="left").fillna({"Fixtures": 0})
+        sector_counts["Fixtures"] = sector_counts["Fixtures"].astype(int)
+        sector_counts["Non-fixture"] = sector_counts["Count"] - sector_counts["Fixtures"]
+    else:
+        sector_counts["Fixtures"] = 0
+        sector_counts["Non-fixture"] = sector_counts["Count"]
+
+    # Sort descending by count for a readable bar chart
+    sector_counts = sector_counts.sort_values("Count", ascending=True)
+
+    fig_sectors = go.Figure()
+    fig_sectors.add_trace(go.Bar(
+        y=sector_counts["Sector"],
+        x=sector_counts["Non-fixture"],
+        name="Funnel candidates",
+        orientation="h",
+        marker_color="#26a69a",
+    ))
+    fig_sectors.add_trace(go.Bar(
+        y=sector_counts["Sector"],
+        x=sector_counts["Fixtures"],
+        name="Permanent fixtures",
+        orientation="h",
+        marker_color="#455a64",
+    ))
+    fig_sectors.update_layout(
+        template="plotly_dark",
+        margin=dict(l=0, r=0, t=40, b=0),
+        height=max(320, 28 * len(sector_counts) + 80),
+        title="Universe Symbols by Sector",
+        xaxis_title="Symbol Count",
+        yaxis_title="Sector",
+        barmode="stack",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    st.plotly_chart(fig_sectors, use_container_width=True)
+
+    # Surface "Unknown" symbols so the user can extend SECTOR_MAP if needed.
+    unknown_syms = (
+        df_active.loc[df_active["Sector"] == "Unknown", "Symbol"].tolist()
+        if "Unknown" in sector_counts["Sector"].values else []
+    )
+
+    st.caption(
+        f"**How to read this chart:** counts how many active universe symbols "
+        f"land in each sector (per `risk.portfolio_guard.SECTOR_MAP`). Funnel "
+        f"candidates (teal) come from Stages 1–3; permanent fixtures (grey) "
+        f"are index/sector ETFs always included. PortfolioGuard caps *held* "
+        f"positions at "
+        f"{config.risk.max_sector_exposure_pct:.0%} of equity per sector — the "
+        f"actual exposure shown on Page 9. A heavily skewed universe (e.g. "
+        f"50%+ Technology) will struggle to diversify even when many signals "
+        f"fire."
+        + (
+            f"  \n**Unmapped symbols (Sector = 'Unknown', "
+            f"{len(unknown_syms)}):** {', '.join(unknown_syms)}. "
+            "Add to `_SECTOR_MAP` in `risk/portfolio_guard.py` to bring "
+            "them into the sector exposure check."
+            if unknown_syms else ""
+        )
     )
 
 

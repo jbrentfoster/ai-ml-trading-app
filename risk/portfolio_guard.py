@@ -116,6 +116,17 @@ _SECTOR_MAP: dict[str, str] = {
     "ETR":  "Utilities",
 }
 
+# Public alias — dashboards and analytics consumers should import this name.
+# The leading-underscore form remains the canonical one used by PortfolioGuard
+# itself; keeping both lets internal call sites stay unchanged.
+SECTOR_MAP: dict[str, str] = _SECTOR_MAP
+
+
+def get_sector(symbol: str) -> str:
+    """Return the sector for a symbol, or 'Unknown' when unmapped."""
+    return _SECTOR_MAP.get(symbol.upper(), "Unknown")
+
+
 # GOOG / GOOGL are the same underlying
 _GOOG_PAIR = {"GOOG", "GOOGL"}
 

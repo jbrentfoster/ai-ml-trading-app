@@ -16,6 +16,7 @@ import concurrent.futures
 from datetime import datetime, timezone
 
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
 
@@ -25,6 +26,7 @@ asyncio.set_event_loop(asyncio.new_event_loop())
 
 from config.settings import config, TradingMode
 from data.database import get_latest_risk_levels
+from risk.portfolio_guard import get_sector
 
 # ── Page config ───────────────────────────────────────────────────────────────
 
@@ -353,6 +355,121 @@ if st.session_state.ibkr_data:
                 "A well-diversified portfolio typically keeps any single position below 10–15% of total equity.  "
                 "The system enforces a configurable maximum position size limit (Settings → Trading → Max position size)."
             )
+
+        # ── Sector exposure ───────────────────────────────────────────────────
+        # Weight each position by market value, group by sector, and compare
+        # against the per-sector cap that PortfolioGuard enforces on new trades.
+        st.markdown("---")
+        st.subheader("Sector Exposure")
+
+        sector_df = pos_df.copy()
+        sector_df["sector"] = sector_df["symbol"].apply(get_sector)
+        sector_agg = (
+            sector_df.groupby("sector", as_index=False)
+            .agg(market_value=("market_value", "sum"),
+                 symbols=("symbol", lambda s: ", ".join(sorted(s))))
+        )
+
+        equity = float(summary.net_liquidation) if summary.net_liquidation else 0.0
+        cap_pct = config.risk.max_sector_exposure_pct
+        if equity > 0:
+            sector_agg["pct_equity"] = sector_agg["market_value"] / equity
+        else:
+            sector_agg["pct_equity"] = 0.0
+        sector_agg = sector_agg.sort_values("market_value", ascending=True)
+
+        col_donut, col_bar = st.columns([1, 1])
+
+        with col_donut:
+            import plotly.express as px
+            donut = px.pie(
+                sector_agg, names="sector", values="market_value",
+                title="Allocation by sector",
+                hole=0.4, template="plotly_dark",
+            )
+            donut.update_layout(height=340, margin=dict(l=0, r=0, t=40, b=0))
+            st.plotly_chart(donut, use_container_width=True)
+
+        with col_bar:
+            # Colour each bar red if it breaches the cap, amber if within 5pp,
+            # teal otherwise — matches the colour convention on the positions
+            # table.
+            def _bar_colour(pct: float) -> str:
+                if pct > cap_pct:
+                    return "#ef5350"
+                if pct > cap_pct - 0.05:
+                    return "#ff9800"
+                return "#26a69a"
+
+            bar_colours = sector_agg["pct_equity"].apply(_bar_colour).tolist()
+            bar_fig = go.Figure()
+            bar_fig.add_trace(go.Bar(
+                y=sector_agg["sector"],
+                x=sector_agg["pct_equity"] * 100,
+                orientation="h",
+                marker_color=bar_colours,
+                customdata=sector_agg[["market_value", "symbols"]].values,
+                hovertemplate=(
+                    "<b>%{y}</b><br>"
+                    "%{x:.2f}% of equity<br>"
+                    "$%{customdata[0]:,.0f}<br>"
+                    "%{customdata[1]}"
+                    "<extra></extra>"
+                ),
+            ))
+            bar_fig.add_vline(
+                x=cap_pct * 100,
+                line_dash="dash", line_color="#ef5350",
+                annotation_text=f"Cap {cap_pct:.0%}",
+                annotation_position="top right",
+            )
+            bar_fig.update_layout(
+                template="plotly_dark",
+                margin=dict(l=0, r=0, t=40, b=0),
+                height=max(280, 28 * len(sector_agg) + 80),
+                title="Sector exposure vs cap",
+                xaxis_title="% of net liquidation",
+                yaxis_title="",
+                showlegend=False,
+            )
+            st.plotly_chart(bar_fig, use_container_width=True)
+
+        # Sector summary table
+        table = sector_agg.sort_values("market_value", ascending=False).copy()
+        table["Market Value"] = table["market_value"].apply(lambda v: f"${v:,.0f}")
+        table["% of Equity"]  = table["pct_equity"].apply(lambda p: f"{p:.1%}")
+        table["Status"] = table["pct_equity"].apply(
+            lambda p: "🔴 Over cap" if p > cap_pct
+            else "🟠 Near cap" if p > cap_pct - 0.05
+            else "🟢 OK"
+        )
+        st.dataframe(
+            table.rename(columns={"sector": "Sector", "symbols": "Symbols"})
+                 [["Sector", "Symbols", "Market Value", "% of Equity", "Status"]],
+            use_container_width=True, hide_index=True,
+        )
+
+        unknown_held = sector_agg.loc[sector_agg["sector"] == "Unknown", "symbols"]
+        unknown_note = ""
+        if not unknown_held.empty:
+            unknown_note = (
+                f"  \n⚠ **Unmapped symbols (Sector = 'Unknown'):** "
+                f"{unknown_held.iloc[0]}.  PortfolioGuard's sector check "
+                "passes these through silently — add to `_SECTOR_MAP` in "
+                "`risk/portfolio_guard.py` to bring them under the cap."
+            )
+
+        st.caption(
+            f"**Sector exposure** = sum of position market values per sector, "
+            f"divided by net liquidation ({equity:,.0f}). "
+            f"PortfolioGuard's check #5 blocks new BUYs that would push a "
+            f"sector above **{cap_pct:.0%}** "
+            f"(`config.risk.max_sector_exposure_pct`). "
+            f"🔴 over cap · 🟠 within 5 pp of cap · 🟢 OK. "
+            f"Note the cap only blocks *new* positions — an existing sector "
+            f"can drift over the cap if positions appreciate."
+            f"{unknown_note}"
+        )
 
     # ── Open orders ───────────────────────────────────────────────────────────
     st.markdown("---")

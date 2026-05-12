@@ -12,7 +12,7 @@ trailing_stop   — converts qualifying bracket TPs into standalone TRAIL orders
 
 from risk.circuit_breaker import CircuitBreaker
 from risk.order_manager import OrderDecision, OrderManager
-from risk.portfolio_guard import GuardResult, PortfolioGuard
+from risk.portfolio_guard import SECTOR_MAP, GuardResult, PortfolioGuard, get_sector
 from risk.position_sizer import PositionSize, PositionSizer
 from risk.trailing_stop import TrailingStopAction, TrailingStopManager
 
@@ -24,6 +24,8 @@ __all__ = [
     "PortfolioGuard",
     "PositionSize",
     "PositionSizer",
+    "SECTOR_MAP",
     "TrailingStopAction",
     "TrailingStopManager",
+    "get_sector",
 ]
