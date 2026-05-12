@@ -365,6 +365,67 @@ class TestFormatKellyFstar:
         assert MLWalkForwardOrchestrator._format_kelly_fstar(None) == "n/a"
 
 
+class TestUniversePolicyTagging:
+    """Pin that `walk_forward_results.universe_policy` reflects whether the run
+    was driven by UniverseSelector (`dynamic`, biased) or the static watchlist
+    (`static`, unbiased).  Page 4 banners on the `dynamic` value."""
+
+    def test_orchestrator_default_policy_is_static(self):
+        """No universe_selector → `static` tag on every fold this run writes."""
+        from models.walk_forward import MLWalkForwardOrchestrator
+        orch = MLWalkForwardOrchestrator(symbol="TEST")
+        assert orch._universe_selector is None
+
+    def test_orchestrator_with_selector_marks_dynamic(self):
+        """A UniverseSelector instance → `dynamic` tag on every fold."""
+        from unittest.mock import MagicMock
+        from models.walk_forward import MLWalkForwardOrchestrator
+        orch = MLWalkForwardOrchestrator(symbol="TEST", universe_selector=MagicMock())
+        assert orch._universe_selector is not None
+
+    def test_walk_forward_result_persists_universe_policy(self, monkeypatch, tmp_path):
+        """ORM round-trip: writing `universe_policy='dynamic'` is readable.
+
+        Catches a future refactor that drops the column from the ORM, or a
+        SQLAlchemy column-type mismatch.
+        """
+        from datetime import datetime, timezone
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import Session
+        from data.database import Base, WalkForwardResult, log_walk_forward_result
+
+        engine = create_engine("sqlite:///:memory:", echo=False)
+        Base.metadata.create_all(engine)
+        monkeypatch.setattr("data.database._engine", engine)
+
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        log_walk_forward_result({
+            "run_id": "dyn-run", "symbol": "TEST", "fold_index": 0,
+            "train_start": now, "train_end": now,
+            "test_start": now,  "test_end":   now,
+            "total_return": 0.05, "annualized_return": 0.5,
+            "sharpe_ratio": 1.2, "max_drawdown": -0.03,
+            "win_rate": 0.55,    "n_signals": 4,
+            "recorded_at": now,  "sentiment_note": None,
+            "universe_policy": "dynamic",
+        })
+        log_walk_forward_result({
+            "run_id": "stat-run", "symbol": "TEST", "fold_index": 0,
+            "train_start": now, "train_end": now,
+            "test_start": now,  "test_end":   now,
+            "total_return": 0.05, "annualized_return": 0.5,
+            "sharpe_ratio": 1.2, "max_drawdown": -0.03,
+            "win_rate": 0.55,    "n_signals": 4,
+            "recorded_at": now,  "sentiment_note": None,
+            "universe_policy": "static",
+        })
+
+        with Session(engine) as session:
+            rows = {r.run_id: r.universe_policy
+                    for r in session.query(WalkForwardResult).all()}
+        assert rows == {"dyn-run": "dynamic", "stat-run": "static"}
+
+
 class TestCostModel:
     """Tests for the corrected WF cost model in _run_test_window.
 

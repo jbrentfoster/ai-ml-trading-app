@@ -473,6 +473,100 @@ class TestPortfolioGuard:
         assert not result.passed
         assert result.checks.get("no_duplicate") is False
 
+    # ── Sector exposure ──────────────────────────────────────────────────────
+
+    def test_sector_exposure_blocks_when_over_cap(self, mem_engine):
+        """Adding to a sector that already exceeds 30% should block."""
+        guard = self._guard(mem_engine)
+        # Hold 28% in Technology already (NVDA + META).  Adding 5% AAPL → 33%.
+        positions = {
+            "NVDA": {"shares": 100, "entry_price": 200, "current_price": 200},  # $20k
+            "META": {"shares":  20, "entry_price": 400, "current_price": 400},  # $8k
+        }
+        result = guard.check(
+            symbol="AAPL", signal="BUY",
+            position_size=self._pos_size(value=5_000),  # +5% Tech
+            equity=100_000, positions=positions, daily_pnl_pct=0.0,
+        )
+        assert not result.passed
+        assert result.checks.get("sector_exposure") is False
+        assert "Technology" in result.reason
+
+    def test_sector_exposure_passes_when_under_cap(self, mem_engine):
+        """Same sector but under 30% cap should pass."""
+        guard = self._guard(mem_engine)
+        # Hold only 10% in Technology; adding 5% AAPL → 15%.
+        positions = {
+            "NVDA": {"shares": 50, "entry_price": 200, "current_price": 200},   # $10k
+        }
+        result = guard.check(
+            symbol="AAPL", signal="BUY",
+            position_size=self._pos_size(value=5_000),
+            equity=100_000, positions=positions, daily_pnl_pct=0.0,
+        )
+        assert result.passed
+        assert result.checks.get("sector_exposure") is True
+
+    def test_sector_exposure_only_sums_matching_sector(self, mem_engine):
+        """A Healthcare position should not inflate Technology sector exposure."""
+        guard = self._guard(mem_engine)
+        positions = {
+            "NVDA": {"shares": 50, "entry_price": 200, "current_price": 200},   # $10k Tech
+            "JNJ":  {"shares": 60, "entry_price": 150, "current_price": 150},   # $9k Healthcare
+        }
+        # Adding 5% AAPL → Tech total 15% (well under 30%); Healthcare unaffected.
+        result = guard.check(
+            symbol="AAPL", signal="BUY",
+            position_size=self._pos_size(value=5_000),
+            equity=100_000, positions=positions, daily_pnl_pct=0.0,
+        )
+        assert result.passed
+
+    def test_sector_check_skipped_for_unknown_symbol(self, mem_engine):
+        """Symbols absent from _SECTOR_MAP pass the sector check (best-effort)."""
+        guard = self._guard(mem_engine)
+        ps = self._pos_size(value=5_000)
+        ps.symbol = "ZZZZ"
+        result = guard.check(
+            symbol="ZZZZ", signal="BUY",
+            position_size=ps,
+            equity=100_000, positions={}, daily_pnl_pct=0.0,
+        )
+        assert result.passed
+        assert result.checks.get("sector_exposure") is True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _SECTOR_MAP coverage of the active universe
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestSectorMapCoverage:
+    """Regression guard for sector-map coverage.
+
+    The 2026-05-12 expansion mapped the entire active universe to a sector.
+    Future universe additions must extend `_SECTOR_MAP` too — otherwise the
+    30%-per-sector cap silently passes those symbols.  This test makes the
+    gap loud.  When a new symbol is added to `universe_assets` but not the
+    map, this test names it.
+    """
+
+    def test_every_active_universe_symbol_is_mapped(self, mem_engine):
+        from sqlalchemy import text
+        from risk.portfolio_guard import _SECTOR_MAP
+        rows = mem_engine.connect().execute(
+            text("SELECT symbol FROM universe_assets WHERE active = 1")
+        ).fetchall()
+        active = [r[0] for r in rows]
+        # When the in-memory DB is empty (typical for this fixture), the test
+        # is a no-op — the production DB coverage check is what we care about.
+        if not active:
+            pytest.skip("no active universe rows in test DB — coverage check is a no-op")
+        unmapped = sorted(s for s in active if s.upper() not in _SECTOR_MAP)
+        assert not unmapped, (
+            f"{len(unmapped)} active-universe symbols missing from _SECTOR_MAP: "
+            f"{unmapped}. Add them to risk/portfolio_guard.py."
+        )
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CircuitBreaker

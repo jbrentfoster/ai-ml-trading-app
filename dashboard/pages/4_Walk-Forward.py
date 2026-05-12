@@ -155,6 +155,37 @@ if wf_df.empty:
     )
     st.stop()
 
+# ── Survivorship-bias banner ──────────────────────────────────────────────────
+# Rows tagged `universe_policy='dynamic'` came from a UniverseSelector-driven
+# run — the candidate set was decided using today's data, so historical folds
+# may include symbols that only became candidates in hindsight.  Warn loudly
+# when any visible row is dynamic so the user discounts the metrics
+# accordingly.  NULL ("unknown") rows predate the 2026-05-12 schema migration
+# and don't trigger the banner.
+
+if "Universe Policy" in wf_df.columns:
+    policy_counts = wf_df["Universe Policy"].fillna("unknown").value_counts().to_dict()
+    n_dynamic = int(policy_counts.get("dynamic", 0))
+    n_static  = int(policy_counts.get("static", 0))
+    n_unknown = int(policy_counts.get("unknown", 0))
+    if n_dynamic > 0:
+        msg = (
+            f"⚠️ **Survivorship-bias warning** — {n_dynamic} of {len(wf_df)} "
+            f"folds shown ran under a *dynamic* universe (UniverseSelector). "
+            "The candidate pool was determined using **today's** data, not the "
+            "data available at the start of each fold, so historical folds may "
+            "include symbols that only became candidates in hindsight. "
+            "Discount Sharpe / win-rate accordingly.  "
+            "For unbiased backtests, set `universe.enabled = False` (Settings → Universe) "
+            "or run training with `--use-watchlist`."
+        )
+        if n_static > 0 or n_unknown > 0:
+            msg += (
+                f"\n\nBreakdown: {n_dynamic} dynamic · {n_static} static · "
+                f"{n_unknown} unknown (pre-2026-05-12)."
+            )
+        st.warning(msg)
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # SECTION 1 — SUMMARY CARDS
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -319,7 +350,8 @@ table_cols = [
     "Symbol", "Fold", "Window Label",
     "Train Start", "Train End", "Test Start", "Test End",
     "Total Return", "Ann. Return", "Sharpe Ratio",
-    "Max Drawdown", "Win Rate", "# Signals", "Sentiment Note",
+    "Max Drawdown", "Win Rate", "# Signals",
+    "Universe Policy", "Sentiment Note",
 ]
 table_cols = [c for c in table_cols if c in wf_df.columns]
 
@@ -328,20 +360,32 @@ def _sharpe_color(val) -> str:
         return ""
     return "color: #26a69a" if val >= 0 else "color: #ef5350"
 
+def _policy_color(val) -> str:
+    if pd.isna(val) or val is None:
+        return "color: rgba(255,255,255,0.4)"   # unknown — grey
+    if str(val) == "dynamic":
+        return "color: #ffb74d"                  # amber — biased
+    return "color: #26a69a"                      # static — clean
+
 display_df = wf_df[table_cols].copy()
 if "Sentiment Note" in display_df.columns:
     display_df["Sentiment Note"] = display_df["Sentiment Note"].fillna("—")
+if "Universe Policy" in display_df.columns:
+    display_df["Universe Policy"] = display_df["Universe Policy"].fillna("unknown")
+
+styled = display_df.style.map(_sharpe_color, subset=["Sharpe Ratio"])
+if "Universe Policy" in display_df.columns:
+    styled = styled.map(_policy_color, subset=["Universe Policy"])
+styled = styled.format({
+    "Total Return": "{:.2%}",
+    "Ann. Return":  "{:.2%}",
+    "Sharpe Ratio": "{:.3f}",
+    "Max Drawdown": "{:.2%}",
+    "Win Rate":     "{:.1%}",
+}, na_rep="—")
 
 st.dataframe(
-    display_df.style
-        .map(_sharpe_color, subset=["Sharpe Ratio"])
-        .format({
-            "Total Return": "{:.2%}",
-            "Ann. Return":  "{:.2%}",
-            "Sharpe Ratio": "{:.3f}",
-            "Max Drawdown": "{:.2%}",
-            "Win Rate":     "{:.1%}",
-        }, na_rep="—"),
+    styled,
     use_container_width=True,
     height=min(40 + len(wf_df) * 38, 500),
 )

@@ -269,6 +269,9 @@ def query_walk_forward_results(symbol: str = "") -> pd.DataFrame:
         "Win Rate":           r.win_rate,
         "# Signals":          r.n_signals,
         "Sentiment Note":     r.sentiment_note,
+        # NULL on rows written before the 2026-05-12 migration; "dynamic" /
+        # "static" thereafter.  Page 4 banners when any visible row is dynamic.
+        "Universe Policy":    r.universe_policy,
         "Recorded At":        r.recorded_at,
     } for r in rows])
     df["Recorded At"] = _to_local_series(df["Recorded At"])

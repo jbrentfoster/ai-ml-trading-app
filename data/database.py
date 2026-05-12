@@ -214,6 +214,12 @@ class WalkForwardResult(Base):
     n_signals       = Column(Integer)
     recorded_at     = Column(DateTime, nullable=False)
     sentiment_note  = Column(Text)     # set when FinBERT was suppressed for this fold
+    # "dynamic" when this run was driven by UniverseSelector (subject to
+    # survivorship bias — the universe was determined using *today's* data, so
+    # historical folds may contain symbols that only became candidates in
+    # hindsight); "static" when driven by the configured watchlist.  NULL on
+    # rows written before this column was added (2026-05-12 migration).
+    universe_policy = Column(String(20))
 
 
 class UniverseAsset(Base):
@@ -413,6 +419,17 @@ def _migrate(engine) -> None:
             ))
             conn.commit()
             log.info("Migration applied: walk_forward_results.sentiment_note")
+
+        # walk_forward_results.universe_policy  (2026-05-12 — survivorship-bias
+        # flag: "dynamic" rows came from a UniverseSelector-driven run, "static"
+        # rows came from the watchlist).  Existing rows backfill as NULL since
+        # we don't know retroactively which policy produced them.
+        if "universe_policy" not in wf_cols:
+            conn.execute(text(
+                "ALTER TABLE walk_forward_results ADD COLUMN universe_policy VARCHAR(20)"
+            ))
+            conn.commit()
+            log.info("Migration applied: walk_forward_results.universe_policy")
 
         # universe_assets.exchange  (added to support exchange-based ADR filtering)
         if "universe_assets" in insp.get_table_names():

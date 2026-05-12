@@ -28,32 +28,92 @@ from risk.position_sizer import PositionSize
 
 log = get_logger("risk.portfolio_guard")
 
-# Sector mapping for common tickers; "Unknown" means no sector check is applied.
+# Sector mapping for common tickers; absence from this dict means no sector
+# check is applied (best-effort guard — see CLAUDE.md "PortfolioGuard sector
+# check is best-effort").  Coverage extended 2026-05-12 to span the active
+# universe (see `universe_assets`) plus commonly-traded large-caps that have
+# appeared in held positions or as recent BUY targets in `order_decisions`.
+# Sector buckets are simplified from S&P GICS — "Technology" = Information
+# Technology; "Telecom" = Communication Services; "Consumer Disc" =
+# Consumer Discretionary.  Add new entries here when expanding the universe.
 _SECTOR_MAP: dict[str, str] = {
-    # ETF fixtures
+    # ── Broad-market ETF fixtures ────────────────────────────────────────────
     "SPY": "Broad Market", "QQQ": "Broad Market",
     "IWM": "Broad Market", "DIA": "Broad Market",
+
+    # ── Sector ETF fixtures ──────────────────────────────────────────────────
     "XLF": "Financials",   "XLE": "Energy",
     "XLK": "Technology",   "XLV": "Healthcare",
     "XLI": "Industrials",  "XLP": "Consumer Staples",
     "XLY": "Consumer Disc", "XLU": "Utilities",
     "XLB": "Materials",    "XLRE": "Real Estate",
-    "TLT": "Fixed Income", "GLD": "Commodities",
-    "SLV": "Commodities",  "USO": "Commodities",
-    # Large caps
-    "AAPL": "Technology",  "MSFT": "Technology",
+
+    # ── Bond / commodity ETF fixtures ────────────────────────────────────────
+    "TLT": "Fixed Income",
+    "GLD": "Commodities",  "SLV": "Commodities", "USO": "Commodities",
+
+    # ── Technology ───────────────────────────────────────────────────────────
+    "AAPL": "Technology", "MSFT": "Technology",
     "GOOGL": "Technology", "GOOG": "Technology",
-    "META": "Technology",  "NVDA": "Technology",
+    "META": "Technology", "NVDA": "Technology",
+    "AXTI": "Technology", "CRWV": "Technology",
+    "MCHP": "Technology", "MSI": "Technology",
+    "NOW": "Technology",  "POET": "Technology",
+    "SNOW": "Technology", "TEL": "Technology",
+    "TTD": "Technology",
+
+    # ── Consumer Discretionary ───────────────────────────────────────────────
     "AMZN": "Consumer Disc", "TSLA": "Consumer Disc",
-    "JPM": "Financials",   "BAC": "Financials",
-    "GS": "Financials",    "V": "Financials",
-    "MA": "Financials",    "BRK.B": "Financials",
-    "UNH": "Healthcare",   "JNJ": "Healthcare",
-    "LLY": "Healthcare",   "ABBV": "Healthcare",
-    "XOM": "Energy",       "CVX": "Energy",
-    "WMT": "Consumer Staples", "PG": "Consumer Staples",
-    "KO": "Consumer Staples",  "PEP": "Consumer Staples",
-    "T": "Telecom",        "VZ": "Telecom",
+    "EXPE": "Consumer Disc", "LULU": "Consumer Disc",
+    "NFLX": "Consumer Disc", "NKE": "Consumer Disc",
+    "TSCO": "Consumer Disc",
+
+    # ── Financials ───────────────────────────────────────────────────────────
+    "JPM":  "Financials", "BAC": "Financials",
+    "GS":   "Financials", "V":   "Financials",
+    "MA":   "Financials", "BRK.B": "Financials",
+    "AON":  "Financials", "CRCL": "Financials",
+    "HUT":  "Financials", "SCHW": "Financials",
+    "WFC":  "Financials",
+
+    # ── Healthcare ───────────────────────────────────────────────────────────
+    "UNH":  "Healthcare", "JNJ": "Healthcare",
+    "LLY":  "Healthcare", "ABBV": "Healthcare",
+    "ABT":  "Healthcare", "AZN": "Healthcare",
+    "BDX":  "Healthcare", "BMY": "Healthcare",
+    "BSX":  "Healthcare", "EW":  "Healthcare",
+    "HCA":  "Healthcare", "MCK": "Healthcare",
+    "MDT":  "Healthcare", "MRK": "Healthcare",
+    "REGN": "Healthcare", "ZTS": "Healthcare",
+
+    # ── Energy ───────────────────────────────────────────────────────────────
+    "XOM":  "Energy", "CVX": "Energy",
+    "BP":   "Energy", "DVN": "Energy",
+    "FANG": "Energy", "OXY": "Energy",
+    "VLO":  "Energy",
+
+    # ── Consumer Staples ─────────────────────────────────────────────────────
+    "WMT":  "Consumer Staples", "PG":  "Consumer Staples",
+    "KO":   "Consumer Staples", "PEP": "Consumer Staples",
+    "SYY":  "Consumer Staples",
+
+    # ── Telecom / Communication Services ─────────────────────────────────────
+    "T":    "Telecom", "VZ":   "Telecom",
+    "ASTS": "Telecom", "CHTR": "Telecom",
+    "TMUS": "Telecom",
+
+    # ── Industrials ──────────────────────────────────────────────────────────
+    "DAL":  "Industrials", "GE":   "Industrials",
+    "LHX":  "Industrials", "LMT":  "Industrials",
+    "MMM":  "Industrials", "NOC":  "Industrials",
+    "ODFL": "Industrials", "UAL":  "Industrials",
+
+    # ── Materials ────────────────────────────────────────────────────────────
+    "AEM":  "Materials", "DOW":  "Materials",
+    "LYB":  "Materials", "USAR": "Materials",
+
+    # ── Utilities ────────────────────────────────────────────────────────────
+    "ETR":  "Utilities",
 }
 
 # GOOG / GOOGL are the same underlying

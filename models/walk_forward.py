@@ -213,6 +213,9 @@ class MLWalkForwardOrchestrator:
                 "n_signals":        sum(1 for s in signals if s.passed_gate),
                 "recorded_at":      datetime.now(timezone.utc).replace(tzinfo=None),
                 "sentiment_note":   sentiment_note,
+                # Persist whether this fold ran under a dynamically-selected
+                # universe (subject to survivorship bias — Page 4 flags it).
+                "universe_policy":  "dynamic" if self._universe_selector is not None else "static",
             }
             log_walk_forward_result(db_record)
 
