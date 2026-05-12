@@ -47,8 +47,13 @@ st.markdown(
 )
 
 # ── Filter options (driven by what's actually in trade_log) ───────────────────
+# The dedup checkbox below shares a session_state key with this query so the
+# dropdown lists only symbols/reasons present in the *current* view.  Streamlit
+# reruns the script top-to-bottom on every interaction, so reading session_state
+# here picks up the previous run's checkbox value (default True on first load).
 
-opts = query_trade_log_filter_options()
+dedup_default = st.session_state.get("trade_history_dedup", True)
+opts = query_trade_log_filter_options(dedup_to_latest_run=dedup_default)
 all_symbols      = opts["symbols"]
 all_exit_reasons = opts["exit_reasons"]
 all_sources      = opts["sources"]
@@ -111,11 +116,13 @@ with st.sidebar:
     dedup_to_latest = st.checkbox(
         "Dedupe to latest run per symbol",
         value=True,
+        key="trade_history_dedup",
         help=(
             "ON (default): for walk_forward rows, keep only the latest training "
             "run per symbol — current model only.  OFF: show every weekly "
             "retrain stacked together (Nx duplicates after N runs).  Has no "
-            "effect on live rows or when a specific Run ID is selected below."
+            "effect on live rows or when a specific Run ID is selected below.  "
+            "Also filters the Symbols / Exit reasons dropdowns above to match."
         ),
     )
 

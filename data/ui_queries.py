@@ -838,16 +838,29 @@ def query_tax_breakdown(
 
 
 @st.cache_data(ttl=300)
-def query_trade_log_filter_options() -> dict:
+def query_trade_log_filter_options(dedup_to_latest_run: bool = True) -> dict:
     """
     Distinct values present in trade_log for populating page filters.
 
     Returns: {"symbols": [...], "exit_reasons": [...], "sources": [...]}
     Each list is sorted; empty lists when the table has no rows yet.
+
+    When ``dedup_to_latest_run=True`` (default), walk_forward rows are first
+    collapsed to the latest training run per symbol via
+    ``_keep_latest_run_per_symbol`` so the dropdown matches what
+    ``query_trade_log`` will actually return.  Without this, symbols whose
+    latest WF run produced zero closed trades (e.g. long-only gate
+    suppressing every SELL signal) stayed selectable in the dropdown but
+    yielded an empty table — caused user confusion observed during the
+    2026-05-04 long-only gate verification.
     """
     df = get_trade_log()
     if df.empty:
         return {"symbols": [], "exit_reasons": [], "sources": []}
+    if dedup_to_latest_run:
+        df = _keep_latest_run_per_symbol(df)
+        if df.empty:
+            return {"symbols": [], "exit_reasons": [], "sources": []}
     return {
         "symbols":      sorted(df["symbol"].dropna().unique().tolist()),
         "exit_reasons": sorted(df["exit_reason"].dropna().unique().tolist()),
