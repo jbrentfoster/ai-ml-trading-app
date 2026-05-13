@@ -159,7 +159,7 @@ X_test_scaled  = scaler.transform(X_test)        # apply to test
 
 ### Streamlit
 **What it is:** Python library that turns scripts into interactive web apps with minimal boilerplate.
-**Why it's used:** The entire 8-page dashboard is built with Streamlit — no HTML/CSS/JavaScript required. Each page is a Python script that runs top-to-bottom on every user interaction.
+**Why it's used:** The entire 10-page dashboard is built with Streamlit — no HTML/CSS/JavaScript required. Each page is a Python script that runs top-to-bottom on every user interaction.
 **How it's used:** All dashboard pages in `dashboard/`.
 **Docs:** https://docs.streamlit.io/
 
@@ -292,7 +292,11 @@ All tests mock external dependencies (yfinance, ib_insync, Alpaca API) so no net
 |------|---------|
 | `test_data_pipeline.py` | DataFetcher, IndicatorEngine |
 | `test_ibkr_connection.py` | IBKRConnection |
-| `test_walk_forward.py` | WalkForwardSplit, compute_metrics, orchestrator |
-| `test_models.py` | LSTM, XGBoost, FinBERT, RegimeDetector, SignalGate |
-| `test_universe.py` | UniverseSelector, stage 1/2/3 |
-| `test_risk.py` | PositionSizer, PortfolioGuard, CircuitBreaker, OrderManager |
+| `test_walk_forward.py` | WalkForwardSplit, compute_metrics, orchestrator, bracket simulator, realised-Kelly handoff, universe_policy tagging |
+| `test_models.py` | LSTM, XGBoost, FinBERT, RegimeDetector, SignalGate (incl. regime weight halving + Wilder ADX) |
+| `test_universe.py` | UniverseSelector, stage 1/2/3, fixtures, DB roundtrip |
+| `test_risk.py` | PositionSizer (incl. realised-Kelly), PortfolioGuard (incl. stop-sanity + sector coverage), CircuitBreaker, OrderManager |
+| `test_signal_runner.py` | EQUIVALENT_PAIRS dedup, stale-bar gate, baseline-loss circuit-breaker trigger |
+| `test_trailing_stop.py` | TrailingStopManager (activation, idempotency, missing-ATR, shorts skipped, FAILED path) |
+| `test_ui_queries.py` | trade_log P&L accounting (canary: `net_pnl == stored pnl`, *not* `pnl − costs_charged`) |
+| `test_settings.py` | YAML loader, unknown-key warnings |

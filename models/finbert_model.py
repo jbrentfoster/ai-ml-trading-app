@@ -11,8 +11,10 @@ Returns 0.0 when:
 
 from __future__ import annotations
 
+import logging
 import math
 import os
+import warnings
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -25,6 +27,12 @@ from pathlib import Path
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+
+# The "unauthenticated requests to the HF Hub" notice is emitted via
+# `warnings.warn` (not env-var controlled) AND its `huggingface_hub.utils._http`
+# logger when warnings are captured.  Silence both paths.
+warnings.filterwarnings("ignore", message=r".*unauthenticated requests to the HF Hub.*")
+logging.getLogger("huggingface_hub.utils._http").setLevel(logging.ERROR)
 
 import pandas as pd
 

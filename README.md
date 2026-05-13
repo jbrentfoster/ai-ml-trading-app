@@ -158,7 +158,7 @@ The daily and weekly runs are driven by two batch files that execute the pipelin
 
 | File | When | Steps |
 |------|------|-------|
-| `run_daily.bat` | Mon–Sat 09:40 AM | `run_pipeline.py` → `universe_scheduler.py --rescore-now --no-signal-run` → `train_models.py` (new symbols only) → `signal_runner.py` (data refresh → signals → trailing-stop conversion → new orders) |
+| `run_daily.bat` | Mon–Fri 09:40 AM | `run_pipeline.py` → `universe_scheduler.py --rescore-now --no-signal-run` → `train_models.py` (new symbols only) → `signal_runner.py` (data refresh → signals → trailing-stop conversion → new orders) |
 | `run_weekly.bat` | Sunday 01:00 AM | `run_pipeline.py` → `train_models.py --force` → `universe_scheduler.py --run-now` |
 
 **Step ordering matters.** The daily run rescores the universe *before* training so that symbols freshly promoted into the active set get checkpoints the same day rather than next. `--no-signal-run` suppresses the inline signal runner that `universe_scheduler.py` would otherwise fire post-rescore; signals are run explicitly as the final step, after training has caught up.

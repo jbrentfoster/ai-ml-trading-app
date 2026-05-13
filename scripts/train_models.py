@@ -58,10 +58,10 @@ def _restore_config(saved: dict) -> None:
         setattr(config.ml, k, v)
 
 
-def train_symbol(symbol: str, interval: str, force: bool, quick: bool) -> bool:
+def train_symbol(symbol: str, interval: str, force: bool, quick: bool) -> str:
     """
     Train the ensemble for one symbol.
-    Returns True on success, False on failure.
+    Returns one of: "trained", "skipped", "failed".
     """
     from data.indicators import IndicatorEngine
     from models.walk_forward import MLWalkForwardOrchestrator
@@ -70,14 +70,14 @@ def train_symbol(symbol: str, interval: str, force: bool, quick: bool) -> bool:
 
     if _models_exist(symbol) and not force:
         print(f"  {symbol}: checkpoints already exist — skipping (use --force to retrain)")
-        return True
+        return "skipped"
 
     engine = IndicatorEngine()
     df = engine.run(symbol, interval=interval)
 
     if df is None or df.empty:
         print(f"  {symbol}: no data in DB — run run_pipeline.py first")
-        return False
+        return "skipped"
 
     min_bars = config.ml.wf_train_bars + config.ml.wf_gap_bars + config.ml.wf_n_splits * config.ml.wf_test_bars
     if len(df) < min_bars:
@@ -85,7 +85,7 @@ def train_symbol(symbol: str, interval: str, force: bool, quick: bool) -> bool:
             f"  {symbol}: only {len(df)} bars, need {min_bars} for "
             f"{config.ml.wf_n_splits} folds — skipping"
         )
-        return False
+        return "skipped"
 
     t0 = time.monotonic()
     try:
@@ -105,13 +105,13 @@ def train_symbol(symbol: str, interval: str, force: bool, quick: bool) -> bool:
             f"  {symbol}: {n_folds} folds | avg Sharpe={avg_sharpe:.3f} | "
             f"{elapsed:.0f}s | saved to {cache_dir}"
         )
-        return True
+        return "trained"
 
     except Exception as exc:
         elapsed = time.monotonic() - t0
         print(f"  {symbol}: FAILED after {elapsed:.0f}s — {exc}")
         log.error("Training failed for %s: %s", symbol, exc, exc_info=True)
-        return False
+        return "failed"
 
 
 def main() -> None:
@@ -164,16 +164,19 @@ def main() -> None:
     print()
 
     t_total = time.monotonic()
-    ok_count = 0
-    fail_count = 0
+    trained_count = 0
+    skipped_count = 0
+    failed_count = 0
 
     try:
         for symbol in symbols:
-            success = train_symbol(symbol, args.interval, args.force, args.quick)
-            if success:
-                ok_count += 1
+            result = train_symbol(symbol, args.interval, args.force, args.quick)
+            if result == "trained":
+                trained_count += 1
+            elif result == "skipped":
+                skipped_count += 1
             else:
-                fail_count += 1
+                failed_count += 1
     finally:
         if args.quick:
             _restore_config(saved_cfg)
@@ -181,7 +184,10 @@ def main() -> None:
     elapsed = time.monotonic() - t_total
     print()
     print(f"{'='*60}")
-    print(f"  Done in {elapsed:.0f}s — {ok_count} trained, {fail_count} skipped/failed")
+    print(
+        f"  Done in {elapsed:.0f}s — "
+        f"{trained_count} trained, {skipped_count} skipped, {failed_count} failed"
+    )
     print()
     print("  Next step:")
     print("    python signal_runner.py")

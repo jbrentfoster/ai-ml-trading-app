@@ -1,0 +1,75 @@
+============================================================
+AXTI follow-up case study — run on or after 2026-05-15
+============================================================
+Entry: BUY 548 sh @ $72.96 on 2026-04-29 13:52 (run_id 9616aa86-6b38-46bb-887e-bd7302b616c4)
+  Stop: $54.15  TP: $101.19  Cost basis: $39,984.65
+  Trailing stop activation level: $91.89 (entry + 2.0 x ATR $9.83)
+Conversation: 2026-05-01 — concluded "skillful selection, lucky magnitude" (universe funnel + risk sizing
+  did the work; +33% in 2 days was timing luck). Goal: confirm or revise that read once trade closes.
+
+Step 1 — Has it exited? Run from project root:
+
+  .venv/Scripts/python -c "
+  from data.database import get_engine
+  from sqlalchemy import text
+  import pandas as pd
+  pd.set_option('display.width', 200)
+  eng = get_engine()
+  with eng.connect() as c:
+      print('--- Order decisions after entry ---')
+      print(pd.read_sql(text(\"SELECT decided_at, signal, decision, shares, entry_price, reject_reason FROM order_decisions WHERE symbol='AXTI' AND decided_at > '2026-04-29 13:52' ORDER BY decided_at\"), c).to_string())
+      print('\\n--- Trailing stop log ---')
+      print(pd.read_sql(text(\"SELECT decided_at, action, current_price, atr, trail_amount, reason FROM trailing_stop_log WHERE symbol='AXTI' ORDER BY decided_at\"), c).to_string())
+      print('\\n--- Trade log (live exits land here once Phase B ships) ---')
+      print(pd.read_sql(text(\"SELECT * FROM trade_log WHERE symbol='AXTI' AND source='live'\"), c).to_string())
+      print('\\n--- Last 10 daily bars ---')
+      print(pd.read_sql(text(\"SELECT timestamp, open, high, low, close FROM ohlcv_bars WHERE symbol='AXTI' AND interval='1d' ORDER BY timestamp DESC LIMIT 10\"), c).to_string())
+  "
+
+Step 2 — Confirm broker state (IB Gateway must be up):
+
+  .venv/Scripts/python scripts/open_positions.py
+  # Look for AXTI line. If absent -> position closed. If present -> still held; note avg cost + market value.
+
+Step 3 — Identify exit reason (decision tree):
+  - trailing_stop_log shows action=CONVERTED  -> exit was via trailing stop; pull the TRAIL fill price from IBKR or
+    the day's low after activation. Exit reason = "trailing".
+  - order_decisions shows CLOSED_LONG for AXTI  -> a SELL signal closed it. Exit reason = "signal_flip".
+  - No CONVERTED, no CLOSED_LONG, position absent in IBKR  -> bracket TP or STP fired. Compare exit price to
+    $54.15 (stop) vs $101.19 (TP) vs intermediate (trailing TP if it converted before the original TP).
+  - Position still open  -> MTM only; revisit later.
+
+Step 4 — Compute realized P&L:
+  realized_pnl = (exit_px - 72.96) * 548
+  realized_pnl_pct = (exit_px - 72.96) / 72.96
+  Subtract estimated fees/slippage if known (IBKR paper rarely charges; round to nearest dollar).
+
+Step 5 — Write the case study to docs/case_studies/axti_2026-04.md. Cover:
+  1. Entry thesis (copy from CLAUDE.md / 2026-05-01 conversation): momentum + Wedbush PT raise $28->$80 +
+     optical AI narrative + RSI 55.7 + ATR-sized stop. XGBoost score 0.94 on the daily rescore.
+  2. What happened day-by-day (use ohlcv_bars from 2026-04-29 through exit date).
+  3. Exit (price, reason, holding period, P&L $ and %).
+  4. Skill vs luck retrospective:
+     - Did the trailing stop activate as designed? (key system-design question)
+     - Was the exit price reasonable vs the high-water mark? (slippage from peak)
+     - Would a tighter / looser stop have changed the outcome materially?
+     - Is the win consistent with the "skillful selection, lucky magnitude" read,
+       or does it shift toward more luck (round-tripped) or more skill (clean trail-stop exit near peak)?
+  5. Implications for the three enhancements that were deferred (analyst PT revisions, news theme
+     clustering, post-offering survival flag) — does this trade strengthen or weaken the case for any?
+     Note: as of 2026-05-01 the `fundamental_data` table is append-only history (UNIQUE constraint on
+     symbol dropped). Pull the AXTI analyst_target series from entry through exit and include it in
+     the case study — was the rally accompanied by further PT raises (supporting the PT-revision
+     factor case) or did targets stall (weakening it)?
+       SELECT fetched_at, analyst_target, market_cap FROM fundamental_data
+       WHERE symbol='AXTI' ORDER BY fetched_at;
+
+Reference data captured during 2026-05-01 conversation (preserved here so future-you has the entry snapshot
+without re-deriving):
+  - At entry, AXTI fundamentals: no PE, fwd PE 151, P/B 15.7, EV/EBITDA -298, rev growth -8.2%,
+    profit margin -24%, ROE -7.9%, FCF $1.8M, analyst target $67.75, market cap ~$4.88B.
+  - Universe added_at: 2026-04-26 (Sunday weekly run); xgb_score 0.941018; avg_dollar_volume $945M.
+  - Year-prior close (2024-04-29): $3.03 — i.e. ~24x in 12 months pre-entry.
+  - News flow before entry: Wedbush PT $28->$80 (Apr 29), "Optical AI Boom" articles (Apr 25-27),
+    secondary offering over-allotment exercised at $64.25 (Apr 24) — stock absorbed dilution cleanly.
+============================================================

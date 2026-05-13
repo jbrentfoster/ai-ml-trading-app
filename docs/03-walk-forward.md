@@ -93,6 +93,54 @@ Inside each fold, predictions are made **bar by bar** — for each test bar, the
 
 ---
 
+## Bracket simulator
+
+Walk-forward doesn't just evaluate signals in isolation — it runs each fold's test window through a **bracket simulator** in `_run_test_window` that mirrors the live execution path. The intent is that WF P&L reflects what would *actually* have happened end-to-end, not just the raw direction of the model's score.
+
+### What the simulator models
+
+- **Entry timing**: signals at bar `t` close enter at bar `t+1` open (matches live runner behaviour).
+- **ATR-based brackets**: at entry, place `stop = entry − atr_stop_multiplier × ATR` and `tp = entry + atr_take_profit_multiplier × ATR` using ATR from the bar *before* entry (no lookahead).
+- **Intra-bar worst-case rule**: when both stop and TP lie inside `[Low, High]` on the same bar, the **stop** fills (conservative).
+- **Gap-through**: if `Open ≤ stop` (long), fill at `Open`. The gap *is* the slippage; no extra stop-slippage charge on top.
+- **Stop slippage**: intra-bar stop fills charged `stop_slippage_multiplier × slippage_pct` (default 2.0× the baseline). TP fills are exact (limit orders fill at limit or better).
+- **Trailing-stop conversion**: pre-activation, check `Close ≥ entry + activation_atr × ATR`. Once active, ratchet `peak_price = max(peak_price, High)` and `trail_stop = peak_price − trail_atr × ATR`. New trailing-stop level applies bar `t+1` onward (today's High can't tighten today's stop).
+- **Long-only gate**: when `trading.allow_short_selling=False` (the default), SELL signals from flat are no-ops and SELL signals after a long close the position without opening a short. Matches the live `OrderManager` behaviour.
+- **Fold-end flatten**: any position still open at the last bar of the test window is force-flattened. Bracket exits and fold-end flatten are independent — whichever fires first closes the position.
+- **Costs**: each closed trade is charged `slippage_pct + commission_per_share / entry_px` (plus stop-slippage on stops) to compute `pnl_pct`.
+
+### Persistence to `trade_log`
+
+Each closed trade is written to the `trade_log` table with:
+- `source='walk_forward'`, `run_id`, `fold_index`
+- `entry_ts`, `entry_px`, `exit_ts`, `exit_px`
+- `exit_reason ∈ {stop, tp, trailing, signal_flip, fold_end, manual_close}`
+- `shares` (Kelly-sized — see below), `pnl` (net of costs, in dollars), `pnl_pct`, `costs_charged`
+
+The `pnl` field is **already net of costs**; `costs_charged` is exposed separately for display reconstruction. Never compute `net_pnl = pnl - costs_charged` — that double-counts fees.
+
+These rows are the data source for the Trade History dashboard page (Page 10) and for realised-Kelly sizing (below).
+
+---
+
+## Realised-Kelly sizing in walk-forward
+
+Once enough closed trades accumulate in `trade_log` for a symbol (default ≥ 30), the position sizer switches from the signal-score proxy to **realised** Kelly inputs:
+
+```
+win_rate     = wins / n_trades
+avg_win_pct  = mean(pnl_pct for winning trades)
+avg_loss_pct = |mean(pnl_pct for losing trades)|
+b            = avg_win_pct / avg_loss_pct
+f*           = (win_rate × b − (1 − win_rate)) / b
+```
+
+The orchestrator computes `kelly_history` once at the start of each fold with `as_of=fold.test_start`, `source='walk_forward'`, `run_id=self._run_id` — naturally forward-only (no future folds), naturally excludes trades from prior runs with different ensemble weights. Below the trade-count threshold, sizing falls back to the signal-score proxy. Method label `kelly_realised` vs `kelly_proxy` appears in logs and in the order-decisions table.
+
+Per-bar P&L (and therefore the fold's Sharpe / drawdown) is intentionally size-agnostic — scaling every bar's contribution by a fold-constant `position_pct` is a no-op for Sharpe, and `pnl_pct` remains the right Kelly input. Only `shares`, dollar `pnl`, and `costs_charged` in `trade_log` reflect the Kelly-sized position.
+
+---
+
 ## Performance metrics
 
 After each test window, `compute_metrics()` calculates:
@@ -137,15 +185,14 @@ FinBERT is excluded from the Sharpe competition — it can't be evaluated like a
 
 When `config.universe.enabled = True`, the universe was selected using today's data. Historical walk-forward folds may include symbols that were only selected in hindsight (i.e., they survived and grew large enough to enter the universe). This makes historical performance look better than it would have been in practice.
 
-For unbiased backtests, use the static watchlist:
-```bash
-python train_models.py --use-watchlist
-```
+For unbiased backtests, use the static watchlist (leave `config.universe.enabled=False`, or call `run_pipeline.py --use-watchlist`).
 
 The orchestrator logs a warning when it detects universe selection is active:
 ```
 WARNING: Walk-forward results may reflect survivorship bias
 ```
+
+Each `walk_forward_results` row carries a `universe_policy` column (`dynamic` | `static`) so the dashboard's Walk-Forward page can flag biased runs visually — an amber banner appears above the summary cards whenever any displayed row has `universe_policy='dynamic'`, and the detailed results table colour-codes the column.
 
 ---
 

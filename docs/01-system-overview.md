@@ -43,33 +43,33 @@ External data sources
 
 ---
 
-## The five phases of a daily run
+## The six phases of a daily run
 
-The `signal_runner.py` script works in five sequential phases:
+The `signal_runner.py` script works in six sequential phases (Phase 3.5 is opt-in):
 
-### Phase 1 — Data refresh
-Fetch the latest OHLCV bars and news for all symbols. This is an incremental update — only new bars since the last run are fetched. yfinance is the primary source for price data; IBKR/Alpaca/yfinance are tried in order for news.
+### Phase 1 — Startup
+Determine which symbols to process, check the circuit breaker state, capture an equity-baseline snapshot from IBKR (when not in dry-run), and auto-trip the circuit breaker if the realised + unrealised P&L vs that baseline has exceeded the daily / weekly loss limits. Includes orphan-position detection so any held long not in the active universe still gets pulled into the symbol list.
 
-### Phase 2 — Signal generation
+### Phase 2 — Data refresh
+Fetch the latest OHLCV bars and news for the symbols selected in Phase 1. This is an incremental update — only new bars since the last run are fetched. yfinance is the primary source for price data; IBKR/Alpaca/yfinance are tried in order for news. Symbols whose newest cached daily bar is older than `risk.max_bar_staleness_days` (default 3) are dropped before Phase 3 generates signals.
+
+### Phase 3 — Signal generation
 For each symbol, load the saved model checkpoints and run inference:
 - **LSTM** reads the last 60 bars of price + indicator data
 - **XGBoost** reads current indicator values + fundamental ratios
 - **FinBERT** aggregates recent news headlines into a sentiment score
-- **Ensemble** combines the three scores using weighted averaging
+- **Ensemble** combines the three scores using weighted averaging (XGBoost weight is halved in TRENDING regime)
 
-### Phase 3 — Signal gate
-Filter signals through three sequential checks:
-1. Is the ensemble score strong enough? (`|score| >= threshold`)
-2. Adjusted for market regime? (high volatility raises the bar)
-3. Do at least 2 of 3 models agree on direction?
+The signal gate then runs three sequential filters — threshold, regime-adjusted threshold, and model confirmation (≥ 2 of 3 agree). Only signals that pass all three become BUY or SELL decisions; the rest fall to HOLD.
 
-Only signals that pass all three gates become BUY or SELL decisions.
+### Phase 3.5 — Trailing-stop conversion (opt-in)
+When `risk.trailing_stop_enabled=True` AND `trading.paper_orders_enabled=True` AND NOT dry-run, the `TrailingStopManager` walks every open long position. For each position that has moved ≥ `trailing_stop_activation_atr × ATR` into profit, the bracket's TP and STP legs are cancelled and replaced by a single standalone GTC `TRAIL` order. Idempotent — positions with an existing TRAIL order are skipped.
 
 ### Phase 4 — Risk & order decisions
-Each signal passes through the portfolio guard (six checks) and position sizer (Kelly criterion + ATR). The result is an `OrderDecision` with entry price, stop loss, and take profit levels.
+Each signal passes through the portfolio guard (seven checks) and position sizer (Kelly criterion + ATR). The result is an `OrderDecision` with entry price, stop loss, and take profit levels. SELL signals against existing longs flatten the position (`CLOSED_LONG`); SELL signals from flat without `allow_short_selling` are rejected (`REJECTED_NO_POSITION`).
 
-### Phase 5 — Order submission
-In dry-run mode (default): log the decision to `order_decisions` table. In paper mode: submit bracket orders to IBKR paper account. In live mode: submit to live account.
+### Phase 5 — Summary
+Write a `signal_runner_log` row with run-level counters (signals generated, orders submitted, rejected, longs closed, trailing conversions, skipped duplicates, stale-bar drops) and print a summary table. Order submission itself happens inside Phase 4 — in dry-run mode (default) decisions are written to `order_decisions` only; in paper mode bracket orders are submitted to IBKR; in live mode they go to the live account.
 
 ---
 
@@ -129,19 +129,28 @@ MLWalkForwardOrchestrator.predict()
     │   runs signal gate
     │   writes to signal_log
     ▼
-OrderManager.evaluate()
-    │   PortfolioGuard (6 checks)
-    │   PositionSizer (Kelly + ATR)
+TrailingStopManager.manage()          ← Phase 3.5, runs before new orders
+    │   walks open longs, converts qualifying TPs to trailing stops
+    │   writes to trailing_stop_log
+    ▼
+OrderManager.process()
+    │   PositionSizer (Kelly + ATR — realised-Kelly once trade_log has ≥30 closed trades)
+    │   PortfolioGuard (7 sequential checks)
     │   writes to order_decisions
     ▼
 IBKRConnection.place_bracket_order()   ← only when paper_orders_enabled=True
+    │                                    (entry LMT + stop STP + take-profit LMT, all GTC)
+    ▼
+walk_forward bracket simulator        ← during model training
+    │   simulates the same execution path bar-by-bar
+    │   writes closed trades to trade_log (source='walk_forward')
 ```
 
 ---
 
 ## The database (SQLite)
 
-Ten tables in `db/trading.db`. You never need to interact with it directly — the dashboard reads from it, and all writes go through the ORM helper functions in `data/database.py`.
+Fourteen tables in `db/trading.db`. You never need to interact with it directly — the dashboard reads from it, and all writes go through the ORM helper functions in `data/database.py`.
 
 The most important tables:
 
@@ -153,5 +162,8 @@ The most important tables:
 | `fundamental_data` | FundamentalsClient | XGBoost |
 | `signal_log` | Orchestrator | Dashboard page 3 |
 | `order_decisions` | OrderManager | Dashboard page 8 |
+| `trade_log` | Walk-forward simulator (and, with Phase B, IBKR fills) | Dashboard page 10, realised-Kelly |
+| `trailing_stop_log` | TrailingStopManager | Dashboard page 8 |
+| `signal_runner_log` | signal_runner.py | Dashboard page 8 |
 
-Schema migrations are handled by `_migrate()` in `data/database.py` — it runs at every engine init and adds new columns with idempotent `ALTER TABLE` statements.
+Schema migrations are handled by `_migrate()` in `data/database.py` — it runs at every engine init and adds new columns with idempotent `ALTER TABLE` statements. See [CLAUDE.md](../../CLAUDE.md) for the full 14-table schema reference.

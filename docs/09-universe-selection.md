@@ -150,8 +150,8 @@ Fixtures bypass all three funnel stages and are never removed by the scoring pro
 
 | Run | When | What happens |
 |-----|------|-------------|
-| Full refresh | Sunday 01:00 | All three stages; new candidates replace old universe |
-| Daily rescore | Mon–Sat 05:30 | Stage 3 only; re-ranks existing candidates by current momentum + ADV; doesn't add new symbols |
+| Full refresh | Sunday 01:00 (`run_weekly.bat`) | All three stages; new candidates replace old universe |
+| Daily rescore | Mon–Fri 09:40 (`run_daily.bat`) | Stage 3 only; re-ranks existing candidates by current momentum + ADV; doesn't add new symbols. Runs as the second step of `run_daily.bat`, *before* model training, so symbols freshly promoted into the active set get checkpoints the same day. Invoked with `--rescore-now --no-signal-run` — the `--no-signal-run` flag suppresses the inline signal runner that `universe_scheduler.py` would otherwise fire, since signals run explicitly as the final step of `run_daily.bat`. |
 
 The daily rescore is fast (seconds) because it skips the expensive Alpaca API call (Stage 1) and liquidity filter (Stage 2). It just re-ranks the already-approved candidate pool with the latest 20-day momentum and dollar-volume figures.
 

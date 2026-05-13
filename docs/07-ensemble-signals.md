@@ -128,23 +128,32 @@ else:
 
 ADX (Average Directional Index) measures **trend strength** regardless of direction. Above 25 indicates a clear trend (up or down); below 25 indicates a choppy, range-bound market.
 
-### Regime effects on the signal gate
+### Regime effects on the ensemble + signal gate
+
+Two things change in TRENDING and HIGH_VOLATILITY regimes — the ensemble *weights* themselves and the gate's *threshold*. All four multipliers are configurable in `config.ml`:
 
 ```python
+# In TRENDING regime, before the weighted-sum:
+xgb_weight_effective = xgb_weight × xgb_trending_weight_multiplier   # default 0.5
+# the shed XGBoost weight is redistributed to LSTM and FinBERT proportionally
+
+# Threshold adjustment (signal_gate.py):
 match regime:
     case HIGH_VOLATILITY:
-        effective_threshold = base_threshold × 1.5
+        effective_threshold = base_threshold × high_vol_threshold_multiplier   # default 1.5
     case TRENDING:
-        effective_threshold = base_threshold × 0.9
+        effective_threshold = base_threshold × trending_threshold_multiplier   # default 1.2
     case MEAN_REVERTING:
         effective_threshold = base_threshold
 ```
 
-**HIGH_VOLATILITY**: Raise the bar. In volatile markets, model predictions are less reliable (more noise, faster reversals). Requiring a stronger signal reduces false positives at the cost of missing some real opportunities.
+**HIGH_VOLATILITY**: Raise the bar (1.5×). In volatile markets, model predictions are less reliable (more noise, faster reversals). Requiring a stronger signal reduces false positives at the cost of missing some real opportunities.
 
-**TRENDING**: Lower the bar slightly. In trending markets, momentum signals are more reliable — even moderate ensemble scores often indicate real directional moves.
+**TRENDING**: *Two* adjustments. (a) Halve XGBoost's effective weight — XGBoost has learned mean-reversion patterns ("high RSI + price above upper BB → reverse in 5 bars") that fire constantly in trends but fail to materialise. With XGBoost dragging the ensemble bearish in rallies, the signal mix had drifted to ~30:1 SELL:BUY by 2026-05-11 (and with `allow_short_selling=False`, that means *no* new trades). (b) Raise the threshold (1.2×). The two adjustments compound: A reduces the bearish skew on the score; C makes sure the marginal signals still need to be genuinely strong to pass.
 
-**MEAN_REVERTING**: Keep the default. No adjustment; the models perform as calibrated.
+**MEAN_REVERTING**: Keep all defaults. The models perform as calibrated; XGBoost's mean-reversion bias is appropriate here.
+
+> **Calibration knobs**: `xgb_trending_weight_multiplier` (1.0 = no adjustment, 0.0 = drop XGBoost entirely in TRENDING), `trending_threshold_multiplier`, `high_vol_threshold_multiplier`. All YAML-settable from the dashboard's Settings page. If TRENDING produces too few signals after a tuning change, lower `trending_threshold_multiplier` toward 1.0 *before* touching the XGB weight knob.
 
 ---
 

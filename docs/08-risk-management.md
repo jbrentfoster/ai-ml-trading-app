@@ -4,12 +4,15 @@
 
 Generating good signals is only half the problem. Position sizing and risk controls determine whether good signals translate into good returns — or whether a bad streak wipes out the portfolio.
 
-The risk layer has four components:
+The risk layer has five components:
 
-1. **PositionSizer** — how much to buy/sell
-2. **PortfolioGuard** — six sequential checks before any order
-3. **CircuitBreaker** — automatic trading halt on large losses
-4. **OrderManager** — orchestrates the above and interfaces with IBKR
+1. **PositionSizer** — how much to buy/sell (Kelly criterion + ATR; realised-Kelly once trade history accumulates)
+2. **PortfolioGuard** — seven sequential checks before any order
+3. **CircuitBreaker** — automatic trading halt on large daily / weekly losses
+4. **TrailingStopManager** — converts bracket take-profits into trailing stops once a long is sufficiently in profit (Phase 3.5, opt-in)
+5. **OrderManager** — orchestrates sizing + guard + IBKR submission; handles long-only SELL semantics (close-only)
+
+Before any of these run, signal generation itself drops symbols whose newest cached daily bar is older than `risk.max_bar_staleness_days` (default 3) — week-old prices never reach the order path even if the pipeline missed a run.
 
 ---
 
@@ -84,16 +87,28 @@ investable = total_equity × (1 - cash_reserve_pct)
 
 With `cash_reserve_pct=0.20`, 20% is always held in cash. This provides a buffer for drawdowns, margin requirements, and opportunities to add positions.
 
-### Fallback: fixed stop sizing
+### Realised Kelly vs proxy Kelly
 
-When there isn't enough signal history (fewer than `kelly_min_trades=10` past signals), Kelly can't be computed reliably. The fallback sizes to risk exactly 1% of investable equity per trade:
+There are actually three sizing paths, picked in priority order:
 
-```
-risk_per_trade = investable_equity × 0.01
-position_size  = risk_per_trade / stop_distance
-```
+1. **`kelly_realised`** — once at least `min_trades_for_realised_kelly` (default 30) closed trades exist for the symbol in `trade_log`, Kelly inputs come from *real* outcomes:
+   ```
+   win_rate     = wins / n_trades
+   avg_win_pct  = mean(pnl_pct for winning trades)
+   avg_loss_pct = |mean(pnl_pct for losing trades)|
+   b            = avg_win_pct / avg_loss_pct
+   f*           = (win_rate × b − (1 − win_rate)) / b
+   ```
+   Negative `f*` is floored to 0 (the long-only system never shorts on a lose-heavy realised history). The walk-forward orchestrator and the live order manager both consume the same helper (`compute_realised_kelly`), filtered to `source='walk_forward'` or `source='live'` respectively.
 
-Where `stop_distance` is derived from ATR (see below). This is why early in the system's life you'll see uniform $4,000 positions — the fallback is active until signal history accumulates.
+2. **`kelly_proxy`** — when there aren't yet enough realised trades, fall back to the signal-score proxy: `|ensemble_score|` is used as a stand-in for P(win). This is the cold-start path.
+
+3. **Fixed fallback** — when there's less than `kelly_min_trades=10` of *any* signal history, size to risk exactly 1% of investable equity per trade:
+   ```
+   risk_per_trade = investable_equity × 0.01
+   position_size  = risk_per_trade / stop_distance
+   ```
+   Where `stop_distance` is derived from ATR (see below). This is why early in the system's life you'll see uniform small positions — the fallback is active until signal history accumulates.
 
 ---
 
@@ -143,9 +158,9 @@ The reward-to-risk ratio (TP distance / stop distance) is always `atr_take_profi
 
 ---
 
-## PortfolioGuard: six sequential checks
+## PortfolioGuard: seven sequential checks
 
-Every potential order passes through six checks in order. If any check fails, the order is REJECTED with a reason recorded in `order_decisions`.
+Every potential order passes through seven checks in order. If any check fails, the order is REJECTED with a reason recorded in `order_decisions`. (Before the guard runs, `OrderManager.process` itself short-circuits with `REJECTED_TOO_SMALL` if `PositionSizer` returned `< 1 share` — see below.)
 
 ### Check 1: Circuit breaker
 ```python
@@ -154,7 +169,18 @@ if circuit_breaker.is_halted():
 ```
 If the circuit breaker is triggered, no new orders are placed. See the circuit breaker section below.
 
-### Check 2: Portfolio drawdown
+### Check 2: Stop-price sanity
+```python
+if signal == "BUY" and not (stop_price < entry_price):
+    return REJECTED, "stop on wrong side of entry"
+if signal == "SELL" and not (stop_price > entry_price):
+    return REJECTED, "stop on wrong side of entry"
+if entry_price <= 0 or stop_price <= 0:
+    return REJECTED, "non-positive price"
+```
+Catches a NaN ATR (which collapses to `stop == entry`) or a sign-flip in stop placement — either of which would turn the safety stop into an instant or inverse-direction trigger.
+
+### Check 3: Portfolio drawdown
 ```python
 current_drawdown = (peak_equity - current_equity) / peak_equity
 if current_drawdown > max_portfolio_drawdown_pct:
@@ -162,23 +188,23 @@ if current_drawdown > max_portfolio_drawdown_pct:
 ```
 Prevents digging a deeper hole when the portfolio is already down significantly.
 
-### Check 3: Position size
+### Check 4: Position size
 ```python
 if proposed_position_value / total_equity > max_position_size_pct:
     return REJECTED, "position too large"
 ```
-Hard cap on any single position as a fraction of total equity (default 5%).
+Hard cap on any single position as a fraction of total equity (default 10%, `kelly_max_position_pct`).
 
-### Check 4: Sector exposure
+### Check 5: Sector exposure
 ```python
 sector = _SECTOR_MAP.get(symbol)
 current_sector_exposure = sum(position_values for symbol in sector)
 if (current_sector_exposure + new_position) / equity > max_sector_exposure_pct:
     return REJECTED, "sector exposure limit"
 ```
-Prevents concentration in a single sector (default 30% cap). Note: only symbols in the hardcoded `_SECTOR_MAP` in `portfolio_guard.py` are checked — unknown symbols pass through. The sector map covers major S&P 500 constituents and sector ETFs.
+Prevents concentration in a single sector (default 30% cap). The `_SECTOR_MAP` in `portfolio_guard.py` covers the entire active universe plus commonly-traded large-caps; unknown symbols pass through with a warning.
 
-### Check 5: Correlation
+### Check 6: Correlation
 ```python
 # Count existing positions with Pearson r >= correlation_threshold (0.7)
 n_correlated = count_highly_correlated_positions(symbol, existing_positions)
@@ -187,7 +213,7 @@ if n_correlated >= max_correlated_positions:  # default: 3
 ```
 Prevents a portfolio of highly similar positions that all lose together. Pearson correlation is computed over the last 60 bars of daily returns.
 
-### Check 6: Duplicate
+### Check 7: Duplicate
 ```python
 if symbol in current_positions:
     return REJECTED, "already holding"
@@ -198,6 +224,21 @@ if (symbol == "GOOG" and "GOOGL" in positions) or \
     return REJECTED, "GOOG/GOOGL duplicate"
 ```
 Prevents double-buying the same (or economically equivalent) position.
+
+---
+
+## Long-only SELL handling
+
+When `trading.allow_short_selling=False` (the default), `OrderManager.process()` intercepts SELL signals **before** sizing and the portfolio guard:
+
+- **SELL after long held** → `_close_long_position()` market-sells to flatten. Decision recorded as `CLOSED_LONG`. Closing reduces risk; sizing and the guard are bypassed.
+- **SELL from flat** → no order placed. Decision recorded as `REJECTED_NO_POSITION`.
+
+Shorts are never opened. The same gate is enforced inside the walk-forward bracket simulator so backtest P&L reflects the live execution path — a 2026-04-30 audit found 66% of unfiltered WF trades were short opens that the live runner would never have executed.
+
+## Sizing short-circuit: `REJECTED_TOO_SMALL`
+
+`OrderManager.process()` checks `pos_size.shares < 1` immediately after `PositionSizer.calculate()` and returns `REJECTED_TOO_SMALL` without calling the PortfolioGuard or submitting any IBKR order. This covers (a) Kelly/fixed sizing producing `position_value < entry_price` for a high-priced stock, and (b) `_get_latest_close()` returning 0 because no bars were cached. Without this check, a 0-share "APPROVED" decision would land in `order_decisions` and IBKR would either reject or silently no-op a 0-share bracket order.
 
 ---
 
@@ -214,6 +255,10 @@ if daily_loss_pct >= circuit_breaker_daily_loss_pct:    # default: 3%
 if weekly_loss_pct >= circuit_breaker_weekly_loss_pct:  # default: 7%
     circuit_breaker.trigger("Weekly loss limit exceeded")
 ```
+
+### How the loss percentages are computed
+
+`signal_runner.py` Phase 1 pulls `realized_pnl + unrealized_pnl` from `IBKRConnection.get_account_summary()` each run and compares it against an equity baseline cached in the `equity_snapshots` table. The first live run only seeds the baseline; from run #2 onward the comparison is automatic — no manual click required to trip the halt. (Intra-day triggering via `reqPnL` streaming is on the roadmap but not yet wired up.)
 
 ### State persistence
 
