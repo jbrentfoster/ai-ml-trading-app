@@ -117,6 +117,17 @@ quick_mode = st.sidebar.checkbox(
 run_btn = st.sidebar.button("Run Walk-Forward Training", type="primary", key="wf_run")
 
 st.sidebar.markdown("---")
+show_all_runs = st.sidebar.checkbox(
+    "Show all training runs",
+    value=False,
+    key="wf_show_all_runs",
+    help=(
+        "Each weekly --force retrain writes a new set of folds.  "
+        "By default this page only shows each symbol's most recent run so the "
+        "Sharpe bars stay in date order.  Tick to include every historical retrain."
+    ),
+)
+
 if st.sidebar.button("Refresh cache", key="wf_refresh"):
     query_walk_forward_results.clear()
     query_ensemble_weight_history.clear()
@@ -147,6 +158,21 @@ if run_btn:
 sym_filter = "" if symbol == "All" else symbol
 wf_df      = query_walk_forward_results(sym_filter)
 wt_df      = query_ensemble_weight_history()
+
+# Each weekly --force retrain bulk-inserts a fresh set of folds with a new Run ID
+# without truncating prior rows, so stacking every run produces a confusing
+# x-axis where dates jump backwards at each run boundary.  By default keep only
+# the most recent Run ID per symbol (mirrors the Page 10 dedup pattern).
+if not show_all_runs and not wf_df.empty and "Run ID" in wf_df.columns:
+    latest_run_per_sym = (
+        wf_df.sort_values("Test Start")
+             .groupby("Symbol")["Run ID"]
+             .last()
+    )
+    keep = wf_df.apply(
+        lambda r: r["Run ID"] == latest_run_per_sym.get(r["Symbol"]), axis=1
+    )
+    wf_df = wf_df[keep].reset_index(drop=True)
 
 _company = query_company_name(symbol) if symbol and symbol.upper() != "ALL" else ""
 st.title(f"Walk-Forward Validation — {symbol}" + (f" ({_company})" if _company else ""))
