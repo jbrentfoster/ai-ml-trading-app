@@ -20,7 +20,7 @@ from plotly.subplots import make_subplots
 from config.settings import config
 from data.fetcher import DataFetcher
 from data.indicators import IndicatorEngine, compute_indicators
-from data.ui_queries import query_bars, query_watchlist_summary
+from data.ui_queries import query_bars, query_company_name, query_watchlist_summary, symbol_picker
 
 # ── Page config ───────────────────────────────────────────────────────────────
 
@@ -38,7 +38,7 @@ st.sidebar.caption(f"Mode: **{config.trading.mode.value.upper()}**")
 st.sidebar.markdown("---")
 
 watchlist: list[str] = config.data.watchlist
-symbol: str   = st.sidebar.text_input("Symbol", value="AAPL", key="md_symbol").strip().upper()
+symbol: str   = symbol_picker("Symbol", default="AAPL", key="md_symbol")
 interval: str = st.sidebar.selectbox("Interval", ["1d", "1h"], index=0, key="md_interval")
 
 st.sidebar.markdown("**Date range**")
@@ -104,7 +104,9 @@ if df.empty:
 
 # ── Header metrics ────────────────────────────────────────────────────────────
 
-st.markdown(f"## {symbol} &nbsp; `{interval}`")
+_company = query_company_name(symbol)
+_header  = f"## {symbol}" + (f" — {_company}" if _company else "") + f" &nbsp; `{interval}`"
+st.markdown(_header)
 
 latest = df.iloc[-1]
 prev   = df.iloc[-2] if len(df) > 1 else latest

@@ -17,7 +17,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from config.settings import config
-from data.ui_queries import query_fundamentals, query_news
+from data.ui_queries import query_company_name, query_fundamentals, query_news, symbol_picker
 
 # ── Page config ───────────────────────────────────────────────────────────────
 
@@ -33,7 +33,7 @@ st.set_page_config(
 st.sidebar.title("📊 Fundamentals & News")
 st.sidebar.markdown("---")
 
-symbol = st.sidebar.text_input("Symbol", value="AAPL", key="fn_symbol").strip().upper()
+symbol = symbol_picker("Symbol", default="AAPL", key="fn_symbol")
 news_days = st.sidebar.slider("News lookback (days)", 7, 90, 30, key="fn_days")
 
 st.sidebar.markdown("**Fetch News**")
@@ -102,7 +102,8 @@ if fetch_btn:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-st.title(f"Fundamentals & News — {symbol}")
+_company = query_company_name(symbol)
+st.title(f"Fundamentals & News — {symbol}" + (f" ({_company})" if _company else ""))
 st.caption(
     "Data sourced from the local SQLite cache.  "
     "Run `python run_pipeline.py` or use the **Market Data** page refresh "

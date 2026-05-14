@@ -21,6 +21,7 @@ from data.ui_queries import (
     query_order_decisions,
     query_signal_runner_log,
     query_trailing_stop_log,
+    symbol_picker,
 )
 
 st.set_page_config(page_title="Risk & Portfolio", layout="wide")
@@ -68,7 +69,13 @@ with st.sidebar:
     # Signal runner quick-launch
     st.subheader("Signal Runner")
     st.caption("Run the signal pipeline manually.")
-    sym_input = st.text_input("Symbol (blank = all)", "").upper().strip()
+    sym_input = symbol_picker(
+        "Symbol (blank = all)",
+        default="",
+        key="rp_run_symbol",
+        sidebar=False,
+        help="Pick from the current Stage 3 universe or type any symbol; leave blank to run every symbol.",
+    )
 
     if st.button("Run (dry-run)", use_container_width=True):
         from scripts.signal_runner import run as _run

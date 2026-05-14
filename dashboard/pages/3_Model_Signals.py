@@ -22,9 +22,11 @@ from plotly.subplots import make_subplots
 
 from config.settings import config
 from data.ui_queries import (
+    query_company_name,
     query_latest_ensemble_weights,
     query_news,
     query_signal_log,
+    symbol_picker,
 )
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -120,7 +122,7 @@ def _generate_signal(symbol: str, interval: str, train_first: bool, quick_mode: 
 st.sidebar.title("🤖 Model Signals")
 st.sidebar.markdown("---")
 
-symbol = st.sidebar.text_input("Symbol", value="AAPL", key="ms_symbol").strip().upper()
+symbol = symbol_picker("Symbol", default="AAPL", key="ms_symbol")
 interval  = st.sidebar.selectbox("Interval", ["1d", "1h"], key="ms_interval")
 
 _today   = datetime.now(timezone.utc).date()
@@ -219,7 +221,8 @@ for btn_clicked, force_train in [(gen_btn, False), (retrain_btn, True)]:
 
 sig_df = query_signal_log(symbol, ms_start, ms_end)
 
-st.title(f"Model Signals — {symbol}")
+_company = query_company_name(symbol)
+st.title(f"Model Signals — {symbol}" + (f" ({_company})" if _company else ""))
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SECTION 1 — LATEST SCORES & REGIME

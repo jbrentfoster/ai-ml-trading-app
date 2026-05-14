@@ -332,6 +332,106 @@ def query_universe_run_log(limit: int = 100) -> pd.DataFrame:
     return df.rename(columns=rename).drop(columns=["id"], errors="ignore")
 
 
+@st.cache_data(ttl=300)
+def query_symbol_options() -> list[str]:
+    """
+    Return sorted list of active Stage 3 universe symbols for sidebar pickers.
+    Falls back to `config.data.watchlist` when universe_assets is empty (e.g.
+    universe selector has never been run).
+    """
+    df = get_universe_assets(active_only=True)
+    if df.empty or "symbol" not in df.columns:
+        from config.settings import config
+        return sorted({s.upper() for s in config.data.watchlist if s})
+    return sorted(df["symbol"].dropna().astype(str).str.upper().unique().tolist())
+
+
+_NAME_SUFFIXES_TO_STRIP = (
+    " Class A Common Stock",
+    " Class B Common Stock",
+    " Class C Common Stock",
+    " Common Stock",
+    " Ordinary Shares",
+    " American Depositary Shares",
+    " ADR",
+)
+
+
+def _clean_company_name(name: str) -> str:
+    """Strip exchange-listing suffixes so titles read naturally."""
+    n = (name or "").strip()
+    for suffix in _NAME_SUFFIXES_TO_STRIP:
+        if n.endswith(suffix):
+            n = n[: -len(suffix)].strip()
+            break
+    return n
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def query_company_name(symbol: str) -> str:
+    """
+    Resolve a human-readable company name for `symbol`.
+
+    Source order (cheapest first):
+      1. `universe_assets.name` — already cached in SQLite for every universe candidate.
+      2. yfinance `Ticker.info` (`longName`/`shortName`) — network call, cached for 24h
+         so manual entries like AAPL only hit the network once per day.
+
+    Returns "" when nothing is available; callers should treat empty as "no name known"
+    and render the bare symbol.
+    """
+    sym = (symbol or "").strip().upper()
+    if not sym:
+        return ""
+    try:
+        df = get_universe_assets(active_only=False)
+        if not df.empty and "symbol" in df.columns and "name" in df.columns:
+            hit = df.loc[df["symbol"].astype(str).str.upper() == sym, "name"]
+            if not hit.empty:
+                name = _clean_company_name(str(hit.iloc[0] or ""))
+                if name:
+                    return name
+    except Exception:
+        pass
+    try:
+        import yfinance as yf
+        info = yf.Ticker(sym).info or {}
+        return _clean_company_name(info.get("longName") or info.get("shortName") or "")
+    except Exception:
+        return ""
+
+
+def symbol_picker(
+    label: str,
+    default: str = "",
+    key: str | None = None,
+    sidebar: bool = True,
+    help: str | None = None,
+) -> str:
+    """
+    Editable combobox: options are the active Stage 3 universe symbols, but
+    the user can also type a symbol that isn't on the list (manual override).
+    `default` is selected initially; if it isn't in the options list it is
+    prepended so the index lookup succeeds.
+    """
+    options = query_symbol_options()
+    default_clean = (default or "").strip().upper()
+    if default_clean and default_clean not in options:
+        options = [default_clean] + options
+    elif not default_clean:
+        options = [""] + options
+    container = st.sidebar if sidebar else st
+    value = container.selectbox(
+        label,
+        options=options,
+        index=options.index(default_clean) if default_clean in options else 0,
+        accept_new_options=True,
+        key=key,
+        help=help or "Pick from the current Stage 3 universe or type any symbol.",
+    )
+    return (value or "").strip().upper()
+
+
 # ── Data status ───────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=60)

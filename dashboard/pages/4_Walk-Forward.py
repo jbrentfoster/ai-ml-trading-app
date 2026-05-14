@@ -18,8 +18,10 @@ import streamlit as st
 
 from config.settings import config
 from data.ui_queries import (
+    query_company_name,
     query_ensemble_weight_history,
     query_walk_forward_results,
+    symbol_picker,
 )
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -95,10 +97,15 @@ st.sidebar.title("📉 Walk-Forward Validation")
 st.sidebar.markdown("---")
 
 _default_sym = config.data.watchlist[0] if config.data.watchlist else "AAPL"
-symbol = st.sidebar.text_input("Symbol (or 'All')", value=_default_sym, key="wf_symbol").strip().upper()
+symbol = symbol_picker(
+    "Symbol (or 'All')",
+    default=_default_sym,
+    key="wf_symbol",
+    help="Pick from the current Stage 3 universe, or type any symbol — type 'All' to view every symbol.",
+)
 
 st.sidebar.markdown("**Run Training**")
-train_sym = st.sidebar.text_input("Train symbol", value="AAPL", key="wf_train_sym").strip().upper()
+train_sym = symbol_picker("Train symbol", default="AAPL", key="wf_train_sym")
 train_iv   = st.sidebar.selectbox("Interval", ["1d", "1h"], key="wf_train_iv")
 quick_mode = st.sidebar.checkbox(
     "Quick mode",
@@ -141,7 +148,8 @@ sym_filter = "" if symbol == "All" else symbol
 wf_df      = query_walk_forward_results(sym_filter)
 wt_df      = query_ensemble_weight_history()
 
-st.title(f"Walk-Forward Validation — {symbol}")
+_company = query_company_name(symbol) if symbol and symbol.upper() != "ALL" else ""
+st.title(f"Walk-Forward Validation — {symbol}" + (f" ({_company})" if _company else ""))
 
 # ── Empty state ───────────────────────────────────────────────────────────────
 
