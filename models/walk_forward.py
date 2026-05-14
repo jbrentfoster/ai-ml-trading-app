@@ -171,7 +171,12 @@ class MLWalkForwardOrchestrator:
                     )
             eval_metrics = ensemble.evaluate(fold.test_df)
 
-            ensemble.rebalance(eval_metrics, finbert_coverage=finbert_coverage)
+            ensemble.rebalance(
+                eval_metrics,
+                finbert_coverage=finbert_coverage,
+                symbol=self._symbol,
+                run_id=self._run_id,
+            )
 
             perf = self._compute_fold_performance(fold_returns, signals)
 

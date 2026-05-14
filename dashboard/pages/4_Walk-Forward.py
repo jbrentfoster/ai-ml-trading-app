@@ -308,44 +308,99 @@ st.caption(
     "(the 'nudge'), while the other loses the same amount — both are floored at 10% so no model is fully discarded.  "
     "FinBERT is excluded from this competition (its 'evaluate' is news-coverage-based, not Sharpe-based); "
     "instead, its weight scales with the fraction of test-window bars that had a non-zero sentiment score — "
-    "folds with sparse news coverage automatically reduce FinBERT's influence.  "
-    "A growing slice indicates that model has been consistently outperforming in recent folds."
+    "folds with sparse news coverage automatically reduce FinBERT's influence."
 )
 
-if wt_df.empty:
-    st.info("No ensemble weight history yet — weights are recorded after each fold rebalance.")
+_MODEL_COLORS = {"LSTM": "#2196f3", "XGBoost": "#26a69a", "FinBERT": "#ff9800"}
+
+# Pre-2026-05-14 rows don't carry symbol/run_id; drop them so neither view mixes
+# in unattributable history.
+wt_tagged = wt_df[wt_df["symbol"].notna() & wt_df["run_id"].notna()] if not wt_df.empty else wt_df
+
+if wt_tagged.empty:
+    st.info(
+        "Per-symbol weight history will populate after the next walk-forward training run.  "
+        "Pre-2026-05-14 rebalance rows are not symbol-tagged and are excluded from this view."
+    )
+elif sym_filter:
+    # Single-symbol time series — restrict to the most recent training run for that symbol.
+    sym_df = wt_tagged[wt_tagged["symbol"] == sym_filter].copy()
+    if sym_df.empty:
+        st.info(f"No symbol-tagged weight history yet for **{sym_filter}**.")
+    else:
+        latest_run = sym_df.sort_values("recorded_at")["run_id"].iloc[-1]
+        run_df = sym_df[sym_df["run_id"] == latest_run].sort_values("recorded_at").reset_index(drop=True)
+        run_df["Rebalance #"] = run_df.index + 1
+        hover_ts = run_df["recorded_at"].dt.strftime("%Y-%m-%d %H:%M").tolist()
+
+        wt_fig = go.Figure()
+        for model, color in _MODEL_COLORS.items():
+            if model in run_df.columns:
+                wt_fig.add_trace(go.Scatter(
+                    x=run_df["Rebalance #"],
+                    y=run_df[model] * 100,
+                    name=model,
+                    mode="lines+markers",
+                    line=dict(color=color, width=2),
+                    marker=dict(size=8),
+                    stackgroup="one",
+                    customdata=hover_ts,
+                    hovertemplate="%{y:.1f}%  —  %{customdata}<extra>%{fullData.name}</extra>",
+                ))
+        wt_fig.update_layout(
+            height=300, template="plotly_dark",
+            yaxis=dict(title="Weight (%)", range=[0, 100]),
+            xaxis=dict(title="Rebalance #", dtick=1, tick0=1),
+            legend=dict(orientation="h", y=1.05, x=0),
+            margin=dict(l=0, r=0, t=20, b=0),
+        )
+        st.plotly_chart(wt_fig, use_container_width=True)
+        st.caption(
+            f"Stacked area — **{sym_filter}**'s most recent training run "
+            f"({len(run_df)} rebalances).  Hover for the exact timestamp."
+        )
 else:
-    # Use a sequential rebalance index as x-axis.  All rebalances within a single
-    # training run happen within seconds of each other, so using recorded_at causes
-    # Plotly to zoom into a one-second window and appear empty.
-    wt_df = wt_df.reset_index(drop=True)
-    wt_df["Rebalance #"] = wt_df.index + 1
-    hover_ts = wt_df["recorded_at"].dt.strftime("%Y-%m-%d %H:%M").tolist()
+    # Aggregate view — distribution of *final* weights per model across all symbols.
+    # "Final" = the last rebalance row within each (symbol, run_id) group, then the
+    # most recent run_id per symbol.
+    last_per_run = (
+        wt_tagged.sort_values("recorded_at")
+                 .groupby(["symbol", "run_id"], as_index=False)
+                 .tail(1)
+    )
+    last_per_run = (
+        last_per_run.sort_values("recorded_at")
+                    .groupby("symbol", as_index=False)
+                    .tail(1)
+    )
 
     wt_fig = go.Figure()
-    model_colors = {"LSTM": "#2196f3", "XGBoost": "#26a69a", "FinBERT": "#ff9800"}
-    for model, color in model_colors.items():
-        if model in wt_df.columns:
-            wt_fig.add_trace(go.Scatter(
-                x=wt_df["Rebalance #"],
-                y=wt_df[model] * 100,
+    for model, color in _MODEL_COLORS.items():
+        if model in last_per_run.columns:
+            wt_fig.add_trace(go.Box(
+                x=last_per_run[model] * 100,
                 name=model,
-                mode="lines+markers",
-                line=dict(color=color, width=2),
-                marker=dict(size=6),
-                stackgroup="one",
-                customdata=hover_ts,
-                hovertemplate="%{y:.1f}%  —  %{customdata}<extra>%{fullData.name}</extra>",
+                marker=dict(color=color),
+                boxpoints="all",
+                jitter=0.4,
+                pointpos=0,
+                orientation="h",
+                hovertemplate="%{x:.1f}%  (%{customdata})<extra>%{fullData.name}</extra>",
+                customdata=last_per_run["symbol"],
             ))
     wt_fig.update_layout(
         height=300, template="plotly_dark",
-        yaxis=dict(title="Weight (%)", range=[0, 100]),
-        xaxis=dict(title="Rebalance #", dtick=1, tick0=1),
-        legend=dict(orientation="h", y=1.05, x=0),
+        xaxis=dict(title="Final weight (%)", range=[0, 100]),
+        yaxis=dict(autorange="reversed"),
+        showlegend=False,
         margin=dict(l=0, r=0, t=20, b=0),
     )
     st.plotly_chart(wt_fig, use_container_width=True)
-    st.caption("Stacked area — hover over any point for the exact rebalance timestamp.")
+    st.caption(
+        f"Distribution of post-training weights across **{len(last_per_run)} symbols** "
+        f"(one point per symbol, its most recent training run).  "
+        "Pick a specific symbol in the sidebar to see that symbol's per-fold evolution."
+    )
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SECTION 5 — DETAILED RESULTS TABLE

@@ -227,6 +227,8 @@ def query_ensemble_weight_history() -> pd.DataFrame:
         return pd.DataFrame()
     df = pd.DataFrame([{
         "recorded_at": r.recorded_at,
+        "symbol":      r.symbol,
+        "run_id":      r.run_id,
         "LSTM":        r.lstm_weight,
         "XGBoost":     r.xgb_weight,
         "FinBERT":     r.finbert_weight,

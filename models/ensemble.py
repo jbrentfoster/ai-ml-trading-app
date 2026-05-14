@@ -143,7 +143,9 @@ class EnsembleModel:
     # ── Weight management ─────────────────────────────────────────────────────
 
     def rebalance(self, eval_results: dict[str, dict],
-                  finbert_coverage: float = 1.0) -> None:
+                  finbert_coverage: float = 1.0,
+                  symbol: str | None = None,
+                  run_id: str | None = None) -> None:
         """
         Rebalance ensemble weights after a walk-forward fold.
 
@@ -199,6 +201,8 @@ class EnsembleModel:
             xgb=self.weights["xgb"],
             finbert=self.weights["finbert"],
             trigger="rebalance",
+            symbol=symbol,
+            run_id=run_id,
         )
 
     def _normalise_weights(self) -> None:

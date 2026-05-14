@@ -188,6 +188,8 @@ class EnsembleWeightHistory(Base):
 
     id           = Column(Integer, primary_key=True, autoincrement=True)
     recorded_at  = Column(DateTime, nullable=False)
+    symbol       = Column(String(10), index=True)   # NULL on pre-2026-05-14 rows
+    run_id       = Column(String(36), index=True)
     lstm_weight  = Column(Float,    nullable=False)
     xgb_weight   = Column(Float,    nullable=False)
     finbert_weight = Column(Float,  nullable=False)
@@ -419,6 +421,23 @@ def _migrate(engine) -> None:
             ))
             conn.commit()
             log.info("Migration applied: walk_forward_results.sentiment_note")
+
+        # ensemble_weight_history.symbol + run_id  (2026-05-14 — Page 4 chart needs
+        # per-symbol filtering; pre-migration rows backfill as NULL).
+        if "ensemble_weight_history" in insp.get_table_names():
+            ewh_cols = {c["name"] for c in insp.get_columns("ensemble_weight_history")}
+            if "symbol" not in ewh_cols:
+                conn.execute(text(
+                    "ALTER TABLE ensemble_weight_history ADD COLUMN symbol VARCHAR(10)"
+                ))
+                conn.commit()
+                log.info("Migration applied: ensemble_weight_history.symbol")
+            if "run_id" not in ewh_cols:
+                conn.execute(text(
+                    "ALTER TABLE ensemble_weight_history ADD COLUMN run_id VARCHAR(36)"
+                ))
+                conn.commit()
+                log.info("Migration applied: ensemble_weight_history.run_id")
 
         # walk_forward_results.universe_policy  (2026-05-12 — survivorship-bias
         # flag: "dynamic" rows came from a UniverseSelector-driven run, "static"
@@ -809,13 +828,17 @@ def log_signal(record: dict) -> None:
 # ── Ensemble weight helpers ───────────────────────────────────────────────────
 
 def log_ensemble_weights(lstm: float, xgb: float, finbert: float,
-                         trigger: str = "rebalance") -> None:
+                         trigger: str = "rebalance",
+                         symbol: str | None = None,
+                         run_id: str | None = None) -> None:
     """Persist current ensemble weights."""
     from datetime import timezone
     engine = get_engine()
     with Session(engine) as session:
         session.add(EnsembleWeightHistory(
             recorded_at=datetime.now(timezone.utc).replace(tzinfo=None),
+            symbol=symbol,
+            run_id=run_id,
             lstm_weight=lstm,
             xgb_weight=xgb,
             finbert_weight=finbert,
