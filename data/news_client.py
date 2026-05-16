@@ -2,7 +2,7 @@
 NewsClient — unified news fetcher with three-tier fallback.
 
 Priority order:
-  1. IBKR / TWS  (reqHistoricalNews — Dow Jones, Briefing.com; ~4-5 months history)
+  1. IBKR        (reqHistoricalNews — Dow Jones, Briefing.com; ~4-5 months history)
   2. Alpaca       (News API — requires ALPACA_API_KEY / ALPACA_SECRET_KEY)
   3. yfinance     (no API key; ~10 most-recent articles only)
 
@@ -126,9 +126,9 @@ class NewsClient:
         self, symbol: str, since: datetime, days_back: int
     ) -> list[dict]:
         """
-        Fetch news via TWS reqHistoricalNews.
+        Fetch news via IBKR reqHistoricalNews.
 
-        Uses the IB instance passed at construction time.  Returns [] if TWS
+        Uses the IB instance passed at construction time.  Returns [] if IBKR
         is not available or returns no articles.
         """
         if self._ib is None:
@@ -147,7 +147,7 @@ class NewsClient:
     def _fetch_from_ibkr_standalone(
         self, symbol: str, since: datetime, days_back: int
     ) -> list[dict]:
-        """Open a short-lived TWS connection, fetch, then close.
+        """Open a short-lived IBKR connection, fetch, then close.
 
         Creates its own asyncio event loop *before* importing ib_insync so
         this method is safe to call from non-main threads (e.g. Streamlit's
@@ -180,7 +180,7 @@ class NewsClient:
             util.logToConsole(level=40)   # ERROR only during short-lived connections
             ib.connect("127.0.0.1", port, clientId=cfg.client_id + 50, timeout=5)
         except Exception as exc:
-            log.debug("TWS not reachable for news fetch (%s); skipping", exc)
+            log.debug("IBKR not reachable for news fetch (%s); skipping", exc)
             loop.close()
             return []
 
@@ -216,7 +216,7 @@ class NewsClient:
                 return []
             provider_codes = "+".join(p.code for p in providers)
 
-            # Date range — TWS wants "YYYYMMDD HH:MM:SS" UTC strings
+            # Date range — IBKR wants "YYYYMMDD HH:MM:SS" UTC strings
             end_dt   = datetime.now(timezone.utc)
             start_dt = end_dt - timedelta(days=days_back)
             start_str = start_dt.strftime("%Y%m%d %H:%M:%S")
@@ -244,7 +244,7 @@ class NewsClient:
                 provider   = getattr(h, "providerCode", "IBKR")
                 article_id = f"{provider}${getattr(h, 'articleId', '')}"
 
-                # TWS returns datetime objects or ISO strings
+                # IBKR returns datetime objects or ISO strings
                 pub_raw = getattr(h, "time", None)
                 if isinstance(pub_raw, datetime):
                     pub = pub_raw.replace(tzinfo=None) if pub_raw.tzinfo else pub_raw

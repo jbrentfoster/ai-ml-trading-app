@@ -2,7 +2,7 @@
 # Install with: pip install -r requirements.txt
 
 # ── IBKR Connection ──────────────────────────────────────────────────────────
-ib_insync>=0.9.86          # Async wrapper for IBKR TWS API
+ib_insync>=0.9.86          # Async wrapper for IBKR API
 
 # ── Data & Numerics ──────────────────────────────────────────────────────────
 pandas>=2.1.0

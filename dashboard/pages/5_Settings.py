@@ -454,11 +454,11 @@ with tabs[4]:
 # TAB 6 — IBKR CONNECTION
 # ═════════════════════════════════════════════════════════════════════════════
 with tabs[5]:
-    st.subheader("IBKR / TWS Connection")
+    st.subheader("IBKR Connection")
 
     with st.form("form_ibkr"):
         ic1, ic2 = st.columns(2)
-        host        = ic1.text_input("TWS host", value=config.ibkr.host)
+        host        = ic1.text_input("IBKR host", value=config.ibkr.host)
         client_id   = ic2.number_input("Client ID", 1, 999, config.ibkr.client_id, step=1,
                                        help="Must be unique per simultaneous connection.")
 

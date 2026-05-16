@@ -11,7 +11,7 @@ End-to-end validation of the data pipeline:
 Run with:
     python verify_pipeline.py
 
-No TWS connection required.
+No IBKR connection required.
 """
 
 import io

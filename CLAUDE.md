@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-AI-driven algorithmic trading system connecting to Interactive Brokers (IBKR) via IB Gateway (recommended) or TWS. Built as a learning platform with a Streamlit dashboard that explains each component visually. Python async/await throughout for IBKR; all other code is synchronous. Data pipeline uses yfinance → SQLite. Dashboard is Streamlit + Plotly.
+AI-driven algorithmic trading system connecting to Interactive Brokers (IBKR) via IB Gateway. Built as a learning platform with a Streamlit dashboard that explains each component visually. Python async/await throughout for IBKR; all other code is synchronous. Data pipeline uses yfinance → SQLite. Dashboard is Streamlit + Plotly.
 
 | Phase | Description | Status |
 |-------|-------------|--------|
@@ -32,9 +32,8 @@ pip install -r requirements.txt
 
 All commands must be run from the project root (so `config`, `core`, `data`, etc. resolve as packages). The project uses a `.venv` at `trading_app/.venv/`; activate it or prefix commands with `.venv/Scripts/python` on Windows.
 
-Before using IBKR features (IB Gateway recommended over TWS):
+Before using IBKR features, configure IB Gateway:
 - **IB Gateway**: `Configure → Settings → API → Settings` — enable ActiveX and Socket Clients, socket port 4002 (paper) / 4001 (live), uncheck "Read-Only API"
-- **TWS**: `File → Global Configuration → API → Settings` — socket port 7497 (paper) / 7496 (live)
 
 ## Commands
 
@@ -81,10 +80,10 @@ python scripts/verify_risk.py
 # Run integration verification against a live paper trading account
 python scripts/verify_connection.py
 
-# Test IBKR news API (requires IB Gateway or TWS open)
+# Test IBKR news API (requires IB Gateway open)
 python scripts/test_ibkr_news.py --symbol AAPL --days 30 --max 300
 
-# Run all tests (no live IB Gateway/TWS or network needed)
+# Run all tests (no live IB Gateway or network needed)
 .venv/Scripts/pytest tests/ -v
 
 # Run a single test
@@ -414,7 +413,7 @@ Quick mode (UI): 5 LSTM epochs / 50 XGB estimators / 2 folds / 60 train + 10 tes
 All 6 pages follow the same patterns:
 
 - **Chart style**: `template="plotly_dark"`, teal `#26a69a` for bullish/positive, red `#ef5350` for bearish/negative, `margin=dict(l=0, r=0, t=40, b=0)`
-- **Data access**: all pages query SQLite via `data/ui_queries.py` functions decorated with `@st.cache_data(ttl=300)`. Pages never hit yfinance or the network directly (except Page 2's "Fetch & Score News" button and Page 6's "Refresh from TWS").
+- **Data access**: all pages query SQLite via `data/ui_queries.py` functions decorated with `@st.cache_data(ttl=300)`. Pages never hit yfinance or the network directly (except Page 2's "Fetch & Score News" button and Page 6's "Refresh from IBKR").
 - **Educational captions**: every chart has a `st.caption()` below (or `st.markdown()` + `st.caption()` before/after) explaining what the chart shows, how to read it, and how it connects to the trading logic.
 - **Empty states**: every section has an `st.info()` message when data is absent, explaining what to run to populate it.
 - **Sidebar controls**: date range pickers use `config.ml.signal_lookback_days` (default 365) as the default lookback on Page 3.
@@ -429,7 +428,7 @@ Dashboard pages:
 - **Page 6** (`6_Data_Status.py`): one row per symbol — bar counts (daily/hourly), latest bar timestamps + age, news/scored article counts, fundamentals flag, model checkpoint flag; 5 summary metric cards; amber row = stale >1 day, red row = no bars at all; sidebar Refresh button
 - **Page 7** (`7_Universe.py`): funnel overview, active candidates table, size history, recently removed, run log, manual refresh buttons
 - **Page 8** (`8_Risk_&_Portfolio.py`): circuit breaker status banner, signal runner log, order decisions (color-coded), risk config cards + Kelly explainer, CB event log; sidebar: trigger/reset/run controls
-- **Page 9** (`9_Account.py`): live IBKR account summary + positions (enriched with risk levels + live yfinance prices) + open orders; position allocation donut. TWS required — no signal/trade history (Page 3 covers signals, Page 8 covers order decisions, Page 10 covers closed trades)
+- **Page 9** (`9_Account.py`): live IBKR account summary + positions (enriched with risk levels + live yfinance prices) + open orders; position allocation donut. IBKR required — no signal/trade history (Page 3 covers signals, Page 8 covers order decisions, Page 10 covers closed trades)
 - **Page 10** (`10_Trade_History.py`): closed trades from `trade_log`; 5 summary cards (gross/net P&L, fees, win rate); indicative tax view (ST vs LT split, configurable rates in `st.session_state`, *not* tax advice); color-coded trades table with CSV export; cumulative net-P&L curve (gross vs net) + exit-reason donut; per-symbol breakdown expander
 
 ## Key Architectural Decisions
@@ -446,7 +445,7 @@ Dashboard pages:
 
 **LSTM checkpoint format (torch tensors)**: PyTorch ≥ 2.6 changed `weights_only` default to `True`. Storing `pd.Series` in checkpoints breaks this (unsafe type). Fix: store `mean`/`std` as `torch.tensor(series.values)` and feature names as a plain `list`. Load converts tensors back to Series. Old checkpoints fall back to `weights_only=False` with a warning — retrain to upgrade.
 
-**Three-tier news fallback (IBKR → Alpaca → yfinance)**: IBKR provides the best-quality financial news (~4-5 months back, 300 articles max) but requires IB Gateway or TWS. Alpaca is the secondary source (requires free API key). yfinance is the always-available fallback. The tiering means the system degrades gracefully without any API keys configured.
+**Three-tier news fallback (IBKR → Alpaca → yfinance)**: IBKR provides the best-quality financial news (~4-5 months back, 300 articles max) but requires IB Gateway. Alpaca is the secondary source (requires free API key). yfinance is the always-available fallback. The tiering means the system degrades gracefully without any API keys configured.
 
 **`upsert_news` never overwrites scores**: Scoring is expensive (FinBERT ~400MB model). Once an article has a score it's permanent. The upsert only fills in `sentiment_score` when it's currently `None`. This lets `run_pipeline.py` be re-run idempotently — only new unscored articles are processed.
 
@@ -554,6 +553,23 @@ Once a fix is verified live (the user confirms it worked end-to-end in productio
 
 ### Enhancements (open)
 - **Richer cost model**: bid-ask spread, partial fills, market impact in `models/walk_forward.py`.
+- **Point-in-time fundamentals for walk-forward** (`data/fundamentals.py`, XGBoost training pipeline): `FundamentalsClient._fetch_and_cache` calls `yf.Ticker(symbol).info`, which is a *current* snapshot only. The 13 fundamental features fed to XGBoost (P/E, ROE, profit_margin, revenue_growth, etc.) are therefore the *same value* for every historical training bar — a stock that was unprofitable a year ago but profitable today gets today's profit margin applied to last year's bars. Mild lookahead bias today at 120 train bars (~6 months); gets worse as `wf_train_bars` is extended. Symptom to watch for: if a `wf_train_bars` experiment (e.g. 252 instead of 120) shows XGBoost's contribution improving substantially more than LSTM's, suspect this is doing some of the work — LSTM uses no fundamentals so its scaling is "clean". **Options ranked by effort/cost:**
+    * **yfinance quarterly statements** (free, already installed): `Ticker.quarterly_financials` / `quarterly_balance_sheet` / `quarterly_cashflow` provide ~5 years of point-in-time quarterly filings. Compute ratios from raw line items (P/E = price ÷ TTM EPS *as of filing date*, ROE = TTM net income ÷ equity, etc.) and join to each bar via the latest filing whose `filing_date <= bar_ts`. Roughly half-day of ETL: new `historical_fundamentals` table keyed on `(symbol, filing_date)`, a join helper, and an `XGBoostModel._features` change to read filing-date-aware values. Risk: yfinance filing dates aren't always reliable; cross-check against the SEC EDGAR `filed` field on a few symbols before trusting.
+    * **SimFin free tier** (free, registration required): designed exactly for point-in-time fundamentals research. ~10-line integration, cleaner than yfinance, but adds an external dependency and an API key.
+    * **Financial Modeling Prep / Sharadar / Nasdaq Data Link** (paid, $15–50/month): cleanest data, most comprehensive history. Probably overkill for a single-user learning system.
+    * **SEC EDGAR XBRL** (free, authoritative): the actual source of truth but raw filings need significant ETL. Skip unless one of the above proves unreliable.
+- **Consider walk-forward Sharpe in signal generation** (`scripts/signal_runner.py`, `models/signal_gate.py`, or a new pre-gate filter): today WF Sharpe-per-fold influences signals only *indirectly* — fold-end rebalancing nudges LSTM-vs-XGBoost ensemble weights, then the final retrain on the full dataset produces the live model. Nothing reads `walk_forward_results.sharpe_ratio` at signal-gate time, so a symbol whose most recent fold posted Sharpe = −1.22 (the MMM example that surfaced this, 2026-05-14) can still emit a BUY today as long as the current ensemble score clears the threshold + confirmation filters. Two implementation shapes to consider when this is picked up:
+    * **Hard filter** — drop signals from symbols whose latest WF run has aggregate Sharpe (or trailing-fold Sharpe) below a configurable floor. Cheapest to implement, easiest to reason about. Risk: throws away symbols mid-recovery; a single bad fold permanently mutes a name until next retrain.
+    * **Soft penalty** — multiply `signal_threshold` by a function of recent WF Sharpe (e.g. raise threshold for low-Sharpe symbols, lower it for high-Sharpe). Smoother behaviour, harder to tune. Could live as a new `_adjusted_threshold` term in `models/signal_gate.py` alongside the regime adjustment.
+
+  **Open design questions** (resolve before code):
+    * **Which Sharpe?** Aggregate across the 5 folds (mean / median), trailing fold only, or weighted toward recent folds? Trailing-fold is most reactive but noisiest; aggregate is more stable but slow to react when a symbol's regime shifts. The 5-fold mean from `walk_forward_results` is probably the right default.
+    * **Threshold value?** Sharpe = 0 is the obvious zero-skill line, but post-cost WF Sharpes are often negative even for symbols that produce reasonable live P&L (the cost model is conservative — flat slippage + commissions + the bracket simulator now charges stop-slippage too). A more honest floor might be the universe-wide *p25* of WF Sharpe at any given time, not an absolute number. Compute on the fly from `walk_forward_results`.
+    * **Survivorship-bias interaction**: when `universe_policy='dynamic'`, the WF Sharpe is biased upward (the universe was selected with today's knowledge). Filtering on biased Sharpe could amplify that bias. The `universe_policy` column (added 2026-05-12) makes this explicit — consider applying the filter only to `static`-policy rows, or applying a separate (looser) threshold to `dynamic`-policy rows.
+    * **Pairs with Phase 4.5 Phase C — realised Kelly**: once `source='live'` rows accumulate, *realised P&L* becomes a more honest scoreboard than WF Sharpe (no cost-model approximations, no survivorship). A WF-Sharpe filter is a useful interim signal but the right long-term answer is "filter on realised P&L when n is high enough, fall back to WF Sharpe in cold-start." That's the same cold-start pattern Phase C already implements for sizing — mirror it for filtering.
+    * **Observability**: add a new column to `order_decisions` like `wf_sharpe_at_decision` so post-hoc analysis can answer "did the filter drop signals that would have made money?" without re-deriving the value.
+
+  **Defer until** ≥2 weeks of Phase B `source='live'` rows exist — same gate as the IBKR-scanner enhancement above, for the same reason: tuning a Sharpe-floor on WF-only data risks discarding symbols whose live behaviour differs from WF (e.g. the SELL-bias diagnosis from 2026-05-11 — where XGBoost's "high RSI → mean reversion" rule was *correct in WF cost-model terms* but is being overruled by a stronger trend in live markets). A combined WF + live filter is more defensible than either alone.
 - **YAML unknown-key warning** *(code complete 2026-05-12 — awaiting live verification)* (`config/settings.py:_apply_yaml_section`): the loader silently ignores YAML keys that don't match a dataclass field, so typos like `min_trades_for_realised_kellly` (three L's, surfaced 2026-05-07 during Phase C verification) disable a config override without warning. The dataclass already has `dataclasses.fields(obj)` available — for each key in the YAML section that isn't in that field set, emit `log.warning("Unknown YAML key: %s.%s — ignored", section_name, key)`. ~10-line change. Bonus: add the same warning at the top level for unknown sections (`config:` typo would silently drop the whole section). Cost is one extra log line per unknown key per process start; benefit is catching every future typo in 30 seconds instead of however long until the symptom is noticed. **Status:** implemented via `warnings.warn(...)` (UserWarning, not log.warning — Python's `warnings` machinery is the right channel for "your config is invalid" since it surfaces on stderr at import time before logging is even configured). `_apply_yaml_section` accepts a `section_name` kwarg and warns per unknown key; `load_yaml_config` warns per unknown top-level section. Test coverage: 5 new in `tests/test_settings.py` (known-field override / unknown-key warns + ignored / mix of known+unknown / no-section-name branch / unknown-section warns). Full suite: 197/197 passing. Verification pending: deliberately introduce a typo in `config/settings.yaml` (e.g. `kelly_fractoin: 0.5`) and confirm the warning surfaces at process start.
 - **trade_log.pnl semantics — cross-reference checklist** *(code complete 2026-05-12)* (carry-over from 2026-05-07 Page 10 P&L fix): three semantic flips happened in 8 days around `trade_log.pnl` (Phase A wrote net, Phase C consumed via pnl_pct, Page 10 misread net as gross). The architectural decision note now anchors the convention, but a "if you touch trade_log.pnl semantics, also update" checklist would prevent the next divergence. Touch points to enumerate: (a) `models/walk_forward.py:_close_trade` (the writer), (b) `data/ui_queries.py:query_trade_log` derived columns + `query_trade_summary` aggregation, (c) `risk/position_sizer.py:compute_realised_kelly` (consumer of `pnl_pct`), (d) Phase B reconciliation Pass 2 (when it lands — must follow the same `pnl is net` rule when writing `source='live'` rows from IBKR per-fill `realizedPNL`), (e) `dashboard/pages/10_Trade_History.py` column labels, (f) `tests/test_ui_queries.py::test_net_pnl_equals_stored_pnl` (the canary). Add as a comment block at the top of `walk_forward._close_trade` so it's the first thing anyone editing that function sees. Estimated effort: 15 minutes. **Status:** implemented as a 20-line comment block immediately above `_close_trade` (`models/walk_forward.py:361-383`) — first thing anyone editing the function sees. Lists the convention (`pnl is net`, `gross_pnl = pnl + costs_charged`), the anti-pattern to avoid (`net_pnl = pnl - costs_charged` double-counts), and all 5 touch points to update if the convention ever changes. No code change beyond the comment; nothing to verify live.
 - **Retire verified-but-unmarked bug fixes** *(completed 2026-05-11)*: three "code complete — awaiting live verification" entries (datetime.utcnow / dashboard path / LSTM determinism) were silently verified by the daily-run cadence; all three retired to `CHANGELOG.md` on 2026-05-11. The earlier two from the same carry-over (signal_log / universe rescore) were retired 2026-05-08.
@@ -768,10 +784,10 @@ Once a fix is verified live (the user confirms it worked end-to-end in productio
   3. Phase A's `pnl is net` semantic verified live (already done 2026-05-07 via the SPY accounting fix; pinned by `test_net_pnl_equals_stored_pnl`).
 
   **Day-1 spot-check** (must pass before second Phase B daily run):
-  - **`fill_log` ↔ TWS reconciliation**: after the first reconciliation run that ingests real fills, manually compare against IBKR's TWS *Trades* view for the same day:
-    * Row count: `SELECT COUNT(*) FROM fill_log WHERE DATE(exec_time) = '<today>'` should match TWS's filled-trade count.
-    * Sum of shares: `SELECT SUM(shares) FROM fill_log WHERE ...` should match the sum in TWS.
-    * Sum of commissions: `SELECT SUM(commission) FROM fill_log WHERE ...` should match TWS Activity Statement.
+  - **`fill_log` ↔ IBKR reconciliation**: after the first reconciliation run that ingests real fills, manually compare against IBKR's *Trades* view (Account Portal or IB Gateway) for the same day:
+    * Row count: `SELECT COUNT(*) FROM fill_log WHERE DATE(exec_time) = '<today>'` should match IBKR's filled-trade count.
+    * Sum of shares: `SELECT SUM(shares) FROM fill_log WHERE ...` should match the sum in IBKR.
+    * Sum of commissions: `SELECT SUM(commission) FROM fill_log WHERE ...` should match the IBKR Activity Statement.
   - Mismatches indicate a missed `commissionReport` event, an `ExecutionFilter.time` boundary off-by-one, or `account` filter dropping rows. Diagnose and fix before relying on `trade_log.live` rows for realised-Kelly.
   - **`trade_log.live` ↔ `fill_log` aggregation**: for one round-trip trade, manually check `trade_log.shares == fill_log.shares` for the entry leg, `trade_log.entry_px ≈ volume-weighted avg of entry fills`, and `trade_log.pnl + trade_log.costs_charged == sum of IBKR realisedPNL across exit fills`. This validates Pass 2 (round-trip aggregation) before trusting it for Kelly recompute.
 
@@ -912,6 +928,6 @@ Unit tests mock `ib_insync`, `yfinance`, and all database calls — no live conn
 - `test_risk.py`: 18 tests; uses in-memory SQLite (`mem_engine` monkeypatch fixture); patches `PortfolioGuard.check` and `OrderManager._get_latest_close` where needed; no IBKR or network required
 - `test_signal_runner.py`: 6 tests; patches `signal_runner.OrderManager`; no live connections, yfinance, or DB needed
 
-Integration tests (`verify_connection.py`) require a paper trading account open in IB Gateway or TWS.
+Integration tests (`verify_connection.py`) require a paper trading account open in IB Gateway.
 `verify_universe.py` requires `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` env vars for Stages 1-3; DB helpers are tested without keys.
 `verify_risk.py` requires no external services; uses the live `db/trading.db`.

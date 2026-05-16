@@ -2,7 +2,7 @@
 Unit tests for risk/trailing_stop.py (Phase 3.5).
 
 Uses AsyncMock for the IBKR async methods and a real asyncio event loop so
-`run_until_complete(...)` drives the AsyncMocks correctly.  No live TWS
+`run_until_complete(...)` drives the AsyncMocks correctly.  No live IBKR
 connection or yfinance calls required.
 """
 

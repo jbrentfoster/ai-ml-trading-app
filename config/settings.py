@@ -32,21 +32,21 @@ class TradingMode(Enum):
 class IBKRConfig:
     """Interactive Brokers connection settings."""
 
-    # TWS / IB Gateway host — usually localhost
+    # IB Gateway host — usually localhost
     host: str = "127.0.0.1"
 
-    # Paper trading port: 4002 (IB Gateway, recommended) or 7497 (TWS)
-    # Live trading port:  4001 (IB Gateway, recommended) or 7496 (TWS)
+    # Paper trading port: 4002 (IB Gateway)
+    # Live trading port:  4001 (IB Gateway)
     paper_port: int = 4002
     live_port: int = 4001
 
     # Unique client ID — increment if you run multiple simultaneous connections
     client_id: int = 1
 
-    # Seconds to wait for TWS to respond before timing out
+    # Seconds to wait for IBKR to respond before timing out
     connection_timeout: int = 10
 
-    # How often (seconds) to ping TWS to keep the connection alive
+    # How often (seconds) to ping IBKR to keep the connection alive
     heartbeat_interval: int = 30
 
     # Maximum reconnection attempts before giving up

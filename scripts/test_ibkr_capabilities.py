@@ -2,7 +2,7 @@
 IBKR capability sweep — probes which API endpoints/data feeds your paper-account
 subscription has access to.  Read-only: nothing is ordered, nothing is modified.
 
-Run from the project root with IB Gateway (or TWS) open:
+Run from the project root with IB Gateway open:
     python scripts/test_ibkr_capabilities.py
 
 Optional args:
@@ -359,7 +359,7 @@ async def main():
                               clientId=args.client_id, timeout=10)
     except Exception as exc:
         print(f"ERROR: Could not connect to IBKR — {exc}")
-        print("Is IB Gateway / TWS open and the API enabled?")
+        print("Is IB Gateway open and the API enabled?")
         sys.exit(1)
     print("Connected.\n")
 

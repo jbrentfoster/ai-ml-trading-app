@@ -20,7 +20,7 @@ A Python-based algorithmic trading system that uses an ML ensemble (LSTM + XGBoo
 ## Requirements
 
 - Python 3.11+
-- IB Gateway 10.x (recommended) or TWS — for order execution and premium news; data pipeline works without it
+- IB Gateway 10.x — for order execution and premium news; data pipeline works without it
 - Windows, macOS, or Linux
 
 ```bash
@@ -33,11 +33,11 @@ All commands must be run from the project root directory.
 
 ## IBKR setup
 
-The system uses **IB Gateway** (recommended) or TWS for order submission and news. The data pipeline (yfinance) and ML signal generation work without any IBKR connection.
+The system uses **IB Gateway** for order submission and news. The data pipeline (yfinance) and ML signal generation work without any IBKR connection.
 
-### IB Gateway (recommended)
+### IB Gateway
 
-IB Gateway is a headless version of TWS designed for automated systems — more stable for unattended operation, lower memory usage, and no GUI to close accidentally.
+IB Gateway is a headless IBKR client designed for automated systems — stable for unattended operation, low memory usage, and no GUI to close accidentally.
 
 Download from: **ibkr.com → Trading → Trading Software → IB Gateway**
 
@@ -52,21 +52,11 @@ Configure → Settings → Auto-restart
   ☑ Auto-restart             ← handles the daily 24h session reset
 ```
 
-### TWS (alternative)
-
-```
-File → Global Configuration → API → Settings
-  ☑ Enable ActiveX and Socket Clients
-  Socket port: 7497          ← TWS paper
-  ☐ Read-Only API
-```
-
 ### Port reference
 
 | Client | Paper port | Live port |
 |--------|-----------|----------|
 | IB Gateway | 4002 | 4001 |
-| TWS | 7497 | 7496 |
 
 ### Market data subscriptions
 
@@ -145,7 +135,7 @@ streamlit run dashboard/1_Market_Data.py
 | **6 — Data Status** | One row per symbol — bar counts, news coverage by source, model status |
 | **7 — Universe** | Funnel overview, active candidates, size history, manual refresh controls |
 | **8 — Risk & Portfolio** | Circuit breaker, signal runner log, order decisions, trailing-stop log, risk config |
-| **9 — Account** | Live IBKR account summary, positions, orders (requires active IB Gateway/TWS) |
+| **9 — Account** | Live IBKR account summary, positions, orders (requires active IB Gateway) |
 | **10 — Trade History** | Closed trades from `trade_log` (WF-simulated + live fills): net P&L, indicative ST/LT tax view, exit-reason breakdown, per-symbol stats. Sidebar "Dedupe to latest run per symbol" toggle (default ON) hides stale rows from prior weekly retrains by sourcing the latest `run_id` from `walk_forward_results` |
 
 ---
@@ -224,7 +214,7 @@ schtasks /query /tn "TradingApp\WeeklyRun" /fo LIST
 Run these to confirm each layer is working correctly before running the full pipeline.
 
 ```bash
-python scripts/verify_connection.py    # IB Gateway / TWS paper account connection
+python scripts/verify_connection.py    # IB Gateway paper account connection
 python scripts/verify_pipeline.py      # data pipeline + indicators end-to-end
 python scripts/verify_signals.py       # ML signal generation end-to-end
 python scripts/verify_universe.py      # universe selection (requires Alpaca API keys)
@@ -377,7 +367,7 @@ News is fetched in priority order with automatic fallback:
 
 | Source | Quality | Requires |
 |--------|---------|---------|
-| **IBKR** | Best — Dow Jones + Briefing.com, ~4 months history | IB Gateway or TWS running |
+| **IBKR** | Best — Dow Jones + Briefing.com, ~4 months history | IB Gateway running |
 | **Alpaca** | Good — broad coverage, configurable lookback | `ALPACA_API_KEY` env var |
 | **yfinance** | Fallback — ~10 most recent articles only | Nothing |
 
@@ -388,7 +378,7 @@ Run `run_pipeline.py` with IB Gateway open to get full IBKR news history. The Da
 ## Tests
 
 ```bash
-.venv\Scripts\pytest tests\ -v              # all tests (no network or TWS needed)
+.venv\Scripts\pytest tests\ -v              # all tests (no network or IBKR needed)
 .venv\Scripts\pytest tests\test_risk.py -v  # risk module only
 ```
 

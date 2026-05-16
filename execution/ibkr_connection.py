@@ -1,7 +1,7 @@
 """
 IBKR Connection Manager
 =======================
-Handles connecting to Interactive Brokers TWS / IB Gateway via ib_insync.
+Handles connecting to Interactive Brokers IB Gateway via ib_insync.
 
 Supports:
   - Paper trading (simulation mode) and live trading
@@ -38,7 +38,7 @@ log = get_logger("execution.ibkr")
 
 # ---------------------------------------------------------------------------
 # ib_insync is an optional dependency at import time so the rest of the codebase
-# can be imported and tested without a live TWS session.  We'll raise a clear
+# can be imported and tested without a live IBKR session.  We'll raise a clear
 # error only when an actual connection is attempted.
 # ---------------------------------------------------------------------------
 try:
@@ -168,7 +168,7 @@ class IBKRConnection:
 
     async def connect(self) -> bool:
         """
-        Connect to TWS / IB Gateway.
+        Connect to IB Gateway.
         Returns True on success, False if all retry attempts fail.
         """
         for attempt in range(1, self._cfg.max_reconnect_attempts + 1):
@@ -213,13 +213,13 @@ class IBKRConnection:
 
         log.error(
             "Failed to connect after %d attempts. "
-            "Is TWS / IB Gateway running on port %d?",
+            "Is IB Gateway running on port %d?",
             self._cfg.max_reconnect_attempts, self._port,
         )
         return False
 
     async def disconnect(self) -> None:
-        """Gracefully disconnect from TWS."""
+        """Gracefully disconnect from IBKR."""
         self._disconnecting = True
 
         if self._reconnect_task and not self._reconnect_task.done():
@@ -237,7 +237,7 @@ class IBKRConnection:
     async def __aenter__(self) -> "IBKRConnection":
         success = await self.connect()
         if not success:
-            raise ConnectionError("Could not connect to IBKR TWS / IB Gateway.")
+            raise ConnectionError("Could not connect to IBKR IB Gateway.")
         return self
 
     async def __aexit__(self, *_) -> None:
@@ -325,7 +325,7 @@ class IBKRConnection:
         log.info("Placing MARKET order: %s %s x%.0f", action.upper(), symbol, quantity)
         trade: Trade = self._ib.placeOrder(contract, order)
 
-        # Brief wait to get initial status back from TWS
+        # Brief wait to get initial status back from IBKR
         await asyncio.sleep(1)
 
         result = OrderResult(

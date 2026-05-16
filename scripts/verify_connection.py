@@ -4,7 +4,7 @@ Step 1 Verification Script
 Run this to confirm your IBKR paper trading connection works end-to-end.
 
 Pre-requisites:
-  1. IB Gateway (or TWS) is running on your machine
+  1. IB Gateway is running on your machine
   2. Paper trading account is active
   3. API connections are enabled in IB Gateway:
        Configure → Settings → API → Settings
@@ -16,7 +16,7 @@ Run with:
   cd trading_app
   python verify_connection.py
 
-Expected output (if TWS is running):
+Expected output (if IBKR is running):
   ✅ Connected to IBKR in SIMULATION mode
   ✅ Account summary retrieved: Account DU... | NLV: $...
   ✅ Positions retrieved: N position(s)

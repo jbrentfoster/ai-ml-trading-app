@@ -205,7 +205,7 @@ st.plotly_chart(fig, use_container_width=True)
 ## IBKR connectivity
 
 ### ib_insync
-**What it is:** Python wrapper around Interactive Brokers' Trader Workstation (TWS) API. Provides an async-friendly interface on top of IB's low-level socket protocol.
+**What it is:** Python wrapper around the Interactive Brokers (IBKR) API. Provides an async-friendly interface on top of IB's low-level socket protocol.
 **Why it's used:** The official IB Python API (`ibapi`) is synchronous and requires threading to use correctly. `ib_insync` wraps it in asyncio, making it far easier to use in an async application.
 **How it's used:** `IBKRConnection` in `execution/ibkr_connection.py` — connect, account summary, positions, orders, market data.
 **Docs:** https://ib-insync.readthedocs.io/

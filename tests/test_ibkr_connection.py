@@ -1,6 +1,6 @@
 """
 Unit tests for IBKRConnection.
-These tests mock ib_insync so no live TWS session is needed.
+These tests mock ib_insync so no live IBKR session is needed.
 
 Run with:
     python -m pytest tests/test_ibkr_connection.py -v

@@ -1,10 +1,10 @@
 """
 IBKR News API test script.
 
-Connects to IB Gateway / TWS, lists your subscribed news providers, then fetches
+Connects to IB Gateway, lists your subscribed news providers, then fetches
 recent headlines and one full article body for a sample symbol.
 
-Run from the project root with IB Gateway (or TWS) open:
+Run from the project root with IB Gateway open:
     python scripts/test_ibkr_news.py
 
 Optional args:
@@ -30,7 +30,7 @@ def parse_args():
     p.add_argument("--days",   type=int, default=3, help="How many days back to search")
     p.add_argument("--max",    type=int, default=10, help="Max headlines to retrieve")
     p.add_argument("--port",   type=int, default=config.ibkr.paper_port,
-                   help="IBKR API port (default: config.ibkr.paper_port — 4002=IB Gateway paper, 7497=TWS paper)")
+                   help="IBKR API port (default: config.ibkr.paper_port — 4002=IB Gateway paper)")
     p.add_argument("--client-id", type=int, default=99, help="IBKR client ID (use one not in use)")
     return p.parse_args()
 
@@ -52,9 +52,8 @@ async def main():
         await ib.connectAsync(config.ibkr.host, args.port, clientId=args.client_id, timeout=10)
     except Exception as exc:
         print(f"ERROR: Could not connect to IBKR — {exc}")
-        print("Make sure IB Gateway (or TWS) is open and the API is enabled.")
+        print("Make sure IB Gateway is open and the API is enabled.")
         print("  IB Gateway: Configure → Settings → API → Settings (paper port 4002)")
-        print("  TWS:        File → Global Configuration → API → Settings (paper port 7497)")
         sys.exit(1)
 
     print("Connected.\n")
@@ -102,7 +101,7 @@ async def main():
     end_dt   = datetime.now(timezone.utc)
     start_dt = end_dt - timedelta(days=args.days)
 
-    # TWS expects "YYYYMMDD HH:MM:SS" in UTC, or empty string for "now"
+    # IBKR expects "YYYYMMDD HH:MM:SS" in UTC, or empty string for "now"
     start_str = start_dt.strftime("%Y%m%d %H:%M:%S")
     end_str   = end_dt.strftime("%Y%m%d %H:%M:%S")
 
@@ -128,7 +127,7 @@ async def main():
         print("  No headlines returned.")
         print("\nPossible reasons:")
         print("  - No news for this symbol in the selected window")
-        print("  - News subscription not fully enabled — check TWS → Market Data")
+        print("  - News subscription not fully enabled — check IBKR Client Portal → Market Data Subscriptions")
     else:
         print(f"  Retrieved {len(headlines)} headline(s):\n")
         for i, h in enumerate(headlines):

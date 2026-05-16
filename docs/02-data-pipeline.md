@@ -97,7 +97,7 @@ News is fetched by `NewsClient` which tries three sources in priority order:
 
 ```
 1. IBKR / Dow Jones    ← best quality, ~4 months back, 300 article cap
-        ↓ (if TWS/Gateway not running or no articles)
+        ↓ (if IB Gateway not running or no articles)
 2. Alpaca Markets API  ← broad coverage, configurable lookback
         ↓ (if no API key)
 3. yfinance            ← always available, ~10 most recent articles only

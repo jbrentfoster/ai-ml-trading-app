@@ -4,8 +4,8 @@ Account & Portfolio — Page 9
 Shows live IBKR account summary, open positions (enriched with live prices
 via yfinance and risk levels from `order_decisions`), and open orders.
 
-Connects to TWS on demand when the user clicks Refresh — no persistent
-connection is held between renders.  If TWS is not running the page
+Connects to IBKR on demand when the user clicks Refresh — no persistent
+connection is held between renders.  If IBKR is not running the page
 shows the connection error and waits for the next refresh.
 """
 
@@ -26,6 +26,7 @@ asyncio.set_event_loop(asyncio.new_event_loop())
 
 from config.settings import config, TradingMode
 from data.database import get_latest_risk_levels
+from data.ui_queries import query_company_name
 from risk.portfolio_guard import get_sector
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -66,6 +67,43 @@ async def _fetch_ibkr_data() -> dict:
         "orders":     orders,
         "fetched_at": datetime.now(timezone.utc),
     }
+
+
+def _card_metric_html(
+    label: str,
+    value: str,
+    delta: str | None = None,
+    mode: str = "normal",
+) -> str:
+    """
+    Render a metric-style block with a smaller value font than st.metric.
+    Mimics st.metric's visual layout (label / value / delta) but gives us
+    direct control over font sizes, dodging Streamlit CSS specificity.
+
+    mode='normal' colours delta teal (+) or red (-); mode='off' keeps it muted.
+    """
+    delta_html = ""
+    if delta:
+        stripped = delta.lstrip()
+        if mode == "normal" and stripped.startswith("+"):
+            color, arrow = "#26a69a", "▲ "
+        elif mode == "normal" and stripped.startswith("-"):
+            color, arrow = "#ef5350", "▼ "
+        else:
+            color, arrow = "rgba(250,250,250,0.6)", ""
+        delta_html = (
+            f'<div style="font-size: 1.1rem; color: {color}; '
+            f'line-height: 1.3;">{arrow}{delta}</div>'
+        )
+    return (
+        '<div style="margin-bottom: 0.75rem;">'
+        f'<div style="font-size: 0.95rem; color: rgba(250,250,250,0.6); '
+        f'line-height: 1.3; margin-bottom: 0.1rem;">{label}</div>'
+        f'<div style="font-size: 1.25rem; font-weight: 400; line-height: 1.3; '
+        f'margin-bottom: 0.1rem;">{value}</div>'
+        f'{delta_html}'
+        '</div>'
+    )
 
 
 def _enrich_positions(
@@ -163,7 +201,7 @@ st.sidebar.caption(
 )
 st.sidebar.markdown("---")
 
-refresh = st.sidebar.button("Refresh from TWS", type="primary", key="acc_refresh")
+refresh = st.sidebar.button("Refresh from IBKR", type="primary", key="acc_refresh")
 
 # ── Header ────────────────────────────────────────────────────────────────────
 
@@ -179,7 +217,7 @@ st.markdown(
 # ── IBKR refresh ──────────────────────────────────────────────────────────────
 
 if refresh:
-    with st.spinner("Connecting to TWS and fetching account data …"):
+    with st.spinner("Connecting to IBKR and fetching account data …"):
         try:
             st.session_state.ibkr_data  = _run_async(_fetch_ibkr_data())
             st.session_state.ibkr_error = None
@@ -199,12 +237,12 @@ if st.session_state.ibkr_data:
 elif st.session_state.ibkr_error:
     st.warning(
         f"**IBKR not connected** — {st.session_state.ibkr_error}  \n"
-        "TWS must be running and API access enabled.  "
+        "IBKR must be running and API access enabled.  "
         "Signal history and analytics below are still available."
     )
 else:
-    st.info("Click **Refresh from TWS** in the sidebar to load live account data.  "
-            "TWS must be running.")
+    st.info("Click **Refresh from IBKR** in the sidebar to load live account data.  "
+            "IBKR must be running.")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # LIVE IBKR SECTIONS (only when connected)
@@ -219,17 +257,32 @@ if st.session_state.ibkr_data:
     st.markdown("---")
     st.subheader("Account Summary")
 
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Net Liquidation", f"${summary.net_liquidation:,.2f}")
-    c2.metric("Total Cash",      f"${summary.total_cash:,.2f}")
-    c3.metric("Buying Power",    f"${summary.buying_power:,.2f}")
-    c4.metric("Unrealized P&L",  f"${summary.unrealized_pnl:+,.2f}")
-    c5.metric("Realized P&L (today)", f"${summary.realized_pnl:+,.2f}")
+    # Row 1 — balance state
+    b1, b2, b3 = st.columns(3)
+    b1.metric("Net Liquidation",       f"${summary.net_liquidation:,.2f}")
+    b2.metric("Total Cash",            f"${summary.total_cash:,.2f}")
+    b3.metric("Total Position Value",  f"${summary.gross_position_value:,.2f}")
+
+    # Row 2 — P&L breakdown
+    p1, p2, p3 = st.columns(3)
+    p1.metric("Unrealized P&L",        f"${summary.unrealized_pnl:+,.2f}")
+    p2.metric("Realized P&L (today)",  f"${summary.realized_pnl:+,.2f}")
+    p3.metric(
+        "Realized P&L (lifetime)",
+        "— pending Phase B",
+        help=(
+            "Cumulative realized P&L across all closed live trades. "
+            "Disabled until Phase 4.5 Phase B (live-fill ingestion via "
+            "`reqExecutions` polling) populates `trade_log` with `source='live'` rows."
+        ),
+    )
 
     st.caption(
         f"Account ID: {summary.account_id}  |  Currency: {summary.currency}  |  "
-        "Realized P&L is the intraday figure from IBKR — it resets at session start. "
-        "Cumulative realized P&L will be available on the Trade History page once live-fill ingestion (Phase B) lands."
+        "**Unrealized P&L** is cumulative across all open positions (current price vs avg cost), not a today-only figure. "
+        "**Realized P&L (today)** is the intraday figure from IBKR — it resets at session start. "
+        "**Realized P&L (lifetime)** is a placeholder pending Phase B — IBKR's real-time API doesn't expose a "
+        "cumulative figure, so this will be summed from `trade_log` once live fills are ingested."
     )
 
     # ── Open positions ────────────────────────────────────────────────────────
@@ -245,36 +298,70 @@ if st.session_state.ibkr_data:
         pos_df = _enrich_positions(positions_raw, risk_levels)
 
         # ── Risk-level summary cards ──────────────────────────────────────────
-        # One column per position: Stop Loss and Take Profit as st.metric cards.
-        # delta on Stop = % above stop (positive = safe, negative = already below stop).
-        # delta on TP   = % remaining to target (positive = room to run).
-        has_risk = pos_df["stop_loss"].notna().any()
-        if has_risk:
-            rm_cols = st.columns(len(pos_df))
-            for col, (_, row) in zip(rm_cols, pos_df.iterrows()):
-                sym = row["symbol"]
-                sl  = row["stop_loss"]
-                tp  = row["take_profit"]
-                sd  = row["stop_dist_pct"]
-                td  = row["tp_dist_pct"]
-                with col:
-                    st.markdown(f"**{sym}**")
-                    if pd.notna(sl):
-                        st.metric(
-                            label="Stop Loss",
-                            value=f"${sl:,.2f}",
-                            delta=f"{sd:+.1f}% above" if pd.notna(sd) else None,
-                            delta_color="normal",   # green = far above stop = good
+        # One card per position, chunked into rows of CARDS_PER_ROW.  Each card:
+        #   • Current price + % vs avg cost (positive = up on the position)
+        #   • Stop Loss + % above stop (positive = safe; red when close)
+        #   • Take Profit + % remaining to target
+        CARDS_PER_ROW = 4
+        has_risk_or_price = (
+            pos_df["stop_loss"].notna().any()
+            or pos_df["current_price"].notna().any()
+        )
+        if has_risk_or_price:
+            rows = [
+                pos_df.iloc[i:i + CARDS_PER_ROW]
+                for i in range(0, len(pos_df), CARDS_PER_ROW)
+            ]
+            for chunk in rows:
+                rm_cols = st.columns(CARDS_PER_ROW)
+                for col, (_, row) in zip(rm_cols, chunk.iterrows()):
+                    sym = row["symbol"]
+                    cp  = row["current_price"]
+                    ac  = row["avg_cost"]
+                    pp  = row["pnl_pct"]
+                    sl  = row["stop_loss"]
+                    tp  = row["take_profit"]
+                    sd  = row["stop_dist_pct"]
+                    td  = row["tp_dist_pct"]
+                    with col.container(border=True):
+                        company = query_company_name(sym)
+                        company_html = (
+                            f'<div style="font-size: 0.85rem; '
+                            f'color: rgba(250,250,250,0.6); line-height: 1.2; '
+                            f'margin-bottom: 0.5rem;">{company}</div>'
+                        ) if company else ""
+                        st.markdown(
+                            f'<div style="font-size: 1.4rem; font-weight: 700; '
+                            f'line-height: 1.3; margin-bottom: 0.1rem;">{sym}</div>'
+                            f'{company_html}',
+                            unsafe_allow_html=True,
                         )
-                    if pd.notna(tp):
-                        st.metric(
-                            label="Take Profit",
-                            value=f"${tp:,.2f}",
-                            delta=f"{td:+.1f}% away" if pd.notna(td) else None,
-                            delta_color="off",
-                        )
-                    if pd.isna(sl) and pd.isna(tp):
-                        st.caption("No risk data")
+                        blocks: list[str] = []
+                        if pd.notna(cp):
+                            blocks.append(_card_metric_html(
+                                label=f"Current (avg cost ${ac:,.2f})",
+                                value=f"${cp:,.2f}",
+                                delta=f"{pp:+.1f}% vs cost" if pd.notna(pp) else None,
+                                mode="normal",
+                            ))
+                        if pd.notna(sl):
+                            blocks.append(_card_metric_html(
+                                label="Stop Loss",
+                                value=f"${sl:,.2f}",
+                                delta=f"{sd:+.1f}% above" if pd.notna(sd) else None,
+                                mode="normal",
+                            ))
+                        if pd.notna(tp):
+                            blocks.append(_card_metric_html(
+                                label="Take Profit",
+                                value=f"${tp:,.2f}",
+                                delta=f"{td:+.1f}% away" if pd.notna(td) else None,
+                                mode="off",
+                            ))
+                        if blocks:
+                            st.markdown("".join(blocks), unsafe_allow_html=True)
+                        elif pd.isna(sl) and pd.isna(tp) and pd.isna(cp):
+                            st.caption("No price or risk data")
 
         st.markdown("")
 
