@@ -516,8 +516,8 @@ else:
                     ), row=1, col=1)
 
             # LSTM score — positive region (bullish)
-            _pos_score = _score_disp.where(_score_disp >= 0)
-            _neg_score = _score_disp.where(_score_disp < 0)
+            _pos_score = _score_disp.clip(lower=0)
+            _neg_score = _score_disp.clip(upper=0)
             _fig.add_trace(go.Scatter(
                 x=_score_disp.index, y=_pos_score,
                 name="Bullish", line=dict(color="#26a69a", width=2),
