@@ -323,7 +323,7 @@ Key configurable fields:
 | `MLConfig.ensemble_*_weight` | 0.40/0.35/0.25 | Initial weights (normalised to 1.0 on save) |
 | `MLConfig.ensemble_weight_floor` | 0.10 | Minimum per-model weight after rebalance |
 | `MLConfig.ensemble_nudge` | 0.10 | Max weight transfer per rebalance |
-| `MLConfig.news_available_from` | None | Walk-forward folds before this date suppress FinBERT |
+| `MLConfig.news_available_from` | None | Walk-forward folds before this date suppress FinBERT. When `None` (default), the cutoff is derived per-symbol from `MIN(news_cache.published_at)` — set a date only to override (e.g. when a symbol's earliest cached news is unreliable) |
 | `MLConfig.wf_train_bars` | 120 | ~6 months daily |
 | `MLConfig.wf_test_bars` | 21 | ~1 month daily |
 | `MLConfig.wf_n_splits` | 5 | Folds per run |
@@ -404,7 +404,7 @@ Quick mode (UI): 5 LSTM epochs / 50 XGB estimators / 2 folds / 60 train + 10 tes
 ## News & FinBERT Conventions
 
 - **News must be fetched before walk-forward** for FinBERT to contribute anything. Run `python scripts/run_pipeline.py` or use "Fetch & Score News" on Page 2 for each symbol.
-- IBKR news goes back ~4-5 months (300 article hard cap). Set `MLConfig.news_available_from` to the earliest reliable date so walk-forward folds before it suppress FinBERT explicitly and log the reason in `sentiment_note`.
+- IBKR news goes back ~4-5 months (300 article hard cap). By default `MLConfig.news_available_from` is `None` and `MLWalkForwardOrchestrator._resolve_news_cutoff()` derives the effective cutoff per-symbol from `MIN(news_cache.published_at)` — so the gate auto-adjusts to whatever's actually in the cache without a hardcoded date to maintain. Set `MLConfig.news_available_from` only to override (e.g. a sparse-news symbol whose earliest article isn't trustworthy). When neither source is set (empty cache, no override), coverage scaling is the safety net — bars with no news score 0, so FinBERT's weight falls toward 0 via the per-fold `finbert_coverage` multiplier.
 - `upsert_news` updates `sentiment_score` only when the stored value is `None` — it never overwrites a previously scored article.
 - FinBERT coverage (fraction of test-window bars with non-zero score) is tracked per fold and stored in `sentiment_note`. Coverage < 100% scales FinBERT's weight proportionally.
 

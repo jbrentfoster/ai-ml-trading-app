@@ -234,15 +234,16 @@ class FinBERTModel(BaseModel):
     # ── BaseModel interface ────────────────────────────────────────────────────
 
     @staticmethod
-    def is_available_for_date(date: datetime) -> bool:
+    def is_available_for_date(date: datetime, cutoff: datetime | None = None) -> bool:
         """
-        Return False when `date` precedes config.ml.news_available_from.
+        Return False when `date` precedes the resolved news cutoff.
 
         Walk-forward callers use this to decide whether to suppress FinBERT
-        scoring for a given test window.  Returns True when
-        news_available_from is None (no restriction configured).
+        scoring for a given test window. ``cutoff`` (when provided) is used
+        directly; otherwise ``config.ml.news_available_from`` is consulted.
+        Returns True when no cutoff is configured at either site.
         """
-        naf = config.ml.news_available_from
+        naf = cutoff if cutoff is not None else config.ml.news_available_from
         if naf is None:
             return True
         # Normalise to naive UTC for comparison (both dates are naive in the DB)

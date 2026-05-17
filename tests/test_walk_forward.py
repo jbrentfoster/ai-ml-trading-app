@@ -426,6 +426,136 @@ class TestUniversePolicyTagging:
         assert rows == {"dyn-run": "dynamic", "stat-run": "static"}
 
 
+class TestNewsCutoffResolution:
+    """Pin the precedence used by ``_resolve_news_cutoff``.
+
+    Order: YAML override > derived per-symbol MIN(published_at) > None.
+    The cutoff drives whether each fold's FinBERT is suppressed entirely
+    (when test_start < cutoff) or allowed to contribute via coverage scaling.
+    """
+
+    def test_yaml_override_wins_over_cache(self, monkeypatch):
+        """An explicit ``config.ml.news_available_from`` short-circuits derivation."""
+        from datetime import datetime
+        from config.settings import config
+        from models.walk_forward import MLWalkForwardOrchestrator
+
+        override = datetime(2025, 6, 1)
+        monkeypatch.setattr(config.ml, "news_available_from", override)
+
+        # Even if the DB had news, the override must win.  Patch the helper
+        # to verify it's not consulted.
+        called = {"n": 0}
+        def _spy(*_a, **_kw):
+            called["n"] += 1
+            return datetime(2026, 3, 15)
+        monkeypatch.setattr(
+            "models.walk_forward.get_earliest_news_date", _spy,
+        )
+
+        orch = MLWalkForwardOrchestrator(symbol="TEST")
+        assert orch._resolve_news_cutoff() == override
+        assert called["n"] == 0
+
+    def test_derives_from_cache_when_yaml_unset(self, monkeypatch):
+        """No override → MIN(published_at) for this symbol."""
+        from datetime import datetime
+        from config.settings import config
+        from models.walk_forward import MLWalkForwardOrchestrator
+
+        monkeypatch.setattr(config.ml, "news_available_from", None)
+        cached = datetime(2026, 3, 15, 12, 0)
+        monkeypatch.setattr(
+            "models.walk_forward.get_earliest_news_date",
+            lambda symbol=None: cached if symbol == "AAPL" else None,
+        )
+
+        orch = MLWalkForwardOrchestrator(symbol="AAPL")
+        assert orch._resolve_news_cutoff() == cached
+
+    def test_empty_cache_returns_none(self, monkeypatch):
+        """No override, no cached news → ``None`` (no restriction)."""
+        from config.settings import config
+        from models.walk_forward import MLWalkForwardOrchestrator
+
+        monkeypatch.setattr(config.ml, "news_available_from", None)
+        monkeypatch.setattr(
+            "models.walk_forward.get_earliest_news_date", lambda symbol=None: None,
+        )
+
+        orch = MLWalkForwardOrchestrator(symbol="NEWSYM")
+        assert orch._resolve_news_cutoff() is None
+
+    def test_derivation_is_per_symbol(self, monkeypatch):
+        """Different symbols get their own MIN(published_at).
+
+        Pins that the helper is called with ``self._symbol`` (not globally),
+        so a sparse-news symbol can't free-ride on another symbol's older news.
+        """
+        from datetime import datetime
+        from config.settings import config
+        from models.walk_forward import MLWalkForwardOrchestrator
+
+        monkeypatch.setattr(config.ml, "news_available_from", None)
+        per_symbol = {
+            "AAPL": datetime(2026, 3, 16),
+            "TSLA": datetime(2026, 3, 15),
+            "EMPTY": None,
+        }
+        monkeypatch.setattr(
+            "models.walk_forward.get_earliest_news_date",
+            lambda symbol=None: per_symbol.get(symbol),
+        )
+
+        assert MLWalkForwardOrchestrator(symbol="AAPL")._resolve_news_cutoff() == per_symbol["AAPL"]
+        assert MLWalkForwardOrchestrator(symbol="TSLA")._resolve_news_cutoff() == per_symbol["TSLA"]
+        assert MLWalkForwardOrchestrator(symbol="EMPTY")._resolve_news_cutoff() is None
+
+
+class TestGetEarliestNewsDate:
+    """The DB helper used by ``_resolve_news_cutoff``."""
+
+    def test_returns_min_per_symbol(self, monkeypatch):
+        from datetime import datetime
+        from sqlalchemy import create_engine
+        from data.database import Base, NewsCache, get_earliest_news_date
+        from sqlalchemy.orm import Session
+
+        engine = create_engine("sqlite:///:memory:", echo=False)
+        Base.metadata.create_all(engine)
+        monkeypatch.setattr("data.database._engine", engine)
+
+        with Session(engine) as session:
+            session.add_all([
+                NewsCache(symbol="AAPL", article_id="a1",
+                          published_at=datetime(2026, 3, 16, 9, 27),
+                          headline="x", sentiment_score=None),
+                NewsCache(symbol="AAPL", article_id="a2",
+                          published_at=datetime(2026, 4, 1),
+                          headline="y", sentiment_score=None),
+                NewsCache(symbol="TSLA", article_id="t1",
+                          published_at=datetime(2026, 3, 15, 21, 41),
+                          headline="z", sentiment_score=None),
+            ])
+            session.commit()
+
+        assert get_earliest_news_date("AAPL") == datetime(2026, 3, 16, 9, 27)
+        assert get_earliest_news_date("TSLA") == datetime(2026, 3, 15, 21, 41)
+        # No symbol filter → global minimum
+        assert get_earliest_news_date() == datetime(2026, 3, 15, 21, 41)
+
+    def test_returns_none_when_empty(self, monkeypatch):
+        from sqlalchemy import create_engine
+        from data.database import Base, get_earliest_news_date
+
+        engine = create_engine("sqlite:///:memory:", echo=False)
+        Base.metadata.create_all(engine)
+        monkeypatch.setattr("data.database._engine", engine)
+
+        assert get_earliest_news_date("AAPL") is None
+        assert get_earliest_news_date() is None
+
+
 class TestCostModel:
     """Tests for the corrected WF cost model in _run_test_window.
 

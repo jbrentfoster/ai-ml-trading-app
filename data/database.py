@@ -37,6 +37,7 @@ from sqlalchemy import (
     UniqueConstraint,
     create_engine,
     desc,
+    func,
 )
 from sqlalchemy.orm import DeclarativeBase, Session
 
@@ -810,6 +811,22 @@ def get_recent_news(symbol: str, since: datetime) -> list[dict]:
         }
         for r in rows
     ]
+
+
+def get_earliest_news_date(symbol: str | None = None) -> datetime | None:
+    """Return the oldest ``published_at`` in ``news_cache``, or ``None`` if empty.
+
+    Scoped to ``symbol`` when provided; otherwise across all symbols. Used by
+    the walk-forward orchestrator to derive the ``news_available_from`` cutoff
+    directly from the data instead of a hardcoded config date.
+    """
+    engine = get_engine()
+    with Session(engine) as session:
+        q = session.query(func.min(NewsCache.published_at))
+        if symbol is not None:
+            q = q.filter(NewsCache.symbol == symbol)
+        result = q.scalar()
+    return result
 
 
 # ── Signal log helpers ────────────────────────────────────────────────────────

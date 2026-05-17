@@ -23,7 +23,7 @@ import pandas as pd
 
 from core.logger import get_logger
 from data.walk_forward import WalkForwardSplit
-from data.database import log_trades_bulk, log_walk_forward_result
+from data.database import get_earliest_news_date, log_trades_bulk, log_walk_forward_result
 from models.ensemble import EnsembleModel
 from models.finbert_model import FinBERTModel
 from models.signal_gate import SignalGate, SignalResult
@@ -62,6 +62,40 @@ class MLWalkForwardOrchestrator:
         self._ensemble: EnsembleModel | None = None
         self._run_id            = str(uuid.uuid4())
         self._universe_selector = universe_selector
+
+    def _resolve_news_cutoff(self) -> datetime | None:
+        """Resolve the effective ``news_available_from`` cutoff for this run.
+
+        Resolution order:
+          1. ``config.ml.news_available_from`` — explicit override wins
+             (useful when a sparse-news symbol shouldn't trust its earliest
+             cached article).
+          2. ``MIN(published_at)`` from ``news_cache`` for this symbol —
+             the most honest answer: "FinBERT can contribute from the date
+             we actually have news."
+          3. ``None`` — no restriction; coverage scaling in the rebalance
+             step is the safety net (zero-news bars → FinBERT weight → 0).
+        """
+        override = config.ml.news_available_from
+        if override is not None:
+            log.info(
+                "[%s] News cutoff: %s (YAML override)",
+                self._symbol, override,
+            )
+            return override
+        derived = get_earliest_news_date(self._symbol)
+        if derived is not None:
+            log.info(
+                "[%s] News cutoff: %s (derived from news_cache MIN)",
+                self._symbol, derived,
+            )
+            return derived
+        log.info(
+            "[%s] News cutoff: none — no news cached; coverage scaling will "
+            "drive FinBERT weight",
+            self._symbol,
+        )
+        return None
 
     @staticmethod
     def _format_kelly_fstar(f_star) -> str:
@@ -111,6 +145,8 @@ class MLWalkForwardOrchestrator:
             self._symbol, len(folds), self._run_id,
         )
 
+        news_cutoff = self._resolve_news_cutoff()
+
         all_results: list[dict] = []
 
         for fold in folds:
@@ -122,14 +158,16 @@ class MLWalkForwardOrchestrator:
             )
 
             # Determine whether news data existed at the start of this test window
-            suppress_finbert = not FinBERTModel.is_available_for_date(fold.test_start)
+            suppress_finbert = not FinBERTModel.is_available_for_date(
+                fold.test_start, cutoff=news_cutoff,
+            )
             if suppress_finbert:
                 log.info(
-                    "Fold %d: test window starts %s, before news_available_from (%s) — "
+                    "Fold %d: test window starts %s, before news cutoff (%s) — "
                     "FinBERT suppressed; weight redistributed to LSTM and XGBoost",
                     fold.fold_index + 1,
                     fold.test_start.date(),
-                    config.ml.news_available_from,
+                    news_cutoff,
                 )
 
             ensemble = EnsembleModel(symbol=self._symbol)
@@ -187,7 +225,7 @@ class MLWalkForwardOrchestrator:
             if suppress_finbert:
                 sentiment_note = (
                     f"suppressed: test window {fold.test_start.date()} precedes "
-                    f"news_available_from ({config.ml.news_available_from}); "
+                    f"news cutoff ({news_cutoff}); "
                     f"weight redistributed to LSTM+XGBoost"
                 )
             elif finbert_coverage < 1.0:
