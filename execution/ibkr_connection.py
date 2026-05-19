@@ -681,6 +681,9 @@ class IBKRConnection:
             10197,  # No market data during competing session
             10349,  # Requested contract details not found
             202,    # Order Canceled — confirmation after cancelOrder, not a failure
+            10148,  # Order cannot be cancelled — already in Cancelled state (benign race
+                    # during cancel+place flows, e.g. trailing-stop conversion or long-only close
+                    # where the bracket child was already cancelled by IBKR before our cancel arrived)
         }
         if error_code in informational:
             log.debug("IBKR info [%d]: %s", error_code, error_string)

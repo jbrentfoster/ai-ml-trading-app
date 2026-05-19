@@ -12,6 +12,10 @@ Phases:
   3.5 Trailing   — TrailingStopManager: bracket TP → standalone TRAIL once a
                    long has moved +activation_atr × ATR above entry (skipped
                    in dry-run; opt-in via config.risk.trailing_stop_enabled)
+  3.6 Hold-timeout — flatten held longs whose most recent passed-gate BUY
+                     in signal_log is older than config.risk.max_hold_days
+                     (skipped in dry-run; opt-in via
+                     config.risk.hold_timeout_enabled)
   4. Risk / order — PortfolioGuard + OrderManager per actionable signal
   5. Summary      — print stats, write signal_runner_log row
 
@@ -50,7 +54,9 @@ from config.settings import config, TradingMode
 from core.logger import get_logger
 from data.database import (
     get_equity_snapshot_on_or_before,
+    get_latest_buy_signal_ts,
     log_equity_snapshot,
+    log_order_decision,
     log_signal,
     log_signal_runner_run,
 )
@@ -591,6 +597,198 @@ def _phase3_5_trailing_stops(dry_run: bool, run_id: str = "") -> int:
             pass
 
 
+def _phase3_6_hold_timeouts(dry_run: bool, run_id: str = "") -> int:
+    """
+    Phase 3.6: flatten any held long whose most recent passed-gate BUY signal
+    is older than ``config.risk.max_hold_days``.
+
+    Guards against positions sitting indefinitely in sparse-signal regimes —
+    once a BUY fills, neither stop nor TP nor a fresh SELL may ever fire, so
+    without this gate a stale winner / loser can hold for months.  The
+    "re-confirming signal" semantic is preferred over a pure time-based stop:
+    if the model still says BUY today (or any day within the window), the
+    position is *not* stale and the timeout does not fire.
+
+    Returns the count of positions timed out in this run (used for Phase 5
+    summary).  Skipped entirely when:
+      * ``dry_run=True`` (no live order mutations in dry-run)
+      * ``paper_orders_enabled=False`` in SIMULATION mode
+      * ``config.risk.hold_timeout_enabled=False`` (opt-in feature, default off)
+      * ``config.risk.max_hold_days <= 0`` (defensive — would otherwise flatten
+        every held long on the next run)
+
+    Persists each closure to ``order_decisions`` with decision='CLOSED_TIMEOUT'
+    so Page 8 can surface a retrospective view alongside CLOSED_LONG / APPROVED.
+    Symbols with NO BUY signal in ``signal_log`` are skipped (we have no anchor
+    for staleness — could be a manual position or a holding from before the
+    runner started writing signal_log rows).
+    """
+    if dry_run or not config.risk.hold_timeout_enabled:
+        return 0
+    if config.risk.max_hold_days <= 0:
+        return 0
+    if (
+        config.trading.mode == TradingMode.SIMULATION
+        and not config.trading.paper_orders_enabled
+    ):
+        return 0
+
+    print("=== Phase 3.6: Hold timeout ===")
+
+    ibkr, loop = _connect_ibkr_if_needed(dry_run)
+    if ibkr is None or loop is None:
+        print("  ⚠  IBKR unreachable — skipping hold-timeout phase.")
+        print()
+        return 0
+
+    today = datetime.now(timezone.utc).replace(tzinfo=None).date()
+    max_days = config.risk.max_hold_days
+    timed_out = 0
+
+    try:
+        positions   = loop.run_until_complete(ibkr.get_positions())
+        open_orders = loop.run_until_complete(ibkr.get_open_orders())
+
+        long_positions = [p for p in positions if int(p.get("quantity", 0) or 0) > 0]
+        if not long_positions:
+            print("  No long positions held.")
+            print()
+            return 0
+
+        for pos in long_positions:
+            symbol = pos.get("symbol")
+            shares = int(pos.get("quantity", 0) or 0)
+            if not symbol or shares <= 0:
+                continue
+
+            latest_buy = get_latest_buy_signal_ts(symbol)
+            if latest_buy is None:
+                print(f"  {symbol}: skipped — no BUY signal history (manual position?)")
+                continue
+
+            # signal_log.bar_timestamp is a tz-naive datetime
+            buy_date = latest_buy.date() if hasattr(latest_buy, "date") else latest_buy
+            age_days = (today - buy_date).days
+
+            if age_days <= max_days:
+                print(
+                    f"  {symbol}: ok — last BUY {buy_date} ({age_days}d ago, "
+                    f"limit {max_days}d)"
+                )
+                continue
+
+            # Stale — flatten.  Mirror OrderManager._close_long_position's
+            # cancel-children-then-market-close ordering: a stale bracket left
+            # live after the position goes to 0 can fire against no shares and
+            # open an unintended short, bypassing allow_short_selling=False.
+            print(
+                f"  {symbol}: TIMEOUT — last BUY {buy_date} ({age_days}d ago "
+                f"> {max_days}d limit), closing {shares} shares"
+            )
+            entry_price = float(pos.get("avg_cost", 0.0) or 0.0)
+            closed_ok = _close_for_timeout(
+                ibkr=ibkr,
+                loop=loop,
+                symbol=symbol,
+                shares=shares,
+                open_orders=open_orders,
+            )
+            decision_label = "CLOSED_TIMEOUT" if closed_ok else "REJECTED"
+            reject_reason = (
+                ""
+                if closed_ok
+                else f"Hold-timeout close failed (last BUY {buy_date}, {age_days}d ago)"
+            )
+            try:
+                log_order_decision({
+                    "run_id":            run_id,
+                    "symbol":            symbol,
+                    "signal":            "SELL",
+                    "decision":          decision_label,
+                    "shares":            shares,
+                    "entry_price":       entry_price,
+                    "stop_price":        0.0,
+                    "take_profit_price": 0.0,
+                    "position_value":    shares * entry_price,
+                    "reject_reason":     reject_reason,
+                    "decided_at":        datetime.now(timezone.utc).replace(tzinfo=None),
+                })
+            except Exception as exc:
+                log.warning("Could not persist CLOSED_TIMEOUT for %s: %s", symbol, exc)
+            if closed_ok:
+                timed_out += 1
+                log.info(
+                    "[%s] CLOSED_TIMEOUT — %d shares, last BUY %s (%dd ago > %dd limit)",
+                    symbol, shares, buy_date, age_days, max_days,
+                )
+
+        print()
+        return timed_out
+    except Exception as exc:
+        print(f"  ⚠  Phase 3.6 failed: {exc}")
+        log.warning("Phase 3.6 failed: %s", exc, exc_info=True)
+        print()
+        return timed_out
+    finally:
+        try:
+            loop.run_until_complete(ibkr.disconnect())
+        except Exception as exc:
+            log.warning("IBKR disconnect error after hold-timeout phase: %s", exc)
+        try:
+            loop.close()
+        except Exception:
+            pass
+        try:
+            asyncio.set_event_loop(None)
+        except Exception:
+            pass
+
+
+def _close_for_timeout(
+    ibkr,
+    loop,
+    symbol: str,
+    shares: int,
+    open_orders: list[dict],
+) -> bool:
+    """
+    Cancel any open bracket children for ``symbol`` then submit a market sell.
+
+    Mirrors ``OrderManager._cancel_bracket_children`` + ``_submit_market_close``
+    inline so Phase 3.6 doesn't depend on OrderManager's stateful setup
+    (PositionSizer, PortfolioGuard, CircuitBreaker — none of which apply to
+    a forced close).  Returns True iff the market sell was placed.
+    """
+    targets = [
+        o for o in open_orders
+        if o.get("symbol") == symbol
+        and o.get("action") == "SELL"
+        and o.get("order_type") in ("LMT", "STP", "STP LMT", "TRAIL")
+    ]
+    for o in targets:
+        order_id = o.get("order_id")
+        try:
+            loop.run_until_complete(ibkr.cancel_order(order_id))
+            log.info(
+                "[%s] Cancelled bracket child %s id=%s before timeout close",
+                symbol, o.get("order_type"), order_id,
+            )
+        except Exception as exc:
+            log.error(
+                "[%s] Could not cancel bracket child id=%s: %s — "
+                "orphan order may remain live in IBKR",
+                symbol, order_id, exc,
+            )
+
+    try:
+        loop.run_until_complete(ibkr.place_market_order(symbol, "SELL", shares))
+        log.info("[%s] Hold-timeout market close submitted (%d shares)", symbol, shares)
+        return True
+    except Exception as exc:
+        log.error("[%s] Hold-timeout market close failed: %s", symbol, exc)
+        return False
+
+
 def _phase4_risk_orders(
     actionable: list[tuple],
     equity: float,
@@ -731,6 +929,7 @@ def _phase5_summary(
     skipped_stale: int,
     longs_closed: int,
     trailing_conversions: int,
+    hold_timeouts: int,
     duration: float,
     dry_run: bool,
 ) -> None:
@@ -746,6 +945,7 @@ def _phase5_summary(
     print(f"  Skipped duplicates:    {skipped_duplicates}")
     print(f"  Skipped stale:         {skipped_stale}")
     print(f"  Trailing conversions:  {trailing_conversions}")
+    print(f"  Hold timeouts:         {hold_timeouts}")
     print(f"  Duration:              {duration:.1f}s")
 
     mode: str
@@ -770,6 +970,7 @@ def _phase5_summary(
             "skipped_stale":         skipped_stale,
             "longs_closed":          longs_closed,
             "trailing_conversions":  trailing_conversions,
+            "hold_timeouts":         hold_timeouts,
             "duration_seconds":      duration,
             "recorded_at":           now,
             "notes":                 None,
@@ -792,12 +993,13 @@ def run(dry_run: bool = True, symbol_filter: str = "") -> None:
 
     if halted:
         # Still log the aborted run
-        _phase5_summary(run_id, symbols, 0, 0, 0, 0, 0, 0, 0, 0, 0.0, dry_run)
+        _phase5_summary(run_id, symbols, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.0, dry_run)
         return
 
     _phase2_refresh(symbols)
     actionable, skipped_stale = _phase3_signals(symbols)
     trailing_conversions = _phase3_5_trailing_stops(dry_run, run_id=run_id)
+    hold_timeouts = _phase3_6_hold_timeouts(dry_run, run_id=run_id)
     approved, dry_run_logged, rejected, skipped_duplicates, longs_closed = (
         _phase4_risk_orders(actionable, equity, run_id, dry_run)
     )
@@ -814,6 +1016,7 @@ def run(dry_run: bool = True, symbol_filter: str = "") -> None:
         skipped_stale=skipped_stale,
         longs_closed=longs_closed,
         trailing_conversions=trailing_conversions,
+        hold_timeouts=hold_timeouts,
         duration=duration,
         dry_run=dry_run,
     )

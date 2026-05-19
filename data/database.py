@@ -325,6 +325,7 @@ class SignalRunnerLog(Base):
     skipped_stale         = Column(Integer, default=0)
     longs_closed          = Column(Integer, default=0)
     trailing_conversions  = Column(Integer, default=0)
+    hold_timeouts         = Column(Integer, default=0)
     duration_seconds      = Column(Float)
     recorded_at           = Column(DateTime, nullable=False)
     notes                 = Column(Text)
@@ -497,6 +498,12 @@ def _migrate(engine) -> None:
                 ))
                 conn.commit()
                 log.info("Migration applied: signal_runner_log.skipped_stale")
+            if "hold_timeouts" not in srl_cols:
+                conn.execute(text(
+                    "ALTER TABLE signal_runner_log ADD COLUMN hold_timeouts INTEGER DEFAULT 0"
+                ))
+                conn.commit()
+                log.info("Migration applied: signal_runner_log.hold_timeouts")
 
         # fundamental_data: drop UNIQUE(symbol) so the table can hold append-only
         # snapshot history (needed for derived features like analyst-target
@@ -876,6 +883,32 @@ def log_signal(record: dict) -> None:
         pass
 
 
+def get_latest_buy_signal_ts(symbol: str) -> datetime | None:
+    """
+    Return the most recent `bar_timestamp` from signal_log where the symbol
+    fired a BUY signal that passed the gate.  Used by the Phase 3.6 hold-timeout
+    rule to decide whether the model still re-confirms a held position.
+
+    Returns None if the symbol has no qualifying signal_log rows — caller
+    treats this as "no anchor for staleness" and skips the position rather
+    than flattening a manual / pre-history holding.
+    """
+    try:
+        engine = get_engine()
+        with Session(engine) as session:
+            row = (
+                session.query(SignalLog.bar_timestamp)
+                .filter(SignalLog.symbol == symbol)
+                .filter(SignalLog.signal == "BUY")
+                .filter(SignalLog.passed_gate == True)  # noqa: E712 (SQLAlchemy)
+                .order_by(SignalLog.bar_timestamp.desc())
+                .first()
+            )
+            return row[0] if row else None
+    except Exception:
+        return None
+
+
 # ── Ensemble weight helpers ───────────────────────────────────────────────────
 
 def log_ensemble_weights(lstm: float, xgb: float, finbert: float,
@@ -1210,6 +1243,7 @@ def get_signal_runner_log(limit: int = 50) -> pd.DataFrame:
         "skipped_stale":        r.skipped_stale,
         "longs_closed":         r.longs_closed,
         "trailing_conversions": r.trailing_conversions,
+        "hold_timeouts":        r.hold_timeouts,
         "duration_seconds":     r.duration_seconds,
         "recorded_at":          r.recorded_at,
         "notes":                r.notes,

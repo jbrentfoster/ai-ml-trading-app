@@ -276,6 +276,23 @@ class RiskConfig:
     # bracket's original stop)
     trailing_stop_trail_atr: float = 2.0
 
+    # ── Hold timeout ──────────────────────────────────────────────────────────
+    # When True and paper_orders_enabled=True, the signal runner closes any
+    # held long that hasn't received a fresh BUY signal (signal_log row with
+    # signal='BUY' AND passed_gate=True) within the last `max_hold_days`
+    # calendar days.  Guards against positions sitting indefinitely in
+    # sparse-signal regimes where neither stop, TP, nor SELL ever fires.
+    # A held position whose most recent BUY in signal_log is older than the
+    # threshold is flattened via a market sell (bracket children cancelled
+    # first), persisted as decision='CLOSED_TIMEOUT'.  Symbols with NO BUY
+    # history at all are skipped (we have no anchor for "stale").
+    hold_timeout_enabled: bool = False
+
+    # Calendar-day threshold for the hold-timeout rule.  30 ≈ 22 trading days
+    # (~1 month) — long enough to ride out consolidation, short enough to
+    # surface positions the model no longer favours.
+    max_hold_days: int = 30
+
     # ── Walk-forward bracket simulation (Phase 4.5 — Phase A) ────────────────
     # When the walk-forward simulator fills a stop intra-bar, the realised
     # exit price is worse than the trigger by `stop_slippage_multiplier × slippage_pct`.

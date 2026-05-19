@@ -17,6 +17,7 @@ from scripts.signal_runner import (
     EQUIVALENT_PAIRS,
     _check_loss_limits_against_baseline,
     _fetch_held_long_symbols,
+    _phase3_6_hold_timeouts,
     _phase3_signals,
     _phase4_risk_orders,
 )
@@ -552,3 +553,192 @@ class TestSignalLogPersistence:
             _phase3_signals(["AAPL"])
 
         mock_log.assert_not_called()
+
+
+# ── Hold timeout (Phase 3.6) ──────────────────────────────────────────────────
+
+class TestHoldTimeout:
+    """
+    _phase3_6_hold_timeouts flattens held longs whose most recent passed-gate
+    BUY signal is older than `config.risk.max_hold_days`.  Opt-in via
+    `config.risk.hold_timeout_enabled`; skipped in dry-run / when
+    `paper_orders_enabled=False`.
+    """
+
+    def _enable(self, monkeypatch, max_days: int = 30):
+        from config.settings import config as cfg, TradingMode
+        monkeypatch.setattr(cfg.trading, "mode", TradingMode.SIMULATION)
+        monkeypatch.setattr(cfg.trading, "paper_orders_enabled", True)
+        monkeypatch.setattr(cfg.risk, "hold_timeout_enabled", True)
+        monkeypatch.setattr(cfg.risk, "max_hold_days", max_days)
+
+    def _mock_ibkr(self, positions, open_orders=None):
+        """Build an ibkr mock returning the given positions + open_orders."""
+        ibkr = MagicMock()
+        ibkr.disconnect = MagicMock(return_value=_async_value(None))
+        ibkr.get_positions = MagicMock(return_value=_async_value(positions))
+        ibkr.get_open_orders = MagicMock(return_value=_async_value(open_orders or []))
+        ibkr.place_market_order = MagicMock(return_value=_async_value(None))
+        ibkr.cancel_order = MagicMock(return_value=_async_value(True))
+        return ibkr
+
+    def test_disabled_by_default_is_noop(self, monkeypatch):
+        """hold_timeout_enabled=False → returns 0, no IBKR connect."""
+        from config.settings import config as cfg, TradingMode
+        monkeypatch.setattr(cfg.trading, "mode", TradingMode.SIMULATION)
+        monkeypatch.setattr(cfg.trading, "paper_orders_enabled", True)
+        monkeypatch.setattr(cfg.risk, "hold_timeout_enabled", False)
+
+        with patch("scripts.signal_runner._connect_ibkr_if_needed") as mock_conn:
+            count = _phase3_6_hold_timeouts(dry_run=False, run_id="x")
+
+        assert count == 0
+        mock_conn.assert_not_called()
+
+    def test_dry_run_is_noop(self, monkeypatch):
+        """dry_run=True → returns 0 even if hold_timeout_enabled=True."""
+        self._enable(monkeypatch)
+        with patch("scripts.signal_runner._connect_ibkr_if_needed") as mock_conn:
+            count = _phase3_6_hold_timeouts(dry_run=True, run_id="x")
+        assert count == 0
+        mock_conn.assert_not_called()
+
+    def test_paper_disabled_is_noop(self, monkeypatch):
+        """paper_orders_enabled=False → returns 0, no IBKR connect."""
+        from config.settings import config as cfg, TradingMode
+        monkeypatch.setattr(cfg.trading, "mode", TradingMode.SIMULATION)
+        monkeypatch.setattr(cfg.trading, "paper_orders_enabled", False)
+        monkeypatch.setattr(cfg.risk, "hold_timeout_enabled", True)
+        monkeypatch.setattr(cfg.risk, "max_hold_days", 30)
+
+        with patch("scripts.signal_runner._connect_ibkr_if_needed") as mock_conn:
+            count = _phase3_6_hold_timeouts(dry_run=False, run_id="x")
+        assert count == 0
+        mock_conn.assert_not_called()
+
+    def test_zero_max_days_is_noop(self, monkeypatch):
+        """max_hold_days=0 → returns 0 (defensive — would flatten everything)."""
+        self._enable(monkeypatch, max_days=0)
+        with patch("scripts.signal_runner._connect_ibkr_if_needed") as mock_conn:
+            count = _phase3_6_hold_timeouts(dry_run=False, run_id="x")
+        assert count == 0
+        mock_conn.assert_not_called()
+
+    def test_recent_buy_blocks_timeout(self, monkeypatch):
+        """Held long with a BUY signal within the window is NOT closed."""
+        self._enable(monkeypatch, max_days=30)
+        positions = [{"symbol": "AAPL", "quantity": 100, "avg_cost": 150.0}]
+        ibkr = self._mock_ibkr(positions)
+        loop = MagicMock()
+        # run_until_complete returns whatever coroutine result it was given —
+        # mimic by unwrapping the coroutine value.
+        loop.run_until_complete.side_effect = lambda coro: _run_coro(coro)
+
+        recent_buy = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=5)
+        with patch("scripts.signal_runner._connect_ibkr_if_needed",
+                   return_value=(ibkr, loop)), \
+             patch("scripts.signal_runner.get_latest_buy_signal_ts",
+                   return_value=recent_buy), \
+             patch("scripts.signal_runner.log_order_decision") as mock_log:
+            count = _phase3_6_hold_timeouts(dry_run=False, run_id="x")
+
+        assert count == 0
+        ibkr.place_market_order.assert_not_called()
+        mock_log.assert_not_called()
+
+    def test_stale_buy_triggers_timeout(self, monkeypatch):
+        """Held long with no BUY in `max_hold_days` is flattened + persisted."""
+        self._enable(monkeypatch, max_days=30)
+        positions = [{"symbol": "AAPL", "quantity": 100, "avg_cost": 150.0}]
+        # bracket children that should be cancelled before the market close
+        open_orders = [
+            {"symbol": "AAPL", "action": "SELL", "order_type": "LMT", "order_id": 1},
+            {"symbol": "AAPL", "action": "SELL", "order_type": "STP", "order_id": 2},
+            # Unrelated leg should NOT be cancelled
+            {"symbol": "MSFT", "action": "SELL", "order_type": "LMT", "order_id": 3},
+        ]
+        ibkr = self._mock_ibkr(positions, open_orders)
+        loop = MagicMock()
+        loop.run_until_complete.side_effect = lambda coro: _run_coro(coro)
+
+        stale_buy = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=45)
+        with patch("scripts.signal_runner._connect_ibkr_if_needed",
+                   return_value=(ibkr, loop)), \
+             patch("scripts.signal_runner.get_latest_buy_signal_ts",
+                   return_value=stale_buy), \
+             patch("scripts.signal_runner.log_order_decision") as mock_log:
+            count = _phase3_6_hold_timeouts(dry_run=False, run_id="run-1")
+
+        assert count == 1
+        # Both AAPL bracket children cancelled, MSFT untouched
+        cancel_ids = [
+            call.args[0] for call in ibkr.cancel_order.call_args_list
+        ]
+        assert 1 in cancel_ids
+        assert 2 in cancel_ids
+        assert 3 not in cancel_ids
+        # Market sell submitted for the right symbol + quantity
+        ibkr.place_market_order.assert_called_once_with("AAPL", "SELL", 100)
+        # Persisted with CLOSED_TIMEOUT
+        mock_log.assert_called_once()
+        record = mock_log.call_args[0][0]
+        assert record["symbol"]   == "AAPL"
+        assert record["decision"] == "CLOSED_TIMEOUT"
+        assert record["signal"]   == "SELL"
+        assert record["shares"]   == 100
+        assert record["run_id"]   == "run-1"
+
+    def test_no_buy_history_is_skipped(self, monkeypatch):
+        """Held long with no BUY signal in signal_log is NOT closed (manual position)."""
+        self._enable(monkeypatch, max_days=30)
+        positions = [{"symbol": "AAPL", "quantity": 100, "avg_cost": 150.0}]
+        ibkr = self._mock_ibkr(positions)
+        loop = MagicMock()
+        loop.run_until_complete.side_effect = lambda coro: _run_coro(coro)
+
+        with patch("scripts.signal_runner._connect_ibkr_if_needed",
+                   return_value=(ibkr, loop)), \
+             patch("scripts.signal_runner.get_latest_buy_signal_ts",
+                   return_value=None), \
+             patch("scripts.signal_runner.log_order_decision") as mock_log:
+            count = _phase3_6_hold_timeouts(dry_run=False, run_id="x")
+
+        assert count == 0
+        ibkr.place_market_order.assert_not_called()
+        mock_log.assert_not_called()
+
+    def test_short_positions_skipped(self, monkeypatch):
+        """Negative-quantity positions are filtered out before timeout eval."""
+        self._enable(monkeypatch, max_days=30)
+        positions = [
+            {"symbol": "AAPL", "quantity": -100, "avg_cost": 150.0},  # short
+            {"symbol": "FLAT", "quantity":    0, "avg_cost":  50.0},  # flat
+        ]
+        ibkr = self._mock_ibkr(positions)
+        loop = MagicMock()
+        loop.run_until_complete.side_effect = lambda coro: _run_coro(coro)
+
+        with patch("scripts.signal_runner._connect_ibkr_if_needed",
+                   return_value=(ibkr, loop)), \
+             patch("scripts.signal_runner.get_latest_buy_signal_ts") as mock_q, \
+             patch("scripts.signal_runner.log_order_decision") as mock_log:
+            count = _phase3_6_hold_timeouts(dry_run=False, run_id="x")
+
+        assert count == 0
+        # Should not have even asked about BUY history for short / flat
+        mock_q.assert_not_called()
+        ibkr.place_market_order.assert_not_called()
+        mock_log.assert_not_called()
+
+
+def _run_coro(coro):
+    """Drain a coroutine synchronously for tests (mock loop)."""
+    import asyncio as _aio
+    try:
+        return _aio.get_event_loop().run_until_complete(coro)
+    except RuntimeError:
+        loop = _aio.new_event_loop()
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
