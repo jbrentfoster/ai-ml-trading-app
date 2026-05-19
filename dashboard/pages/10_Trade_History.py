@@ -47,13 +47,18 @@ st.markdown(
 )
 
 # ── Filter options (driven by what's actually in trade_log) ───────────────────
-# The dedup checkbox below shares a session_state key with this query so the
-# dropdown lists only symbols/reasons present in the *current* view.  Streamlit
-# reruns the script top-to-bottom on every interaction, so reading session_state
-# here picks up the previous run's checkbox value (default True on first load).
+# The dedup + active-universe checkboxes below share session_state keys with
+# this query so the dropdown lists only symbols/reasons present in the
+# *current* view.  Streamlit reruns the script top-to-bottom on every
+# interaction, so reading session_state here picks up the previous run's
+# checkbox values (defaults True on first load).
 
-dedup_default = st.session_state.get("trade_history_dedup", True)
-opts = query_trade_log_filter_options(dedup_to_latest_run=dedup_default)
+dedup_default            = st.session_state.get("trade_history_dedup", True)
+active_universe_default  = st.session_state.get("trade_history_active_universe", True)
+opts = query_trade_log_filter_options(
+    dedup_to_latest_run=dedup_default,
+    active_universe_only=active_universe_default,
+)
 all_symbols      = opts["symbols"]
 all_exit_reasons = opts["exit_reasons"]
 all_sources      = opts["sources"]
@@ -107,6 +112,26 @@ with st.sidebar:
         options=all_exit_reasons,
         default=[],
         help="Empty = all exit reasons.  stop / tp / trailing / signal_flip / fold_end / manual_close.",
+    )
+
+    # Active-universe toggle — defaults ON because walk_forward_results
+    # never deletes rows when a symbol leaves the universe, so the deduped
+    # view keeps surfacing trades from symbols the system no longer tracks.
+    # OFF = full historical record across all symbols ever trained (useful
+    # for auditing universe-rotation effects).  Live rows always pass
+    # through regardless — actual broker fills must remain in the historical
+    # record for tax purposes even when a symbol rotates out.
+    active_universe_only = st.checkbox(
+        "Active universe only",
+        value=True,
+        key="trade_history_active_universe",
+        help=(
+            "ON (default): drop walk_forward rows for symbols not in the "
+            "current active universe.  OFF: include every symbol that has "
+            "ever been trained.  Live rows always pass through (broker fills "
+            "stay in the history regardless).  Also filters the dropdowns "
+            "above to match."
+        ),
     )
 
     # Dedup toggle — defaults ON because every weekly --force retrain inserts
@@ -212,6 +237,7 @@ filter_kwargs = dict(
     exit_reasons=tuple(selected_reasons) if selected_reasons else None,
     run_id=run_id_filter,
     dedup_to_latest_run=dedup_to_latest,
+    active_universe_only=active_universe_only,
 )
 
 trades_df = query_trade_log(**filter_kwargs)

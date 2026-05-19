@@ -720,6 +720,46 @@ def query_trailing_stop_log(
 
 # ── Trade history (closed trades from trade_log) ──────────────────────────────
 
+def _active_universe_symbols() -> set[str]:
+    """Symbols currently tracked by the system.
+
+    Active universe assets when `universe_assets` is populated (the standard
+    case once `universe_scheduler.py --run-now` has run); otherwise falls back
+    to `config.data.watchlist` so static-watchlist mode still has a tracked
+    set.  Returned upper-cased to match `trade_log.symbol` casing.
+    """
+    df = get_universe_assets(active_only=True)
+    if not df.empty and "symbol" in df.columns:
+        return {str(s).upper() for s in df["symbol"].dropna().tolist()}
+    from config.settings import config
+    return {str(s).upper() for s in config.data.watchlist if s}
+
+
+def _filter_to_active_universe(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop walk_forward rows for symbols no longer in the active universe.
+
+    Live rows (`source='live'`) always pass through — they represent actual
+    broker fills, which must remain in the historical record regardless of
+    whether the symbol is still being traded.  This is also a hard requirement
+    for tax reporting: a real closed trade cannot disappear because the
+    universe rotated.
+
+    Without this filter, every weekly universe refresh leaves stale
+    `walk_forward_results` rows from departed symbols, and the Page 10
+    dedup-by-latest-run logic picks them up indefinitely — Summary cards then
+    aggregate over a mix of current-universe and historical-only symbols,
+    which inflates totals and mixes time periods.
+    """
+    if df.empty or "symbol" not in df.columns:
+        return df
+    tracked = _active_universe_symbols()
+    if not tracked:
+        return df  # No universe info to filter against — surface everything.
+    is_live = df.get("source", pd.Series(index=df.index)).eq("live")
+    in_universe = df["symbol"].astype(str).str.upper().isin(tracked)
+    return df[is_live | in_universe].reset_index(drop=True)
+
+
 def _keep_latest_run_per_symbol(df: pd.DataFrame) -> pd.DataFrame:
     """Collapse walk_forward rows to the latest training run_id per symbol.
 
@@ -778,6 +818,7 @@ def query_trade_log(
     exit_reasons: tuple[str, ...] | None = None,
     run_id: str = "",
     dedup_to_latest_run: bool = True,
+    active_universe_only: bool = True,
 ) -> pd.DataFrame:
     """
     Return closed-trade rows from trade_log with derived columns.
@@ -804,12 +845,23 @@ def query_trade_log(
     of every closed trade onto the page and inflates summary metrics.  Pass
     `False` to see the full multi-run history (or filter by a specific run_id,
     which short-circuits the dedup).
+
+    When `active_universe_only=True` (default), walk_forward rows for symbols
+    no longer in the active universe are dropped.  Live rows always pass
+    through.  Pass `False` to see the full historical record across all
+    symbols ever trained (useful for auditing universe-rotation effects).
     """
     df = get_trade_log(source=source if source else None)
     if df.empty:
         return df
 
     df = df.copy()
+
+    if active_universe_only:
+        df = _filter_to_active_universe(df)
+
+    if df.empty:
+        return df
 
     if symbols:
         df = df[df["symbol"].isin(symbols)]
@@ -853,6 +905,7 @@ def query_trade_summary(
     exit_reasons: tuple[str, ...] | None = None,
     run_id: str = "",
     dedup_to_latest_run: bool = True,
+    active_universe_only: bool = True,
 ) -> dict:
     """
     Aggregates for the summary cards on the Trade History page.
@@ -865,6 +918,7 @@ def query_trade_summary(
         start_date=start_date, end_date=end_date,
         exit_reasons=exit_reasons, run_id=run_id,
         dedup_to_latest_run=dedup_to_latest_run,
+        active_universe_only=active_universe_only,
     )
     if df.empty:
         return {
@@ -900,6 +954,7 @@ def query_tax_breakdown(
     exit_reasons: tuple[str, ...] | None = None,
     run_id: str = "",
     dedup_to_latest_run: bool = True,
+    active_universe_only: bool = True,
 ) -> dict:
     """
     Short-term vs long-term realised gain/loss aggregates.
@@ -918,6 +973,7 @@ def query_tax_breakdown(
         start_date=start_date, end_date=end_date,
         exit_reasons=exit_reasons, run_id=run_id,
         dedup_to_latest_run=dedup_to_latest_run,
+        active_universe_only=active_universe_only,
     )
     if df.empty:
         return {
@@ -943,25 +999,37 @@ def query_tax_breakdown(
 
 
 @st.cache_data(ttl=300)
-def query_trade_log_filter_options(dedup_to_latest_run: bool = True) -> dict:
+def query_trade_log_filter_options(
+    dedup_to_latest_run: bool = True,
+    active_universe_only: bool = True,
+) -> dict:
     """
     Distinct values present in trade_log for populating page filters.
 
     Returns: {"symbols": [...], "exit_reasons": [...], "sources": [...]}
     Each list is sorted; empty lists when the table has no rows yet.
 
+    Both flags should match the page's view kwargs so the dropdown matches
+    what ``query_trade_log`` will actually return.
+
     When ``dedup_to_latest_run=True`` (default), walk_forward rows are first
     collapsed to the latest training run per symbol via
-    ``_keep_latest_run_per_symbol`` so the dropdown matches what
-    ``query_trade_log`` will actually return.  Without this, symbols whose
-    latest WF run produced zero closed trades (e.g. long-only gate
-    suppressing every SELL signal) stayed selectable in the dropdown but
-    yielded an empty table — caused user confusion observed during the
-    2026-05-04 long-only gate verification.
+    ``_keep_latest_run_per_symbol``.  Without this, symbols whose latest WF
+    run produced zero closed trades stayed selectable in the dropdown but
+    yielded an empty table (observed 2026-05-04 during long-only gate
+    verification).
+
+    When ``active_universe_only=True`` (default), walk_forward rows for
+    symbols not in the active universe are dropped before extracting the
+    distinct lists.  Live rows always pass through.
     """
     df = get_trade_log()
     if df.empty:
         return {"symbols": [], "exit_reasons": [], "sources": []}
+    if active_universe_only:
+        df = _filter_to_active_universe(df)
+        if df.empty:
+            return {"symbols": [], "exit_reasons": [], "sources": []}
     if dedup_to_latest_run:
         df = _keep_latest_run_per_symbol(df)
         if df.empty:

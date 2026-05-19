@@ -140,7 +140,7 @@ class TestQueryTradeLogDerivedColumns:
         from data.ui_queries import query_trade_log
 
         expected = _seed_trade(mem_engine)
-        df = query_trade_log(dedup_to_latest_run=False)
+        df = query_trade_log(dedup_to_latest_run=False, active_universe_only=False)
         assert len(df) == 1
         row = df.iloc[0]
         assert row["net_pnl"] == pytest.approx(expected["expected_net"])
@@ -156,7 +156,7 @@ class TestQueryTradeLogDerivedColumns:
         from data.ui_queries import query_trade_log
 
         expected = _seed_trade(mem_engine)
-        df = query_trade_log(dedup_to_latest_run=False)
+        df = query_trade_log(dedup_to_latest_run=False, active_universe_only=False)
         row = df.iloc[0]
         assert row["gross_pnl"] == pytest.approx(expected["expected_gross"])
         assert row["gross_pnl"] == pytest.approx(row["pnl"] + row["costs_charged"])
@@ -166,7 +166,7 @@ class TestQueryTradeLogDerivedColumns:
         from data.ui_queries import query_trade_log
 
         _seed_trade(mem_engine)
-        df = query_trade_log(dedup_to_latest_run=False)
+        df = query_trade_log(dedup_to_latest_run=False, active_universe_only=False)
         row = df.iloc[0]
         assert row["gross_pnl"] - row["costs_charged"] == pytest.approx(row["net_pnl"])
 
@@ -186,7 +186,7 @@ class TestQueryTradeLogDerivedColumns:
             costs_pct=0.002014,
             exit_reason="fold_end",
         )
-        df = query_trade_log(dedup_to_latest_run=False)
+        df = query_trade_log(dedup_to_latest_run=False, active_universe_only=False)
         row = df.iloc[0]
 
         assert row["net_pnl"]   == pytest.approx(expected["expected_net"],   abs=0.01)
@@ -216,7 +216,7 @@ class TestQueryTradeSummary:
             exit_reason="fold_end",
         )
 
-        s = query_trade_summary(dedup_to_latest_run=False)
+        s = query_trade_summary(dedup_to_latest_run=False, active_universe_only=False)
         assert s["n_trades"] == 2
 
         expected_net   = e1["expected_net"]   + e2["expected_net"]
@@ -255,7 +255,141 @@ class TestQueryTradeSummary:
             exit_reason="signal_flip",
         )
 
-        s = query_trade_summary(dedup_to_latest_run=False)
+        s = query_trade_summary(dedup_to_latest_run=False, active_universe_only=False)
         assert s["n_trades"] == 2
         # Exactly 1 net winner — the fee_loser is correctly classified as a loss.
         assert s["win_rate"] == pytest.approx(0.5)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# active_universe_only filter
+#
+# Page 10's "Active universe only" checkbox (default ON) drops walk_forward
+# rows for symbols no longer tracked, but always passes through live rows so
+# real broker fills stay in the historical record for tax purposes.  Without
+# this filter, the Page 10 Summary aggregates over a mix of current-universe
+# and historical-only symbols, inflating totals and mixing time periods.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _seed_universe(engine, symbols: list[str], active: bool = True) -> None:
+    """Insert `universe_assets` rows so `_filter_to_active_universe` sees them."""
+    from data.database import UniverseAsset
+
+    with Session(engine) as session:
+        for sym in symbols:
+            session.add(UniverseAsset(
+                symbol=sym,
+                name=sym,
+                asset_class="us_equity",
+                exchange="TEST",
+                is_fixture=False,
+                stage=3,
+                active=active,
+                added_at=_now(),
+            ))
+        session.commit()
+
+
+class TestActiveUniverseFilter:
+
+    def test_walk_forward_row_in_universe_kept(self, mem_engine):
+        """WF row whose symbol is in the active universe survives the filter."""
+        from data.ui_queries import query_trade_log
+
+        _seed_universe(mem_engine, ["AAPL"], active=True)
+        _seed_trade(mem_engine, symbol="AAPL", source="walk_forward")
+
+        df = query_trade_log(active_universe_only=True, dedup_to_latest_run=False)
+        assert len(df) == 1
+        assert df.iloc[0]["symbol"] == "AAPL"
+
+    def test_walk_forward_row_not_in_universe_dropped(self, mem_engine):
+        """WF row for a departed symbol is dropped when the filter is ON."""
+        from data.ui_queries import query_trade_log
+
+        _seed_universe(mem_engine, ["AAPL"], active=True)
+        _seed_trade(mem_engine, symbol="AAPL", source="walk_forward", run_id="r-keep")
+        _seed_trade(mem_engine, symbol="MMM",  source="walk_forward", run_id="r-drop")
+
+        df_on  = query_trade_log(active_universe_only=True,  dedup_to_latest_run=False)
+        df_off = query_trade_log(active_universe_only=False, dedup_to_latest_run=False)
+
+        assert set(df_on["symbol"])  == {"AAPL"}
+        assert set(df_off["symbol"]) == {"AAPL", "MMM"}
+
+    def test_live_row_always_passes_through(self, mem_engine):
+        """Live broker fills must survive the filter even when their symbol
+        has rotated out of the universe — required for tax-reporting fidelity."""
+        from data.ui_queries import query_trade_log
+
+        _seed_universe(mem_engine, ["AAPL"], active=True)
+        _seed_trade(mem_engine, symbol="MMM", source="live", run_id="r-live")
+
+        df = query_trade_log(active_universe_only=True, dedup_to_latest_run=False)
+        assert len(df) == 1
+        assert df.iloc[0]["symbol"] == "MMM"
+        assert df.iloc[0]["source"] == "live"
+
+    def test_empty_universe_falls_back_to_watchlist(self, mem_engine, monkeypatch):
+        """When `universe_assets` is empty, the filter falls back to
+        `config.data.watchlist` so static-watchlist mode still works."""
+        from data.ui_queries import query_trade_log
+        from config.settings import config
+
+        # No universe_assets rows seeded — relies on watchlist fallback.
+        monkeypatch.setattr(config.data, "watchlist", ["WLST"])
+
+        _seed_trade(mem_engine, symbol="WLST", source="walk_forward", run_id="r-w")
+        _seed_trade(mem_engine, symbol="GONE", source="walk_forward", run_id="r-g")
+
+        df = query_trade_log(active_universe_only=True, dedup_to_latest_run=False)
+        assert set(df["symbol"]) == {"WLST"}
+
+    def test_summary_aggregates_only_active_universe(self, mem_engine):
+        """The Summary cards' totals must come from active-universe trades
+        only when the filter is ON — this is the headline fix.  Off would
+        include the departed symbol and inflate net P&L."""
+        from data.ui_queries import query_trade_summary
+
+        _seed_universe(mem_engine, ["AAPL"], active=True)
+
+        # AAPL: a clear winner under the active universe.
+        keeper = _seed_trade(
+            mem_engine, symbol="AAPL", run_id="r-keep",
+            entry_px=100.0, exit_px=110.0, shares=100.0,
+            pnl_pct=0.095, costs_pct=0.005, exit_reason="tp",
+        )
+        # MMM: a departed-symbol winner that should NOT show up in totals.
+        _seed_trade(
+            mem_engine, symbol="MMM", run_id="r-drop",
+            entry_px=100.0, exit_px=120.0, shares=100.0,
+            pnl_pct=0.195, costs_pct=0.005, exit_reason="tp",
+        )
+
+        s_on  = query_trade_summary(active_universe_only=True,  dedup_to_latest_run=False)
+        s_off = query_trade_summary(active_universe_only=False, dedup_to_latest_run=False)
+
+        assert s_on["n_trades"] == 1
+        assert s_on["net_pnl"] == pytest.approx(keeper["expected_net"], abs=0.01)
+
+        assert s_off["n_trades"] == 2
+        # OFF must produce strictly larger net P&L (MMM is a winner too).
+        assert s_off["net_pnl"] > s_on["net_pnl"]
+
+    def test_filter_options_match_view(self, mem_engine):
+        """The dropdown symbol list must reflect the same active-universe
+        filter as the table itself — otherwise users see selectable symbols
+        that yield empty tables (the same UX bug that 2026-05-04 fixed for
+        the dedup case)."""
+        from data.ui_queries import query_trade_log_filter_options
+
+        _seed_universe(mem_engine, ["AAPL"], active=True)
+        _seed_trade(mem_engine, symbol="AAPL", source="walk_forward", run_id="r-a")
+        _seed_trade(mem_engine, symbol="MMM",  source="walk_forward", run_id="r-m")
+
+        opts_on  = query_trade_log_filter_options(active_universe_only=True,
+                                                  dedup_to_latest_run=False)
+        opts_off = query_trade_log_filter_options(active_universe_only=False,
+                                                  dedup_to_latest_run=False)
+        assert opts_on["symbols"]  == ["AAPL"]
+        assert set(opts_off["symbols"]) == {"AAPL", "MMM"}
