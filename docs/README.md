@@ -21,6 +21,14 @@ Tutorials and reference guides for the AI Trading App. Each document is self-con
 
 ---
 
+## Process
+
+| Document | What it covers |
+|----------|----------------|
+| [Review system](review-system.md) | How daily/weekly logs and individual trades flow through the review skills (`/daily-run-review`, `/weekly-run-review`, `/trade-case-study`) into `followups.md`, CLAUDE.md, CHANGELOG.md, and `case_studies/` |
+
+---
+
 ## Quick reference
 
 - **Running the system:** see the project [README](../README.md)
