@@ -365,6 +365,72 @@ class TestFormatKellyFstar:
         assert MLWalkForwardOrchestrator._format_kelly_fstar(None) == "n/a"
 
 
+class TestComputeFoldPerformanceAnnualisation:
+    """Pin that ``_compute_fold_performance`` annualises Sharpe / CAGR via the
+    passed ``bars_per_year`` rather than the previously-hardcoded 252.  The
+    daily-bar default is preserved so existing runs are unaffected; explicit
+    values exercise the parameterisation path for future 1h / 15m runs."""
+
+    def test_default_bars_per_year_is_252(self):
+        """No arg → daily (252) behaviour matches the prior hardcoded path."""
+        from models.walk_forward import MLWalkForwardOrchestrator
+        # Build a small, non-degenerate return series (std > 0 to avoid the
+        # early-return branch).
+        returns = pd.Series([0.01, -0.005, 0.015, -0.003, 0.008])
+        perf = MLWalkForwardOrchestrator._compute_fold_performance(
+            returns=returns, signals=[]
+        )
+        expected_sharpe = float(returns.mean() / returns.std() * (252 ** 0.5))
+        assert perf["sharpe_ratio"] == pytest.approx(expected_sharpe, rel=1e-9)
+
+    def test_hourly_bars_per_year_scales_sharpe(self):
+        """1h US-RTH (≈1638) annualises Sharpe by √1638, not √252."""
+        from models.walk_forward import MLWalkForwardOrchestrator
+        returns = pd.Series([0.001, -0.0005, 0.0015, -0.0003, 0.0008])
+        perf = MLWalkForwardOrchestrator._compute_fold_performance(
+            returns=returns, signals=[], bars_per_year=1638,
+        )
+        expected_sharpe = float(returns.mean() / returns.std() * (1638 ** 0.5))
+        assert perf["sharpe_ratio"] == pytest.approx(expected_sharpe, rel=1e-9)
+
+    def test_bars_per_year_threads_through_cagr(self):
+        """``annualized_return`` uses bars_per_year, not 252.  Constant +1%
+        per bar over 21 bars: CAGR depends on (1.01)^(bpy / 21)."""
+        from models.walk_forward import MLWalkForwardOrchestrator
+        returns = pd.Series([0.01] * 21)
+        # Daily case
+        daily = MLWalkForwardOrchestrator._compute_fold_performance(
+            returns=returns, signals=[], bars_per_year=252,
+        )
+        # Hourly case — same per-bar return, more bars per year ⇒ higher CAGR
+        hourly = MLWalkForwardOrchestrator._compute_fold_performance(
+            returns=returns, signals=[], bars_per_year=1638,
+        )
+        total_r = float((1 + returns).cumprod().iloc[-1] - 1)
+        assert daily["annualized_return"] == pytest.approx(
+            (1 + total_r) ** (252 / 21) - 1, rel=1e-9
+        )
+        assert hourly["annualized_return"] == pytest.approx(
+            (1 + total_r) ** (1638 / 21) - 1, rel=1e-9
+        )
+        assert hourly["annualized_return"] > daily["annualized_return"]
+
+    def test_orchestrator_threads_bars_per_year(self):
+        """Constructor's ``bars_per_year`` is stored and propagated."""
+        from models.walk_forward import MLWalkForwardOrchestrator
+        orch = MLWalkForwardOrchestrator(symbol="TEST", bars_per_year=1638)
+        assert orch._bars_per_year == 1638
+
+    def test_orchestrator_default_bars_per_year(self):
+        """Default ctor value matches the module-level daily constant."""
+        from models.walk_forward import (
+            MLWalkForwardOrchestrator,
+            _BARS_PER_YEAR_DAILY,
+        )
+        orch = MLWalkForwardOrchestrator(symbol="TEST")
+        assert orch._bars_per_year == _BARS_PER_YEAR_DAILY == 252
+
+
 class TestUniversePolicyTagging:
     """Pin that `walk_forward_results.universe_policy` reflects whether the run
     was driven by UniverseSelector (`dynamic`, biased) or the static watchlist

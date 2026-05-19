@@ -36,6 +36,12 @@ if TYPE_CHECKING:
 
 log = get_logger("models.walk_forward")
 
+# Annualisation factor for Sharpe / total-return → CAGR conversions in
+# ``_compute_fold_performance``. 252 trading days/year for daily bars; pass a
+# different value to the orchestrator for non-daily intervals (e.g. ~1638 for
+# 1h US RTH = 252 × 6.5, ~6552 for 15m = 252 × 26).
+_BARS_PER_YEAR_DAILY = 252
+
 
 class MLWalkForwardOrchestrator:
     """
@@ -48,7 +54,8 @@ class MLWalkForwardOrchestrator:
     """
 
     def __init__(self, symbol: str,
-                 universe_selector: UniverseSelector | None = None) -> None:
+                 universe_selector: UniverseSelector | None = None,
+                 bars_per_year: int = _BARS_PER_YEAR_DAILY) -> None:
         cfg = config.ml
         self._symbol   = symbol
         self._splitter = WalkForwardSplit(
@@ -62,6 +69,7 @@ class MLWalkForwardOrchestrator:
         self._ensemble: EnsembleModel | None = None
         self._run_id            = str(uuid.uuid4())
         self._universe_selector = universe_selector
+        self._bars_per_year     = bars_per_year
 
     def _resolve_news_cutoff(self) -> datetime | None:
         """Resolve the effective ``news_available_from`` cutoff for this run.
@@ -216,7 +224,9 @@ class MLWalkForwardOrchestrator:
                 run_id=self._run_id,
             )
 
-            perf = self._compute_fold_performance(fold_returns, signals)
+            perf = self._compute_fold_performance(
+                fold_returns, signals, bars_per_year=self._bars_per_year,
+            )
 
             n_bars = len(fold.test_df)
             covered_bars = round(finbert_coverage * n_bars)
@@ -715,8 +725,17 @@ class MLWalkForwardOrchestrator:
         return signals, return_series, finbert_coverage, trades
 
     @staticmethod
-    def _compute_fold_performance(returns: pd.Series, signals: list[SignalResult]) -> dict:
-        """Aggregate performance metrics for one fold."""
+    def _compute_fold_performance(
+        returns: pd.Series,
+        signals: list[SignalResult],
+        bars_per_year: int = _BARS_PER_YEAR_DAILY,
+    ) -> dict:
+        """Aggregate performance metrics for one fold.
+
+        ``bars_per_year`` annualises Sharpe and converts the fold's total
+        return to a CAGR; defaults to 252 (daily). Pass ~1638 for 1h bars
+        (US RTH = 252 × 6.5) or ~6552 for 15m (252 × 26).
+        """
         import numpy as np
 
         if returns.empty or returns.std() == 0:
@@ -731,8 +750,8 @@ class MLWalkForwardOrchestrator:
         cum      = (1 + returns).cumprod()
         total_r  = float(cum.iloc[-1] - 1)
         n_bars   = len(returns)
-        ann_r    = float((1 + total_r) ** (252 / max(n_bars, 1)) - 1)
-        sharpe   = float(returns.mean() / returns.std() * (252 ** 0.5))
+        ann_r    = float((1 + total_r) ** (bars_per_year / max(n_bars, 1)) - 1)
+        sharpe   = float(returns.mean() / returns.std() * (bars_per_year ** 0.5))
 
         roll_max = cum.cummax()
         drawdown = (cum - roll_max) / roll_max
