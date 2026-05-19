@@ -109,16 +109,35 @@ def _card_metric_html(
 def _enrich_positions(
     positions: list[dict],
     risk_levels: dict[str, dict] | None = None,
+    open_orders: list[dict] | None = None,
 ) -> pd.DataFrame:
     """
-    Enrich positions with live price data (via yfinance) and, when available,
-    risk levels (entry limit, stop-loss, take-profit) from order_decisions.
+    Enrich positions with live price data (via yfinance), risk levels from
+    `order_decisions`, and live order state from IBKR.
+
+    Cross-referencing matters when a bracket has been mutated — e.g. once
+    `TrailingStopManager` converts a bracket TP → standalone TRAIL, the
+    original LMT and STP legs are cancelled at IBKR.  Without the cross-ref
+    the page would render the cancelled prices as if they were live, which
+    is what surfaced as the stale `Take Profit $159.44 (-6.0% away)` card
+    on SNOW (2026-05-19): the position had converted to TRAIL on 2026-05-07
+    so the original bracket no longer existed.
+
+    Resolution rules per symbol (against open_orders filtered to action='SELL'):
+      * Active SELL LMT  → bracket TP still live   → keep `take_profit`
+      * Active SELL STP/STP LMT → bracket stop still live → keep `stop_loss`
+      * No matching leg  → blank that column (rendered as "—" downstream)
+      * Active SELL TRAIL → surface `trail_amount` (= auxPrice = trail
+                            distance) and best-effort `trail_trigger`
+                            (= trailStopPrice = current ratcheting trigger,
+                            None until IBKR sends the first update)
 
     Adds columns:
       current_price, market_value, unrealized_pnl, pnl_pct,
       entry_limit, stop_loss, take_profit,
       stop_dist_pct (% above stop — lower = closer to being stopped out),
-      tp_dist_pct   (% below take-profit — lower = closer to target).
+      tp_dist_pct   (% below take-profit — lower = closer to target),
+      trail_amount, trail_trigger, trail_dist_pct.
     """
     if not positions:
         return pd.DataFrame()
@@ -148,7 +167,7 @@ def _enrich_positions(
         axis=1,
     )
 
-    # ── Risk levels from order_decisions ─────────────────────────────────────
+    # ── Risk levels from order_decisions (the original bracket prices) ───────
     rl = risk_levels or {}
 
     def _rl(sym: str, key: str):
@@ -157,6 +176,48 @@ def _enrich_positions(
     df["entry_limit"] = df["symbol"].apply(lambda s: _rl(s, "entry_price"))
     df["stop_loss"]   = df["symbol"].apply(lambda s: _rl(s, "stop_price"))
     df["take_profit"] = df["symbol"].apply(lambda s: _rl(s, "take_profit_price"))
+
+    # ── Cross-reference live open orders ─────────────────────────────────────
+    # Index orders by symbol so we can check each position cheaply.
+    orders_by_sym: dict[str, list[dict]] = {}
+    for o in (open_orders or []):
+        if o.get("action") != "SELL":
+            continue
+        orders_by_sym.setdefault(o["symbol"], []).append(o)
+
+    def _has_active_tp(sym: str) -> bool:
+        return any(o.get("order_type") == "LMT" for o in orders_by_sym.get(sym, []))
+
+    def _has_active_stop(sym: str) -> bool:
+        return any(
+            o.get("order_type") in ("STP", "STP LMT")
+            for o in orders_by_sym.get(sym, [])
+        )
+
+    def _trail_amount(sym: str) -> float | None:
+        for o in orders_by_sym.get(sym, []):
+            if o.get("order_type") == "TRAIL":
+                v = o.get("stop_price")  # auxPrice = trail distance
+                return float(v) if v is not None else None
+        return None
+
+    def _trail_trigger(sym: str) -> float | None:
+        for o in orders_by_sym.get(sym, []):
+            if o.get("order_type") == "TRAIL":
+                v = o.get("trail_stop_price")
+                return float(v) if v is not None else None
+        return None
+
+    # Blank stop/TP for positions whose bracket leg no longer exists at IBKR.
+    # When `open_orders` is None we have no information to disprove the leg —
+    # leave the prices as-is for backwards compatibility (e.g. tests that
+    # don't supply orders, or a transient IBKR fetch failure).
+    if open_orders is not None:
+        df.loc[~df["symbol"].apply(_has_active_tp),   "take_profit"] = None
+        df.loc[~df["symbol"].apply(_has_active_stop), "stop_loss"]   = None
+
+    df["trail_amount"]  = df["symbol"].apply(_trail_amount)
+    df["trail_trigger"] = df["symbol"].apply(_trail_trigger)
 
     # Distance from current price to stop / TP (long positions)
     # stop_dist_pct > 0  → price is above stop (safe)
@@ -173,15 +234,23 @@ def _enrich_positions(
             return (tp - cp) / cp * 100
         return None
 
-    df["stop_dist_pct"] = df.apply(_stop_dist, axis=1)
-    df["tp_dist_pct"]   = df.apply(_tp_dist,   axis=1)
+    def _trail_dist(row):
+        cp, tt = row["current_price"], row["trail_trigger"]
+        if cp and tt and tt > 0:
+            return (cp - tt) / cp * 100
+        return None
+
+    df["stop_dist_pct"]  = df.apply(_stop_dist,  axis=1)
+    df["tp_dist_pct"]    = df.apply(_tp_dist,    axis=1)
+    df["trail_dist_pct"] = df.apply(_trail_dist, axis=1)
 
     return df[[
         "symbol", "quantity", "avg_cost",
         "entry_limit", "stop_loss", "take_profit",
+        "trail_amount", "trail_trigger",
         "current_price", "market_value",
         "unrealized_pnl", "pnl_pct",
-        "stop_dist_pct", "tp_dist_pct",
+        "stop_dist_pct", "tp_dist_pct", "trail_dist_pct",
     ]]
 
 
@@ -295,17 +364,21 @@ if st.session_state.ibkr_data:
     else:
         symbols = [p["symbol"] for p in positions_raw]
         risk_levels = get_latest_risk_levels(symbols)
-        pos_df = _enrich_positions(positions_raw, risk_levels)
+        pos_df = _enrich_positions(positions_raw, risk_levels, data["orders"])
 
         # ── Risk-level summary cards ──────────────────────────────────────────
         # One card per position, chunked into rows of CARDS_PER_ROW.  Each card:
         #   • Current price + % vs avg cost (positive = up on the position)
-        #   • Stop Loss + % above stop (positive = safe; red when close)
-        #   • Take Profit + % remaining to target
+        #   • Stop Loss + % above stop  (hidden once the bracket STP has been
+        #     cancelled — e.g. trailing-stop conversion)
+        #   • Take Profit + % remaining (hidden once the bracket LMT is gone)
+        #   • Trailing Stop + trail distance + live trigger
+        #     (shown when a SELL TRAIL order is active for this symbol)
         CARDS_PER_ROW = 4
         has_risk_or_price = (
             pos_df["stop_loss"].notna().any()
             or pos_df["current_price"].notna().any()
+            or pos_df["trail_amount"].notna().any()
         )
         if has_risk_or_price:
             rows = [
@@ -323,17 +396,52 @@ if st.session_state.ibkr_data:
                     tp  = row["take_profit"]
                     sd  = row["stop_dist_pct"]
                     td  = row["tp_dist_pct"]
+                    ta  = row["trail_amount"]
+                    tt  = row["trail_trigger"]
+                    tdist = row["trail_dist_pct"]
                     with col.container(border=True):
                         company = query_company_name(sym)
                         company_html = (
                             f'<div style="font-size: 0.85rem; '
                             f'color: rgba(250,250,250,0.6); line-height: 1.2; '
-                            f'margin-bottom: 0.5rem;">{company}</div>'
+                            f'margin-bottom: 0.4rem;">{company}</div>'
                         ) if company else ""
+                        # State badge: every card shows one so heights stay
+                        # aligned across the row.  Three states based on the
+                        # active SELL legs cross-referenced in _enrich_positions:
+                        #   TRAILING — SELL TRAIL alive  (teal — winner;
+                        #              conversion only fires after price
+                        #              moved past activation_atr × ATR)
+                        #   BRACKET  — SELL LMT or STP/STP LMT alive
+                        #              (muted slate — standard state)
+                        #   MANUAL   — no SELL legs (washed grey — position
+                        #              has no broker-side downside protection)
+                        if pd.notna(ta):
+                            badge_label = "▸ TRAILING"
+                            badge_bg    = "#22c55e"   # vivid green — distinct
+                                                       # from BRACKET's slate
+                            badge_fg    = "white"
+                        elif pd.notna(sl) or pd.notna(tp):
+                            badge_label = "BRACKET"
+                            badge_bg    = "#3b4a5c"   # muted slate
+                            badge_fg    = "rgba(250,250,250,0.85)"
+                        else:
+                            badge_label = "MANUAL"
+                            badge_bg    = "rgba(250,250,250,0.10)"
+                            badge_fg    = "rgba(250,250,250,0.55)"
+                        badge_html = (
+                            '<div style="margin-bottom: 0.5rem;">'
+                            f'<span style="display: inline-block; padding: 0.1rem 0.5rem; '
+                            f'border-radius: 0.4rem; background-color: {badge_bg}; '
+                            f'color: {badge_fg}; font-size: 0.7rem; font-weight: 700; '
+                            f'letter-spacing: 0.05rem;">{badge_label}</span>'
+                            '</div>'
+                        )
                         st.markdown(
                             f'<div style="font-size: 1.4rem; font-weight: 700; '
                             f'line-height: 1.3; margin-bottom: 0.1rem;">{sym}</div>'
-                            f'{company_html}',
+                            f'{company_html}'
+                            f'{badge_html}',
                             unsafe_allow_html=True,
                         )
                         blocks: list[str] = []
@@ -358,9 +466,46 @@ if st.session_state.ibkr_data:
                                 delta=f"{td:+.1f}% away" if pd.notna(td) else None,
                                 mode="off",
                             ))
+                        if pd.notna(ta):
+                            # Split the trailing info across two blocks so the
+                            # card has the same vertical footprint as a normal
+                            # 3-block card (Current + Stop + TP).  Without the
+                            # split, trailing cards rendered ~1 block shorter
+                            # and broke row alignment.
+                            #
+                            # Block A — Trailing Stop trigger:
+                            #   Live trigger is only present after IBKR sends
+                            #   the first ratchet update; until then, render a
+                            #   "pending" placeholder rather than a misleading
+                            #   $0.00.
+                            if pd.notna(tt):
+                                trig_value = f"${tt:,.2f}"
+                                trig_delta = (
+                                    f"{tdist:+.1f}% above" if pd.notna(tdist) else None
+                                )
+                                trig_mode  = "normal"
+                            else:
+                                trig_value = "pending"
+                                trig_delta = "awaiting IBKR update"
+                                trig_mode  = "off"
+                            blocks.append(_card_metric_html(
+                                label="Trailing Stop",
+                                value=trig_value,
+                                delta=trig_delta,
+                                mode=trig_mode,
+                            ))
+                            # Block B — Trail Distance: replaces the Take
+                            # Profit slot since trailing positions have no
+                            # upside cap.
+                            blocks.append(_card_metric_html(
+                                label="Trail Distance",
+                                value=f"${ta:,.2f}",
+                                delta="no upside cap",
+                                mode="off",
+                            ))
                         if blocks:
                             st.markdown("".join(blocks), unsafe_allow_html=True)
-                        elif pd.isna(sl) and pd.isna(tp) and pd.isna(cp):
+                        elif pd.isna(sl) and pd.isna(tp) and pd.isna(cp) and pd.isna(ta):
                             st.caption("No price or risk data")
 
         st.markdown("")
@@ -373,6 +518,8 @@ if st.session_state.ibkr_data:
             "entry_limit":   "Entry Limit",
             "stop_loss":     "Stop Loss",
             "take_profit":   "Take Profit",
+            "trail_amount":  "Trail $",
+            "trail_trigger": "Trail Trig",
             "current_price": "Current",
             "market_value":  "Mkt Value",
             "unrealized_pnl":"Unreal. P&L",
@@ -380,7 +527,7 @@ if st.session_state.ibkr_data:
             "stop_dist_pct": "→ Stop %",
             "tp_dist_pct":   "→ TP %",
         }
-        display_df = pos_df.rename(columns=rename)
+        display_df = pos_df.rename(columns=rename).drop(columns=["trail_dist_pct"])
 
         def _colour_pnl(val) -> str:
             if pd.isna(val):
@@ -403,6 +550,8 @@ if st.session_state.ibkr_data:
             "Entry Limit": "${:,.2f}",
             "Stop Loss":   "${:,.2f}",
             "Take Profit": "${:,.2f}",
+            "Trail $":     "${:,.2f}",
+            "Trail Trig":  "${:,.2f}",
             "Current":     "${:,.2f}",
             "Mkt Value":   "${:,.2f}",
             "Unreal. P&L": "${:+,.2f}",
@@ -420,10 +569,13 @@ if st.session_state.ibkr_data:
 
         st.caption(
             "**Entry Limit / Stop Loss / Take Profit** are the prices set by the signal runner "
-            "when the position was opened (from `order_decisions` table).  "
+            "when the position was opened (from `order_decisions` table) — shown as **—** once "
+            "the bracket leg has been cancelled at IBKR (e.g. trailing-stop conversion). "
+            "**Trail $** is the trail distance and **Trail Trig** is IBKR's current ratcheting "
+            "trigger; both populate once a position converts to a TRAIL order. "
             "**→ Stop %** = how far the current price is above the stop-loss — "
-            "red < 5 %, amber 5–10 %, green > 10 %.  "
-            "**→ TP %** = remaining upside to the take-profit target.  "
+            "red < 5 %, amber 5–10 %, green > 10 %. "
+            "**→ TP %** = remaining upside to the take-profit target. "
             "Live prices are fetched from Yahoo Finance."
         )
 

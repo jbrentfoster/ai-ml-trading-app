@@ -532,17 +532,27 @@ class IBKRConnection:
             # STP / STP LMT carry the trigger price in auxPrice, not lmtPrice.
             if otype in ("STP", "STP LMT") and lmt is None:
                 lmt = None  # keep limit blank; stop_price below carries the trigger
+            # TRAIL orders ratchet a live stop trigger as the price moves
+            # favourably.  ib_insync exposes the current trigger as
+            # ``trailStopPrice`` (None until IBKR confirms the first update).
+            # auxPrice on TRAIL is the trail *distance* (carried as stop_price
+            # above for backward compat); trail_stop_price is the live trigger.
+            trail_trigger = (
+                _clean(getattr(t.order, "trailStopPrice", None))
+                if otype == "TRAIL" else None
+            )
             result.append({
-                "order_id":    t.order.orderId,
-                "symbol":      t.contract.symbol,
-                "action":      t.order.action,
-                "quantity":    t.order.totalQuantity,
-                "order_type":  otype,
-                "limit_price": lmt,
-                "stop_price":  stop,
-                "status":      t.orderStatus.status,
-                "filled":      t.orderStatus.filled,
-                "remaining":   t.orderStatus.remaining,
+                "order_id":         t.order.orderId,
+                "symbol":           t.contract.symbol,
+                "action":           t.order.action,
+                "quantity":         t.order.totalQuantity,
+                "order_type":       otype,
+                "limit_price":      lmt,
+                "stop_price":       stop,
+                "trail_stop_price": trail_trigger,
+                "status":           t.orderStatus.status,
+                "filled":           t.orderStatus.filled,
+                "remaining":        t.orderStatus.remaining,
             })
         return result
 
