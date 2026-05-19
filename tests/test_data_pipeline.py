@@ -146,3 +146,115 @@ class TestIndicatorEngine:
         df = engine.run("AAPL")
 
         assert df.empty
+
+
+# ── upsert_bars / upsert_indicators overwrite path (in-memory SQLite) ─────────
+
+@pytest.fixture()
+def mem_engine(monkeypatch):
+    """Replace get_engine() with an in-memory SQLite engine for the test."""
+    from sqlalchemy import create_engine
+    from data.database import Base
+
+    engine = create_engine("sqlite:///:memory:", echo=False)
+    Base.metadata.create_all(engine)
+    monkeypatch.setattr("data.database._engine", engine)
+    yield engine
+
+
+class TestUpsertBarsOverwrite:
+    """
+    Pins the overwrite semantics added 2026-05-19 for the end-of-day refresh
+    script.  The default behaviour (skip existing rows) must stay intact; the
+    new overwrite=True path must update OHLCV in place so refresh_recent_bars
+    can replace mid-day partial bars with the final post-close values.
+    """
+
+    def _bar(self, close: float, high: float, low: float):
+        return pd.DataFrame(
+            {"Open": [close - 0.1], "High": [high], "Low": [low],
+             "Close": [close], "Volume": [1_000_000.0]},
+            index=pd.DatetimeIndex([datetime(2026, 5, 15)], name="timestamp"),
+        )
+
+    def test_default_skips_existing_row(self, mem_engine):
+        from data.database import upsert_bars, get_bars
+
+        # First write
+        assert upsert_bars(self._bar(100.0, 101.0, 99.0), "TEST", "1d") == 1
+
+        # Second write with different OHLC — should be skipped (return 0)
+        assert upsert_bars(self._bar(200.0, 250.0, 50.0), "TEST", "1d") == 0
+
+        stored = get_bars("TEST", "1d")
+        assert stored.iloc[-1]["Close"] == 100.0  # original retained
+        assert stored.iloc[-1]["Low"]   == 99.0   # original Low retained
+
+    def test_overwrite_updates_existing_row_in_place(self, mem_engine):
+        from data.database import upsert_bars, get_bars
+
+        # Seed a mid-day partial bar (the stale_low > true_low scenario from CLAUDE.md)
+        assert upsert_bars(self._bar(100.0, 101.0, 98.0), "TEST", "1d") == 1
+
+        # End-of-day refresh: true low is lower (intraday excursion that hit a stop)
+        n = upsert_bars(self._bar(99.5, 102.0, 95.0), "TEST", "1d", overwrite=True)
+        assert n == 1  # row was UPDATE'd, not inserted
+
+        stored = get_bars("TEST", "1d")
+        assert len(stored) == 1
+        assert stored.iloc[-1]["Close"] == 99.5   # overwritten
+        assert stored.iloc[-1]["High"]  == 102.0  # overwritten
+        assert stored.iloc[-1]["Low"]   == 95.0   # overwritten — the canary
+
+    def test_overwrite_inserts_new_rows_too(self, mem_engine):
+        """Mixed batch (some existing, some new) — both paths fire under overwrite=True."""
+        from data.database import upsert_bars, get_bars
+
+        upsert_bars(self._bar(100.0, 101.0, 99.0), "TEST", "1d")  # seed bar @ 2026-05-15
+
+        # Two-row update: bar 2026-05-15 already exists (UPDATE), bar 2026-05-16 doesn't (INSERT)
+        df = pd.DataFrame(
+            {"Open": [99.9, 100.5], "High": [102.0, 103.0], "Low": [95.0, 99.0],
+             "Close": [99.5, 102.0], "Volume": [1_000_000.0, 1_200_000.0]},
+            index=pd.DatetimeIndex(
+                [datetime(2026, 5, 15), datetime(2026, 5, 16)], name="timestamp",
+            ),
+        )
+        n = upsert_bars(df, "TEST", "1d", overwrite=True)
+        assert n == 2  # 1 update + 1 insert
+
+        stored = get_bars("TEST", "1d")
+        assert len(stored) == 2
+        # Confirm the older bar was updated, not duplicated
+        may15 = stored[stored.index == datetime(2026, 5, 15)]
+        assert len(may15) == 1
+        assert may15.iloc[0]["Low"] == 95.0
+
+
+class TestUpsertIndicatorsOverwrite:
+    """Same contract for indicator snapshots — refresh script depends on it."""
+
+    def _ind(self, rsi: float):
+        return pd.DataFrame(
+            {"rsi_14": [rsi], "macd": [0.5], "atr_14": [1.0]},
+            index=pd.DatetimeIndex([datetime(2026, 5, 15)], name="timestamp"),
+        )
+
+    def test_default_skips_existing_indicator_row(self, mem_engine):
+        from data.database import upsert_indicators, get_latest_indicators
+
+        assert upsert_indicators(self._ind(50.0), "TEST", "1d") == 1
+        assert upsert_indicators(self._ind(75.0), "TEST", "1d") == 0
+
+        latest = get_latest_indicators("TEST", "1d")
+        assert latest is not None and latest["rsi_14"] == 50.0
+
+    def test_overwrite_updates_indicator_row_in_place(self, mem_engine):
+        from data.database import upsert_indicators, get_latest_indicators
+
+        upsert_indicators(self._ind(50.0), "TEST", "1d")
+        n = upsert_indicators(self._ind(75.0), "TEST", "1d", overwrite=True)
+        assert n == 1
+
+        latest = get_latest_indicators("TEST", "1d")
+        assert latest is not None and latest["rsi_14"] == 75.0

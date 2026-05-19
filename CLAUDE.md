@@ -65,6 +65,11 @@ python scripts/signal_runner.py --symbol AAPL     # single symbol
 python scripts/signal_runner.py --no-dry-run      # submit orders (paper_orders_enabled must be True)
 python scripts/signal_runner.py --schedule        # run forever at 09:35 Mon-Fri (manual use only; called automatically by batch files)
 
+# End-of-day bar refresh (overwrite mid-day partial bars with post-close values)
+python scripts/refresh_recent_bars.py              # default: last 5 days, current universe + recently-acted + held
+python scripts/refresh_recent_bars.py --days 10    # wider backfill window
+python scripts/refresh_recent_bars.py --no-ibkr    # skip IBKR-positions union (use when Gateway down)
+
 # Verify Step 2 data pipeline end-to-end
 python scripts/verify_pipeline.py
 
@@ -102,6 +107,9 @@ trading_app/
 │                              logs to logs/daily/daily_run_YYYYMMDD.log
 ├── run_weekly.bat           — Sunday scheduler: run_pipeline.py → train_models.py --force →
 │                              universe_scheduler.py --run-now; logs to logs/weekly/weekly_run_YYYYMMDD.log
+├── run_eod.bat              — Mon–Fri post-close scheduler (16:30 ET): refresh_recent_bars.py;
+│                              logs to logs/eod/eod_run_YYYYMMDD.log.  Wire via Windows Task Scheduler
+│                              separately from run_daily.bat (which fires pre-market at 09:40 ET).
 │
 ├── scripts/                 — all user-invokable CLI entry points (importable as the `scripts` package).
 │   │                          Run any of them from the project root with `python scripts/<name>.py`.
@@ -120,6 +128,15 @@ trading_app/
 │   │                          orders — requires IB Gateway + trading.paper_orders_enabled=True),
 │   │                          --symbol, --schedule flags.  Bracket orders submitted GTC with prices
 │   │                          rounded to $0.01 tick size.
+│   ├── refresh_recent_bars.py — End-of-day refresh: overwrites the last `--days` (default 5) of
+│   │                            OHLCV bars + indicator snapshots for the union of
+│   │                            (active universe, recently-acted symbols via order_decisions
+│   │                            last 14 days, currently-held IBKR positions).  Uses
+│   │                            upsert_bars/upsert_indicators with overwrite=True to replace
+│   │                            mid-day partial bars (written by morning signal_runner Phase 2)
+│   │                            with final post-close values from yfinance.  Tolerates IB Gateway
+│   │                            being down (--no-ibkr flag, also auto-degrades on connect failure).
+│   │                            Invoked by run_eod.bat.
 │   ├── open_orders.py       — Ops CLI: list open IBKR orders (default, read-only); add
 │   │                          --cancel plus --id / --symbol / --all to cancel
 │   ├── open_positions.py    — Ops CLI: list held IBKR positions (default, read-only); add
@@ -250,6 +267,7 @@ trading_app/
 └── logs/
     ├── daily/               — daily_run_YYYYMMDD.log (one per run_daily.bat execution)
     ├── weekly/              — weekly_run_YYYYMMDD.log (one per run_weekly.bat execution)
+    ├── eod/                 — eod_run_YYYYMMDD.log (one per run_eod.bat execution at 16:30 ET)
     └── python/
         └── trading_app.log  — rotating Python logger (WARNING+ from all app code)
 ```
@@ -559,7 +577,7 @@ Once a fix is verified live (the user confirms it worked end-to-end in productio
    lands against an already-Cancelled bracket child during the cancel+place flow. **Fix:** add `10148` to the
   `informational` set alongside the existing `202` ("Order Canceled" confirmation) and update the "Informational
   error codes continue to expand" note in CLAUDE.md to list the new full set.
-- **Stale partial-day bars in `ohlcv_bars` for symbols outside the active universe** (`data/fetcher.py`,
+- **Stale partial-day bars in `ohlcv_bars` for symbols outside the active universe** *(code complete 2026-05-19 — awaiting live verification)* (`data/fetcher.py`,
 `scripts/signal_runner.py:_phase2_data_refresh`): `signal_runner.py` Phase 2 fetches each symbol's daily bar
 mid-day (~10:00-11:00 ET) via yfinance, which returns whatever the day's *partial* state is at fetch time.
 `upsert_bars` writes that partial bar to SQLite. Nothing re-fetches the bar after the 16:00 ET close. Symbols that
@@ -575,7 +593,7 @@ end-of-day refetch pass — new script `scripts/refresh_recent_bars.py` (cron at
 step in `run_daily.bat`) that re-fetches the last 2 trading days' bars for the union of (currently-held symbols,
 symbols held in the last 14 days, current universe). Overwriting on upsert is already the behavior; the gap is just
   that nothing currently triggers a re-fetch after close. ~50 lines, ~5-10 sec runtime for the current universe
-size.
+size. **Status:** implemented as `scripts/refresh_recent_bars.py` + a new `run_eod.bat` scheduler wrapper. The spec's "overwriting on upsert is already the behavior" turned out to be wrong — `upsert_bars` / `upsert_indicators` both skipped existing rows. Two additions: (a) new `overwrite: bool = False` parameter on both helpers in `data/database.py` (default preserves existing skip-existing semantics for the incremental-fetch path); (b) new `DataFetcher.refresh_recent(symbol, interval='1d', days_back=5)` that calls yfinance and upserts with `overwrite=True`. The script builds its symbol union from three sources: (1) `get_universe_assets(active_only=True)` or `config.data.watchlist`, (2) `order_decisions` with `decision in ('APPROVED', 'DRY_RUN', 'CLOSED_LONG')` and `decided_at > now − 14d` (as a Phase-A proxy for "recently-held" until Phase B lands `source='live'` rows in `trade_log`), (3) currently-held IBKR positions (optional — `--no-ibkr` flag, also degrades cleanly to empty set when Gateway is unreachable). For each symbol it overwrites recent bars then recomputes and overwrites the derived indicators. `run_eod.bat` lives separately from `run_daily.bat` because the daily run fires pre-market at 09:40 ET; EOD wrapper logs to `logs/eod/eod_run_YYYYMMDD.log` and must be scheduled separately via Windows Task Scheduler at 16:30 ET. Test coverage added: 5 new in `tests/test_data_pipeline.py` (`TestUpsertBarsOverwrite` × 3: default skips, overwrite updates in place with the low-overwrite canary, mixed batch handles INSERT+UPDATE in one call; `TestUpsertIndicatorsOverwrite` × 2). Full suite: **223 passed + 1 skipped**. Verification pending: (a) the Phase B `source='live'` lookup in `_recently_acted_symbols` should be switched from `order_decisions` to `trade_log` once Phase B accumulates rows; (b) needs a real EOD cron run to confirm yfinance returns finalised post-close bars at 16:30 ET (yfinance typically updates ~15-20 min after close) and that the held-positions union actually catches the rotated-out symbols that motivated this fix; (c) repeat the TMUS / UAL / TEL spot-check from the original observation against the DB after one EOD run completes — DB Low values should match yfinance Low values to within a cent.
 
 ### Enhancements (open)
 - **Trailing stop is structurally crowded out by the bracket TP on fast moves** (`risk/trailing_stop.py`, `config/settings.py` RiskConfig): with current defaults (`trailing_stop_activation_atr=2.0`, `trailing_stop_trail_atr=2.0`, `atr_take_profit_multiplier=3.0`), the activation level sits only **1× ATR below** the bracket TP. The trailing manager evaluates **once per day** in Phase 3.5 reading daily-bar closes from `ohlcv_bars`; intraday excursions above activation are invisible to it. On any fast move that gaps through both activation and TP between two consecutive daily evaluations, the bracket TP wins by construction — the trailing stop cannot engage. **Observed case: AXTI 2026-04-29 → 2026-05-04** (full write-up: `docs/case_studies/axti_2026-04.md`); **counter-case where the trail DID convert: SNOW 2026-04-30 → ongoing** (`docs/case_studies/snow_2026-04.md`). The pair refines the framing from "the trail can't engage on fast moves" to "the trail's success depends on whether the move from below-activation to above-TP happens **overnight** (TP wins — AXTI) or **intraday** while the once-per-day manager is running (trail wins — SNOW). The intervention ranking flips: SNOW's data argues **intraday evaluation > widen activation→TP gap > lower activation_atr**." Entry $72.96; 2026-05-01 close $88.32 sat $3.57 *below* activation $91.89 (intraday high $96.00 would have qualified but daily-bar evaluation missed it); 2026-05-04 opened $97.44 and TP $101.19 filled in the first ~10 minutes of trading before the 09:40 ET trailing-manager evaluation. Realised +38.7% in 3 trading days vs subsequent post-exit peak of $134.00 on 2026-05-13 (~46% of peak move captured). Sample size = 1 today; **do not retune defaults until ≥2 more fast-move winners exit and the pattern is confirmed in aggregate** (gated on Phase B `source='live'` rows so realised P&L drives the analysis instead of a single observation). Interventions ranked by reversibility when the time comes: (1) lower `trailing_stop_activation_atr` to 1.0 — cheap config change, would have activated AXTI's trail on 2026-05-01, risk is over-activation on weaker moves that then retrace; (2) raise `atr_take_profit_multiplier` to ~5.0 — gives the trail room to engage, larger drawdown risk on positions that hit the trail and reverse; (3) intraday trailing-stop evaluation (second `signal_runner` invocation at e.g. 15:30 ET, or a live data stream) — would have caught AXTI's 2026-05-01 intraday $96.00 print, larger code surface; (4) "TP becomes trailing once first-target is hit" rule — conceptually cleanest, largest code change. Trigger to revisit: ≥3 trades total with `exit_reason='tp'` AND post-exit peak >1.5× the TP price within 10 bars (i.e. the system locked in a small win and left a big tail behind). The query that surfaces these once Phase B lands is straightforward against `trade_log` joined to `ohlcv_bars`.

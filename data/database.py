@@ -554,16 +554,28 @@ def _migrate(engine) -> None:
 
 # ── OHLCV helpers ─────────────────────────────────────────────────────────────
 
-def upsert_bars(df: pd.DataFrame, symbol: str, interval: str) -> int:
+def upsert_bars(
+    df: pd.DataFrame,
+    symbol: str,
+    interval: str,
+    overwrite: bool = False,
+) -> int:
     """
     Insert rows from a yfinance-style DataFrame (Open/High/Low/Close/Volume,
-    DatetimeIndex).  Skips rows that already exist.  Returns count inserted.
+    DatetimeIndex).  Returns the count of rows inserted OR updated.
+
+    Default (overwrite=False): skips rows that already exist — the steady-state
+    incremental-fetch path used by run_pipeline.py / signal_runner.py / fetcher.
+
+    overwrite=True: updates OHLCV in place for any (symbol, interval, timestamp)
+    row that already exists.  Used by refresh_recent_bars.py to replace mid-day
+    partial bars with the final post-close values once yfinance has them.
     """
     if df.empty:
         return 0
 
     engine = get_engine()
-    inserted = 0
+    affected = 0
 
     with Session(engine) as session:
         for ts, row in df.iterrows():
@@ -584,11 +596,18 @@ def upsert_bars(df: pd.DataFrame, symbol: str, interval: str) -> int:
                     close=float(row["Close"]),
                     volume=float(row["Volume"]),
                 ))
-                inserted += 1
+                affected += 1
+            elif overwrite:
+                exists.open   = float(row["Open"])
+                exists.high   = float(row["High"])
+                exists.low    = float(row["Low"])
+                exists.close  = float(row["Close"])
+                exists.volume = float(row["Volume"])
+                affected += 1
 
         session.commit()
 
-    return inserted
+    return affected
 
 
 def get_bars(symbol: str, interval: str, limit: int = 500) -> pd.DataFrame:
@@ -637,17 +656,28 @@ _INDICATOR_COLS = [
 ]
 
 
-def upsert_indicators(df: pd.DataFrame, symbol: str, interval: str) -> int:
+def upsert_indicators(
+    df: pd.DataFrame,
+    symbol: str,
+    interval: str,
+    overwrite: bool = False,
+) -> int:
     """
     Persist indicator columns from `df` (must share the same DatetimeIndex
-    as the corresponding OHLCV bars).  Skips existing rows.
-    Returns count inserted.
+    as the corresponding OHLCV bars).  Returns the count of rows inserted
+    OR updated.
+
+    Default (overwrite=False): skips rows that already exist.
+
+    overwrite=True: updates the indicator columns in place — used when the
+    underlying OHLCV bars have been refreshed (refresh_recent_bars.py) and
+    the derived indicators need to track the corrected price data.
     """
     if df.empty:
         return 0
 
     engine = get_engine()
-    inserted = 0
+    affected = 0
 
     with Session(engine) as session:
         for ts, row in df.iterrows():
@@ -656,20 +686,24 @@ def upsert_indicators(df: pd.DataFrame, symbol: str, interval: str) -> int:
             exists = session.query(IndicatorSnapshot).filter_by(
                 symbol=symbol, interval=interval, timestamp=ts_dt
             ).first()
+            kwargs = {
+                col: (None if pd.isna(row.get(col)) else float(row[col]))
+                for col in _INDICATOR_COLS
+                if col in df.columns
+            }
             if exists is None:
-                kwargs = {
-                    col: (None if pd.isna(row.get(col)) else float(row[col]))
-                    for col in _INDICATOR_COLS
-                    if col in df.columns
-                }
                 session.add(IndicatorSnapshot(
                     symbol=symbol, interval=interval, timestamp=ts_dt, **kwargs
                 ))
-                inserted += 1
+                affected += 1
+            elif overwrite:
+                for col, val in kwargs.items():
+                    setattr(exists, col, val)
+                affected += 1
 
         session.commit()
 
-    return inserted
+    return affected
 
 
 def get_latest_indicators(symbol: str, interval: str) -> dict | None:

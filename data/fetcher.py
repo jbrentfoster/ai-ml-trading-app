@@ -81,6 +81,44 @@ class DataFetcher:
 
         return get_bars(symbol, interval, limit=max(days_back * 2, 500))
 
+    def refresh_recent(
+        self,
+        symbol: str,
+        interval: str = "1d",
+        days_back: int = 5,
+    ) -> int:
+        """
+        Re-fetch the last `days_back` calendar days of bars from yfinance and
+        overwrite whatever's in SQLite for those timestamps.  Used by
+        scripts/refresh_recent_bars.py to replace mid-day partial bars (written
+        by the morning signal_runner Phase 2 fetch) with the final post-close
+        values once yfinance has them.
+
+        Default `days_back=5` covers D-1 and D-2 with margin for weekends and
+        holidays.  Returns the number of bars inserted-or-updated.
+        """
+        start = (datetime.now(timezone.utc) - timedelta(days=days_back)).strftime("%Y-%m-%d")
+        log.debug("Refreshing recent bars: %s | interval=%s | start=%s",
+                  symbol, interval, start)
+
+        try:
+            raw = yf.Ticker(symbol).history(
+                start=start, interval=interval, auto_adjust=True
+            )
+        except Exception as exc:
+            log.error("yfinance refresh failed for %s: %s", symbol, exc)
+            return 0
+
+        if raw.empty:
+            log.warning("yfinance returned no data for %s during refresh", symbol)
+            return 0
+
+        df = self._normalise(raw)
+        n  = upsert_bars(df, symbol, interval, overwrite=True)
+        if n > 0:
+            log.info("Refreshed %d bar(s) for %s (%s)", n, symbol, interval)
+        return n
+
     def refresh_watchlist(self, interval: str = "1d") -> dict[str, pd.DataFrame]:
         """
         Fetch every symbol in config.data.watchlist.

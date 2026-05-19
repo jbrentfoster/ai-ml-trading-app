@@ -149,9 +149,12 @@ The daily and weekly runs are driven by two batch files that execute the pipelin
 | File | When | Steps |
 |------|------|-------|
 | `run_daily.bat` | Mon–Fri 09:40 AM | `run_pipeline.py` → `universe_scheduler.py --rescore-now --no-signal-run` → `train_models.py` (new symbols only) → `signal_runner.py` (data refresh → signals → trailing-stop conversion → new orders) |
+| `run_eod.bat`   | Mon–Fri 04:30 PM ET | `refresh_recent_bars.py` — re-fetches the last 5 days of OHLCV + indicators for the union of (active universe, recently-acted symbols, held positions) and overwrites the mid-day partial bars the morning `signal_runner` Phase 2 wrote |
 | `run_weekly.bat` | Sunday 01:00 AM | `run_pipeline.py` → `train_models.py --force` → `universe_scheduler.py --run-now` |
 
 **Step ordering matters.** The daily run rescores the universe *before* training so that symbols freshly promoted into the active set get checkpoints the same day rather than next. `--no-signal-run` suppresses the inline signal runner that `universe_scheduler.py` would otherwise fire post-rescore; signals are run explicitly as the final step, after training has caught up.
+
+**Why a separate EOD step?** `run_daily.bat` runs pre-market, so its Phase 2 yfinance fetch returns whatever the day's partial state is at fetch time (mid-day for D, previous close for D-1). Nothing else re-fetches the D-1 bar once it's finalised. Symbols that subsequently drop out of the universe AND are no longer held never have their stale partial bar corrected — the recorded "daily low/high/close" remains the mid-day snapshot forever, which silently masks intraday stop-outs and biases walk-forward retraining. `run_eod.bat` at 04:30 PM ET (after the 04:00 close, with margin for yfinance to ingest) refreshes the last 5 days of bars and overwrites whatever's stale.
 
 **Why two separate scripts instead of one persistent scheduler?**
 Each batch file runs its steps sequentially and exits. Windows Task Scheduler handles the timing. This avoids silent failures from persistent processes dying overnight, multiple instances on re-login, and race conditions between pipeline and model training.
@@ -167,6 +170,8 @@ logs/
   daily/
     daily_run_20260416.log     ← one file per run
     daily_run_20260417.log
+  eod/
+    eod_run_20260416.log       ← one file per run_eod.bat execution
   weekly/
     weekly_run_20260420.log
   python/
@@ -192,16 +197,20 @@ For unattended overnight operation on a laptop:
 Open PowerShell **as Administrator** and run:
 
 ```powershell
-# Mon–Sat at 09:40 AM
+# Mon–Fri at 09:40 AM (pre-market signal run)
 schtasks /create /tn "TradingApp\DailyRun" /tr '"C:\Users\jbren\OneDrive\Documents\VS_Code\trading_app\run_daily.bat"' /sc WEEKLY /d MON,TUE,WED,THU,FRI /st 09:40 /rl HIGHEST /f
 
-# Sunday at 01:00 AM
+# Mon–Fri at 04:30 PM (post-close bar refresh)
+schtasks /create /tn "TradingApp\EodRun" /tr '"C:\Users\jbren\OneDrive\Documents\VS_Code\trading_app\run_eod.bat"' /sc WEEKLY /d MON,TUE,WED,THU,FRI /st 16:30 /rl HIGHEST /f
+
+# Sunday at 01:00 AM (weekly retrain)
 schtasks /create /tn "TradingApp\WeeklyRun" /tr '"C:\Users\jbren\OneDrive\Documents\VS_Code\trading_app\run_weekly.bat"' /sc WEEKLY /d SUN /st 01:00 /rl HIGHEST /f
 ```
 
 Verify registration:
 ```powershell
 schtasks /query /tn "TradingApp\DailyRun"  /fo LIST
+schtasks /query /tn "TradingApp\EodRun"    /fo LIST
 schtasks /query /tn "TradingApp\WeeklyRun" /fo LIST
 ```
 

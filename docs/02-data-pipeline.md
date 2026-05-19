@@ -40,10 +40,32 @@ The pipeline is **idempotent** — safe to run multiple times. `DataFetcher.fetc
 # Only fetch what we don't have yet
 latest_stored = get_latest_bar_timestamp(symbol, interval)
 df = yf.Ticker(symbol).history(start=latest_stored, interval=interval)
-upsert_bars(symbol, interval, df)   # INSERT OR REPLACE
+upsert_bars(symbol, interval, df)   # default: INSERT-or-SKIP (existing rows untouched)
 ```
 
+`upsert_bars` skips rows that already exist by default — this is what makes repeated runs cheap. There is also an `overwrite=True` mode that UPDATEs the OHLCV columns in place; the end-of-day refresh (below) uses it to replace mid-day partial bars with their final post-close values.
+
 This makes the pipeline fast on daily runs (~1 second per symbol after the initial seed).
+
+### End-of-day bar refresh
+
+The morning `signal_runner.py` Phase 2 fetches each symbol's daily bar mid-day (~09:35–10:00 ET), so what yfinance returns for *today's* bar is a partial intra-day snapshot — not the final daily Open/High/Low/Close. The previous day's bar (D-1) is already finalised by then, but only if the morning run actually re-fetches it; once a partial bar is in SQLite, the default `upsert_bars` path will skip it on every subsequent call.
+
+The symptom is silent and asymmetric: held positions get their bars refreshed indirectly through downstream code paths, but **symbols that drop out of the active universe AND are no longer held never have their stale bar corrected**. The recorded daily Low can sit above the day's true Low forever — which hides intraday stop-outs from the dashboards, misleads case-study analysis, and biases walk-forward retraining (the model trains on a price history that doesn't match what actually happened).
+
+To close the gap, `scripts/refresh_recent_bars.py` runs once per weekday at 04:30 PM ET (via `run_eod.bat` in Windows Task Scheduler) and re-fetches the last 5 days of bars for the union of:
+
+1. **Active universe** — `universe_assets WHERE active=1` (or `config.data.watchlist` when universe is disabled)
+2. **Recently-acted symbols** — `order_decisions` rows with decision in (`APPROVED`, `DRY_RUN`, `CLOSED_LONG`) and `decided_at` within the last 14 days (proxy for "recently-held" until Phase 4.5 Phase B populates `trade_log.live` rows)
+3. **Currently-held IBKR positions** — optional; degrades cleanly when IB Gateway is unreachable (`--no-ibkr` flag, or auto-degrades on connect failure)
+
+For each symbol, the script calls `DataFetcher.refresh_recent()` (which writes via `upsert_bars(... overwrite=True)`) then recomputes the derived indicators from the refreshed bars and writes them via `upsert_indicators(... overwrite=True)`. The whole pass runs in ~5–10 seconds for the current universe.
+
+```bash
+python scripts/refresh_recent_bars.py              # default: last 5 days
+python scripts/refresh_recent_bars.py --days 10    # wider backfill window
+python scripts/refresh_recent_bars.py --no-ibkr    # skip the IBKR positions union
+```
 
 ---
 
