@@ -30,6 +30,7 @@ Three skills and four living documents fall out of those observations.
 | `CLAUDE.md` → *Outstanding bugs* / *Enhancements* | Until verified live | A confirmed bug with a fix in flight, or a sustained signal warranting a code change. "Did the fix hold up over multiple runs?" |
 | `CHANGELOG.md` | Permanent | A CLAUDE.md fix that has been verified live in production. Terminal home — entries don't move out. |
 | `docs/case_studies/*.md` | Permanent (living) | Deep post-mortem of a single trade or trade cluster. Updated when sister-doc triggers fire, not pruned. |
+| `docs/findings/*.md` | Permanent (living) | A distributional pattern across many trades requires investigation before any action can be proposed. Status log appended over time; resolved findings stay in the folder for institutional memory. |
 | `db/trading.db` (tables: `trade_log`, `signal_log`, `order_decisions`, `trailing_stop_log`, `walk_forward_results`, `universe_assets`, ...) | Permanent (append-only) | Source of truth. Every review and case study queries these. |
 
 CLAUDE.md does more than host bug entries — it's also the project orientation doc (config reference, architectural decisions, ML model details). Only the *Outstanding bugs* and *Enhancements* sections participate in the review-system lifecycle.
@@ -89,52 +90,60 @@ Does **not** run the test suite — it writes documentation, not code.
                          │  /weekly-run-review     │
                          └────────────┬────────────┘
                                       │
-            ┌─────────────────────────┼─────────────────────────┐
-            │                         │                         │
-            ▼                         ▼                         ▼
-   single-observation         confirmed bug or         hard trigger fired
-   gate (e.g. "does X         sustained signal         (closed trade ≥ 20%,
-   stabilise next run?")      requiring code           first trail conversion)
-            │                         │                         │
-            ▼                         ▼                         ▼
-   ┌────────────────────┐    ┌────────────────────┐   ┌────────────────────┐
-   │ followups.md       │    │ CLAUDE.md          │   │ /trade-case-study  │
-   │ → Open section     │    │ → Outstanding bugs │   │ (auto-invoked)     │
-   │                    │    │   or Enhancements  │   │                    │
-   │ Resolves when: ... │    │                    │   │ writes             │
-   │ Escalates if: ...  │    │ Status: code       │   │ docs/case_studies/ │
-   └─────────┬──────────┘    │ complete YYYY-MM-DD│   │ <sym>_<YYYY-MM>.md │
-             │               │   awaiting live    │   │                    │
-             │               │   verification     │   │ may surface its    │
-             │               └─────────┬──────────┘   │ own CLAUDE.md      │
-             │                         │              │ proposals          │
-             │                         │              └─────────┬──────────┘
-   ┌─────────┴─────────┐               │                        │
-   │                   │               │                        │
-   ▼                   ▼               ▼                        ▼
-Resolves         Escalates if   Verified live           Reviewed in next
-(criterion       (criterion     in production           daily/weekly run via
-met next run)    met next run)  (run confirms fix)      §6 update trigger
-   │                   │               │                        │
-   ▼                   ▼               ▼                        │
-move to          propose new      move CLAUDE.md                │
-Resolved         CLAUDE.md        entry → CHANGELOG.md          │
-(pruned after    Outstanding     with Verified: paragraph       │
-30 days by       bugs entry      naming the run                 │
-weekly skill)    via §8 format                                  │
-                                                                ▼
-                                                       updated in place
-                                                       (append-only;
-                                                       lives forever)
+        ┌────────────────┬────────────┼────────────┬────────────────┐
+        │                │            │            │                │
+        ▼                ▼            ▼            ▼                │
+single-observation  confirmed   hard trigger   distributional       │
+gate (e.g. "does    bug or      fired (closed  pattern across       │
+X stabilise next    sustained   trade ≥ 20%,   many trades, needs   │
+run?")              signal      first trail    investigation        │
+                    requiring   conversion)    (human judgment;     │
+                    code                       NOT auto-spawned)    │
+        │                │            │            │                │
+        ▼                ▼            ▼            ▼                │
+┌──────────────┐ ┌──────────────┐ ┌─────────────┐ ┌──────────────┐  │
+│ followups.md │ │ CLAUDE.md    │ │/trade-case- │ │docs/findings/│  │
+│ → Open       │ │ → Outstand-  │ │ study       │ │ <name>.md    │  │
+│              │ │   ing bugs   │ │ (auto-      │ │              │  │
+│ Resolves     │ │   or Enhan-  │ │ invoked)    │ │ Status log   │  │
+│ when: ...    │ │   cements    │ │             │ │ appended     │  │
+│ Escalates    │ │              │ │ writes      │ │ over time as │  │
+│ if: ...      │ │ Status: code │ │ docs/case_  │ │ investigation│  │
+└──────┬───────┘ │ complete     │ │ studies/    │ │ progresses   │  │
+       │         │ YYYY-MM-DD   │ │ <sym>_      │ │              │  │
+       │         │ awaiting     │ │ <YYYY-MM>.md│ │ observed →   │  │
+       │         │ live verif.  │ │             │ │ hypothesized │  │
+       │         └──────┬───────┘ │ may surface │ │ → tested →   │  │
+       │                │         │ own         │ │ resolved     │  │
+       │                │         │ CLAUDE.md   │ └──────┬───────┘  │
+       │                │         │ proposals   │        │          │
+       │                │         └─────┬───────┘        │          │
+       │                │               │                │          │
+       ▼                ▼               ▼                ▼          ▼
+ Resolves /      Verified live   Reviewed in      Terminal:    (anything
+ escalates       in production   next review      escalate to  not matching
+ (criterion      (run confirms   via §6 update    CLAUDE.md,   any branch
+ met next        fix) → move     trigger →        cross-ref    is logged
+ run) →          CLAUDE.md       updated in       from case    only — no
+ pruned after    entry →         place (append-   study, or    artifact
+ 30 days by      CHANGELOG.md    only; lives      retire as    written)
+ weekly skill    with Verified:  forever)         noise.
+ OR propose      paragraph                        Resolved
+ new             naming the                       findings
+ CLAUDE.md       run                              STAY in
+ Outstanding                                      folder
+ bugs entry                                       (institutional
+ via §8                                           memory)
 ```
 
-The three terminal states are:
+The four terminal states are:
 
 - **`followups.md` → Resolved → pruned** (short-lived observations that confirmed)
 - **`CLAUDE.md` → `CHANGELOG.md`** (bugs that shipped and verified)
 - **`docs/case_studies/*.md` → updated forever** (trade-level insight)
+- **`docs/findings/*.md` → status log appended forever, terminal state recorded** (distributional patterns; resolved findings remain in the folder for institutional memory rather than being pruned)
 
-The escalation arrow `followups → CLAUDE.md` is the most important one in this diagram: it's how single-observation watches mature into code changes when the *Escalates if* criterion fires.
+The escalation arrow `followups → CLAUDE.md` is the most important one in this diagram: it's how single-observation watches mature into code changes when the *Escalates if* criterion fires. The findings → CLAUDE.md / case-study arrows are the second-most: they're how distributional diagnoses, once resolved, either escalate into specific code work (Outstanding bugs / Enhancements) or anchor to a specific trade narrative (case study sister-doc link).
 
 ---
 
@@ -173,6 +182,21 @@ CLAUDE.md is where in-flight bug work lives. CHANGELOG.md is where it goes to di
 
 CHANGELOG entries never come back to CLAUDE.md.
 
+### Finding vs case study vs CLAUDE.md
+
+| If the observation is... | It belongs in... |
+|--------------------------|------------------|
+| About one trade (or 3–5 related trades), reasoning from day-by-day mechanics | `docs/case_studies/<name>_<YYYY-MM>.md` |
+| A distributional pattern across many trades, no fix in flight, hypotheses to test | `docs/findings/<name>.md` |
+| An architectural or methodological *rule* (constant across the system, already diagnosed) | CLAUDE.md *Key Architectural Decisions* |
+| A confirmed bug with code in flight or about to ship | CLAUDE.md *Outstanding bugs* |
+
+The **unit of analysis** distinguishes finding from case study: a case study reasons from *specific named trades* (entry signals, day-by-day price action, exit mechanics, counterfactual knobs); a finding reasons from *aggregate distributions* (per-bucket averages, hypothesis discriminators, sample sizes).
+
+**Diagnosed-ness** distinguishes finding from architectural decision: a finding is awaiting diagnosis (hypotheses ranked, tests specified, action gated); an architectural decision is the diagnosed rule itself. The fold-end / dedup-vs-raw / cost-asymmetry notes in CLAUDE.md belong there because they *are* the diagnosed rules surfaced during the Phase 3 benchmark-relative tracking work. "Stop-out exits underperform SPY" is a finding because the diagnosis hasn't happened.
+
+See `docs/findings/README.md` for the full scope rule, document structure, and lifecycle.
+
 ---
 
 ## Cadence summary
@@ -203,6 +227,7 @@ The structure above wasn't designed up front. Each piece was added in response t
 8. **`/trade-case-study` skill.** AXTI's near-miss trail conversion was the catalyst — a single trade contained enough mechanism to warrant deep reconstruction that wouldn't fit in a punch list. The skill formalised what a good case study looks like (day-by-day price table, skill-vs-luck retrospective, sister-doc cross-references, update triggers).
 9. **§8 CLAUDE.md proposal format.** Early review outputs were paragraphs of "you should add this to CLAUDE.md." Rendering proposals as copy-paste-ready fenced blocks shortened the friction from minutes to seconds.
 10. **Auto-invoke triggers in `trade-case-study` §0.** Some trades clearly warranted a case study (|return| ≥ 20%, first-ever trail conversion) and humans were the bottleneck on noticing. The hard/soft trigger split lets the daily skill auto-execute the deterministic cases and only ask permission for the judgment ones.
+11. **Findings folder.** The Phase 3 benchmark-relative tracking work on Page 10 surfaced two patterns — stop-bleed (−7% avg excess across 526 raw stop-out trades) and TP-concentration (9 of 49 deduped trades carry the entire +124% cumulative excess) — that had no home in the existing structure. Neither was single-trade enough for a case study, fix-in-flight enough for an Outstanding bug, forward-looking enough for an Enhancement, or single-observation enough for a follow-up. They were *distributional diagnostic findings* — confirmed aggregate patterns awaiting hypothesis-driven investigation. The `docs/findings/` folder is the smallest structural addition that distinguishes that category from the four pre-existing ones; the boundary table in `findings/README.md` enforces the distinction.
 
 Each layer was the smallest thing that solved a problem the previous layer had created. The result is a structure with real complexity but no redundant parts — every file and skill has a distinct role that the others can't fill.
 
@@ -216,6 +241,7 @@ Each layer was the smallest thing that solved a problem the previous layer had c
 - Fixable bug with code → CLAUDE.md *Outstanding bugs*
 - Direction worth pursuing when evidence accumulates → CLAUDE.md *Enhancements* with a *Trigger to revisit*
 - Single-trade mechanism worth reconstructing → `docs/case_studies/`
+- Distributional pattern across many trades, no fix in flight, needs investigation → `docs/findings/<name>.md`
 - Bug that verified live → migrate CLAUDE.md → CHANGELOG.md
 
 **"Which skill do I run?"**
