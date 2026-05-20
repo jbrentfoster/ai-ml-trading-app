@@ -1,5 +1,5 @@
 @echo off
-:: Daily run: Mon-Sat
+:: Daily run: Mon-Fri at 10:00am via Windows Task Scheduler
 :: Step 1 — refresh OHLCV, indicators, news, and FinBERT scores
 :: Step 2 — re-score universe (Stage 3) so new members are active before training
 :: Step 3 — train models for any symbols missing checkpoints (skips existing)
