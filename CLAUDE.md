@@ -105,8 +105,14 @@ trading_app/
 ├── run_daily.bat            — Mon–Fri scheduler: run_pipeline.py → universe_scheduler.py --rescore-now
 │                              --no-signal-run → train_models.py (skip-existing) → signal_runner.py;
 │                              logs to logs/daily/daily_run_YYYYMMDD.log
-├── run_weekly.bat           — Sunday scheduler: run_pipeline.py → train_models.py --force →
-│                              universe_scheduler.py --run-now; logs to logs/weekly/weekly_run_YYYYMMDD.log
+├── run_weekly.bat           — Sunday scheduler: universe_scheduler.py --run-now → run_pipeline.py →
+│                              train_models.py --force → backfill_benchmark_returns.py;
+│                              logs to logs/weekly/weekly_run_YYYYMMDD.log.  Universe refresh runs
+│                              FIRST so pipeline + training operate on the freshly-rotated active set —
+│                              brand-new symbols would otherwise hit training with no indicators / news /
+│                              FinBERT scores and produce degraded checkpoints (reordered 2026-05-20 after
+│                              the 2026-05-17 weekly review surfaced ~80–100 min of orphaned training on
+│                              soon-to-be-deactivated symbols during a 48-symbol rotation).
 ├── run_eod.bat              — Mon–Fri post-close scheduler (16:30 ET): refresh_recent_bars.py;
 │                              logs to logs/eod/eod_run_YYYYMMDD.log.  Wire via Windows Task Scheduler
 │                              separately from run_daily.bat (which fires pre-market at 09:40 ET).
