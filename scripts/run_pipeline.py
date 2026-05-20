@@ -71,6 +71,23 @@ def main(interval: str = "1d", skip_news: bool = False,
     except Exception as exc:
         print(f"failed ({exc})")
 
+    # ── Benchmark pre-cache (Page 10 relative-performance tracking) ───────────
+    # Fetched unconditionally so SPY ingestion does not depend on whether the
+    # universe is enabled or whether SPY happens to be a permanent fixture in
+    # the configured UniverseConfig.permanent_fixtures list.
+    benchmark = config.data.benchmark_symbol
+    print()
+    print("=== Benchmark cache ===")
+    print(f"  {benchmark} ...", end=" ", flush=True)
+    try:
+        bench_df = fetcher.fetch_symbol(benchmark, interval="1d")
+        if bench_df.empty:
+            print("no data returned")
+        else:
+            print(f"{len(bench_df)} bars | latest close={bench_df['Close'].iloc[-1]:.2f}")
+    except Exception as exc:
+        print(f"failed ({exc})")
+
     # ── OHLCV + indicators ────────────────────────────────────────────────────
     print()
     print("=== Market data & indicators ===")

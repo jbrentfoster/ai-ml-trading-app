@@ -32,7 +32,17 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo [%date% %time%] Step 3: scripts\universe_scheduler.py --run-now >> "%LOG%"
+echo [%date% %time%] Step 3: scripts\backfill_benchmark_returns.py (after retrain — populates new trade_log rows) >> "%LOG%"
+.venv\Scripts\python.exe scripts\backfill_benchmark_returns.py >> "%LOG%" 2>&1
+if errorlevel 1 (
+    echo [%date% %time%] WARNING: backfill_benchmark_returns.py failed -- Page 10 alpha view will have NULL rows >> "%LOG%"
+)
+
+:: Verify the backfill — a noisy log line beats a silent data gap.
+echo [%date% %time%] Step 3 verify: NULL benchmark_return_pct count >> "%LOG%"
+.venv\Scripts\python.exe -c "from data.database import get_engine; from sqlalchemy import text; e=get_engine(); n=e.connect().execute(text('SELECT COUNT(*) FROM trade_log WHERE benchmark_return_pct IS NULL')).scalar(); print(f'NULL benchmark_return_pct after backfill: {n}')" >> "%LOG%" 2>&1
+
+echo [%date% %time%] Step 4: scripts\universe_scheduler.py --run-now >> "%LOG%"
 .venv\Scripts\python.exe scripts\universe_scheduler.py --run-now >> "%LOG%" 2>&1
 if errorlevel 1 (
     echo [%date% %time%] ERROR: universe_scheduler.py --run-now failed >> "%LOG%"

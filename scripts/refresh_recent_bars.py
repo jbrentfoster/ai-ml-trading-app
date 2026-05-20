@@ -125,10 +125,16 @@ def main(days_back: int = 5, use_ibkr: bool = True, interval: str = "1d") -> Non
     universe = _universe_symbols()
     recent   = _recently_acted_symbols(days=14)
     held     = _ibkr_position_symbols() if use_ibkr else set()
+    # Benchmark (config.data.benchmark_symbol — SPY by default) is included
+    # unconditionally so Page 10's relative-performance tracking always has
+    # current bars, even if the user disables the universe or rotates the
+    # benchmark out of permanent_fixtures.
+    benchmark = {config.data.benchmark_symbol}
 
-    symbols = sorted(universe | recent | held)
+    symbols = sorted(universe | recent | held | benchmark)
     print(f"Universe: {len(universe)} | Recent (14d): {len(recent)} | "
-          f"Held: {len(held)} | Union: {len(symbols)}")
+          f"Held: {len(held)} | Benchmark: {sorted(benchmark)} | "
+          f"Union: {len(symbols)}")
     print()
 
     if not symbols:

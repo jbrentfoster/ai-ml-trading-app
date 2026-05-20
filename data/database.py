@@ -384,6 +384,15 @@ class TradeLog(Base):
     pnl           = Column(Float,    nullable=False)
     pnl_pct       = Column(Float,    nullable=False)
     costs_charged = Column(Float,    default=0.0)
+    # Raw price return on the benchmark (config.data.benchmark_symbol — SPY by
+    # default) over the trade's holding period: (bench_exit / bench_entry) - 1.
+    # NOT net of any costs.  The trade's pnl_pct is already net of costs; this
+    # column intentionally is not, because the comparison "net of my costs vs
+    # raw benchmark return" is the correct retail-alpha frame (a frictionless
+    # buy-and-hold benchmark is the standard counterfactual).  NULL when the
+    # benchmark has no bar on entry_ts or exit_ts (logged + skipped, not
+    # silently zeroed).  Populated by scripts/backfill_benchmark_returns.py.
+    benchmark_return_pct = Column(Float)
     recorded_at   = Column(DateTime, nullable=False)
 
 
@@ -504,6 +513,19 @@ def _migrate(engine) -> None:
                 ))
                 conn.commit()
                 log.info("Migration applied: signal_runner_log.hold_timeouts")
+
+        # trade_log.benchmark_return_pct  (2026-05-19 — benchmark-relative
+        # performance tracking on Page 10).  Raw (cost-unadjusted) benchmark
+        # price return over the trade's holding period.  NULL for pre-migration
+        # rows; populated by scripts/backfill_benchmark_returns.py.
+        if "trade_log" in insp.get_table_names():
+            tl_cols = {c["name"] for c in insp.get_columns("trade_log")}
+            if "benchmark_return_pct" not in tl_cols:
+                conn.execute(text(
+                    "ALTER TABLE trade_log ADD COLUMN benchmark_return_pct FLOAT"
+                ))
+                conn.commit()
+                log.info("Migration applied: trade_log.benchmark_return_pct")
 
         # fundamental_data: drop UNIQUE(symbol) so the table can hold append-only
         # snapshot history (needed for derived features like analyst-target
@@ -1359,5 +1381,6 @@ def get_trade_log(
         "pnl":           r.pnl,
         "pnl_pct":       r.pnl_pct,
         "costs_charged": r.costs_charged,
+        "benchmark_return_pct": r.benchmark_return_pct,
         "recorded_at":   r.recorded_at,
     } for r in rows])

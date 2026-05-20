@@ -81,6 +81,16 @@ with tabs[0]:
 
         db_path = st.text_input("SQLite database path", value=config.data.db_path)
 
+        benchmark_symbol = st.text_input(
+            "Benchmark symbol",
+            value=config.data.benchmark_symbol,
+            help=(
+                "Used for relative-performance tracking on Page 10 (Trade History). "
+                "OHLCV is fetched alongside the watchlist/universe and stored in "
+                "ohlcv_bars.  SPY is the conventional choice for US equities."
+            ),
+        )
+
         if st.form_submit_button("Save", type="primary"):
             tickers = [t.strip().upper() for t in watchlist_raw.splitlines() if t.strip()]
             if not tickers:
@@ -91,6 +101,7 @@ with tabs[0]:
                 config.data.intraday_lookback_days  = int(intraday_lookback)
                 config.data.intraday_interval       = intraday_interval
                 config.data.db_path                 = db_path
+                config.data.benchmark_symbol        = benchmark_symbol.strip().upper() or "SPY"
                 _save_and_notify()
 
 

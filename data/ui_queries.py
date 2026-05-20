@@ -1041,6 +1041,51 @@ def query_trade_log_filter_options(
     }
 
 
+@st.cache_data(ttl=300)
+def query_benchmark_returns(
+    source: str | None = None,
+    symbols: tuple[str, ...] | None = None,
+    start_date=None,
+    end_date=None,
+    exit_reasons: tuple[str, ...] | None = None,
+    run_id: str = "",
+    dedup_to_latest_run: bool = True,
+    active_universe_only: bool = True,
+) -> pd.DataFrame:
+    """Return trades eligible for benchmark-relative analysis.
+
+    Thin wrapper over ``query_trade_log`` that:
+      - Drops rows where ``benchmark_return_pct IS NULL`` (no benchmark bar on
+        entry or exit — would silently distort aggregates).
+      - Adds an ``excess_pct`` column = ``pnl_pct − benchmark_return_pct``.
+
+    ``fold_end`` rows are intentionally NOT filtered here — they are real
+    rows with valid benchmark returns; the *interpretation* (backtest artifact
+    vs strategy decision) is a Page 10 concern.  Callers exclude them from
+    headline metrics; the per-trade audit toggle allows including them.
+
+    See the "Fold-end closures are backtest artifacts, not strategy decisions"
+    architectural-decision note in CLAUDE.md for the rationale.
+    """
+    df = query_trade_log(
+        source=source,
+        symbols=symbols,
+        start_date=start_date,
+        end_date=end_date,
+        exit_reasons=exit_reasons,
+        run_id=run_id,
+        dedup_to_latest_run=dedup_to_latest_run,
+        active_universe_only=active_universe_only,
+    )
+    if df.empty or "benchmark_return_pct" not in df.columns:
+        return df
+    df = df[df["benchmark_return_pct"].notna()].copy()
+    if df.empty:
+        return df
+    df["excess_pct"] = df["pnl_pct"] - df["benchmark_return_pct"]
+    return df.reset_index(drop=True)
+
+
 @st.cache_data(ttl=60)
 def query_distinct_trade_log_run_ids(limit: int = 20) -> list[dict]:
     """

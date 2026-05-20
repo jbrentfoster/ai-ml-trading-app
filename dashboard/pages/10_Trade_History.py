@@ -22,12 +22,14 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from data.ui_queries import (
+    query_benchmark_returns,
     query_distinct_trade_log_run_ids,
     query_tax_breakdown,
     query_trade_log,
     query_trade_log_filter_options,
     query_trade_summary,
 )
+from config.settings import config as _app_config
 
 # ── Page config ───────────────────────────────────────────────────────────────
 
@@ -224,6 +226,7 @@ with st.sidebar:
         query_tax_breakdown.clear()
         query_trade_log_filter_options.clear()
         query_distinct_trade_log_run_ids.clear()
+        query_benchmark_returns.clear()
         st.rerun()
 
 
@@ -284,6 +287,239 @@ st.caption(
     "**Win rate** counts a trade as a win only if `net_pnl > 0` — fees count "
     "against you.  A trade that nets to exactly zero after fees is treated as a loss."
 )
+
+# ── 1b. Benchmark-Relative Performance ────────────────────────────────────────
+#
+# Headline metrics + chart EXCLUDE ``exit_reason='fold_end'`` — those rows are
+# backtest artifacts (the WF test window's last bar forced the close), not
+# strategy decisions the live system would ever make.  Including them masks
+# the alpha picture because the fold_end subset is left-truncated toward
+# winners-still-running (positions whose brackets had not fired by test_end).
+# The per-trade audit expander offers a toggle to include them so the user
+# can verify the filter is honest.  See CLAUDE.md "Fold-end closures are
+# backtest artifacts, not strategy decisions" for the diagnosis.
+
+st.markdown("---")
+st.subheader(f"Benchmark-Relative Performance (vs {_app_config.data.benchmark_symbol})")
+
+bench_df = query_benchmark_returns(**filter_kwargs)
+
+if bench_df.empty:
+    st.info(
+        "Not enough data yet to compute meaningful benchmark-relative metrics.  "
+        "Need at least 5 trades with benchmark data.  Run "
+        "`python scripts/backfill_benchmark_returns.py` if existing trades are "
+        "missing benchmark returns."
+    )
+else:
+    strategy_df = bench_df[bench_df["exit_reason"] != "fold_end"].copy()
+    fold_end_df = bench_df[bench_df["exit_reason"] == "fold_end"].copy()
+
+    if len(strategy_df) < 5:
+        st.info(
+            f"Only {len(strategy_df)} strategy-decided trade(s) with benchmark "
+            "data after excluding fold-end rows — need at least 5 for meaningful "
+            "metrics.  Widen the date range or clear other sidebar filters."
+        )
+    else:
+        n_strategy = len(strategy_df)
+        n_fold_end = len(fold_end_df)
+        cum_excess_pct = float(strategy_df["excess_pct"].sum()) * 100.0
+        avg_excess_pct = float(strategy_df["excess_pct"].mean()) * 100.0
+        n_wins_vs_b   = int((strategy_df["excess_pct"] > 0).sum())
+        win_vs_b_pct  = 100.0 * n_wins_vs_b / n_strategy
+
+        bc1, bc2, bc3 = st.columns(3)
+        bc1.metric(
+            "Cumulative Excess Return",
+            f"{cum_excess_pct:+.2f}%",
+            delta=f"{cum_excess_pct:+.2f}% vs benchmark",
+            delta_color="normal",
+        )
+        bc2.metric(
+            "Win Rate vs Benchmark",
+            f"{win_vs_b_pct:.1f}%",
+            delta=f"{n_wins_vs_b:,} / {n_strategy:,} trades beat benchmark",
+            delta_color="off",
+        )
+        bc3.metric(
+            "Avg Excess per Trade",
+            f"{avg_excess_pct:+.3f}%",
+            delta=f"{avg_excess_pct:+.3f}% mean excess",
+            delta_color="normal",
+        )
+
+        st.caption(
+            "**Headline metrics computed over strategy-decided exits only** "
+            f"(stop / tp / signal_flip / trailing — {n_strategy:,} trades).  "
+            f"Excludes {n_fold_end:,} fold-end forced closures — those are backtest "
+            "artifacts of WF test-window boundaries, not real exit decisions the live "
+            "system would ever make.  Toggle the expander below to audit the filter."
+        )
+
+        # ── Cumulative excess return chart ────────────────────────────────
+        cum_excess_df = strategy_df.sort_values("exit_ts")[["exit_ts", "excess_pct"]].copy()
+        cum_excess_df["cum_excess_pct"] = cum_excess_df["excess_pct"].cumsum() * 100.0
+
+        final_cum = float(cum_excess_df["cum_excess_pct"].iloc[-1])
+        line_color = "#26a69a" if final_cum >= 0 else "#ef5350"
+        fill_color = (
+            "rgba(38,166,154,0.15)" if final_cum >= 0 else "rgba(239,83,80,0.15)"
+        )
+
+        excess_fig = go.Figure()
+        excess_fig.add_trace(go.Scatter(
+            x=cum_excess_df["exit_ts"],
+            y=cum_excess_df["cum_excess_pct"],
+            mode="lines",
+            name="Cumulative excess",
+            line=dict(color=line_color, width=2),
+            fill="tozeroy",
+            fillcolor=fill_color,
+        ))
+        excess_fig.add_hline(y=0, line_color="rgba(255,255,255,0.4)", line_width=1)
+        excess_fig.update_layout(
+            height=340, template="plotly_dark",
+            yaxis=dict(title="Cumulative excess return (%)"),
+            xaxis=dict(title="Exit date"),
+            margin=dict(l=0, r=0, t=20, b=0),
+            showlegend=False,
+        )
+        st.plotly_chart(excess_fig, use_container_width=True)
+        st.caption(
+            f"Each point is the cumulative sum of (trade return − "
+            f"{_app_config.data.benchmark_symbol} return over the same holding period) "
+            "for **strategy-decided exits** — stop, tp, signal_flip, trailing.  "
+            "Fold-end forced closures excluded — they are backtest artifacts, not real "
+            "exit decisions the live system would ever make.  A persistently rising line "
+            "is evidence of alpha; a flat or falling line means the strategy is not "
+            f"adding value over simply holding {_app_config.data.benchmark_symbol}."
+        )
+
+        # ── Per-exit-reason excess breakdown ──────────────────────────────
+        st.markdown("**Excess return by exit reason**")
+        per_reason = (
+            bench_df.groupby("exit_reason", dropna=False)
+                    .agg(n=("excess_pct", "size"),
+                         avg_excess=("excess_pct", "mean"))
+                    .reset_index()
+        )
+        per_reason["avg_excess_pct"] = per_reason["avg_excess"] * 100.0
+        # Sort by count desc; fold_end always at the bottom for visual separation.
+        per_reason["_sort_key"] = per_reason["exit_reason"].apply(
+            lambda r: (1 if r == "fold_end" else 0, -per_reason.loc[
+                per_reason["exit_reason"] == r, "n"
+            ].iloc[0])
+        )
+        per_reason = per_reason.sort_values("_sort_key").drop(
+            columns=["_sort_key", "avg_excess"]
+        ).reset_index(drop=True)
+        per_reason["exit_reason_display"] = per_reason["exit_reason"].apply(
+            lambda r: f"{r}  (excluded from metrics)" if r == "fold_end" else r
+        )
+        per_reason_display = per_reason[["exit_reason_display", "n", "avg_excess_pct"]].rename(
+            columns={"exit_reason_display": "Exit Reason",
+                     "n":              "Trades",
+                     "avg_excess_pct": "Avg Excess vs Benchmark"}
+        )
+
+        def _excess_row_style(row: pd.Series) -> list[str]:
+            if "fold_end" in str(row["Exit Reason"]):
+                return ["color: rgba(255,255,255,0.45); font-style: italic"] * len(row)
+            avg = row["Avg Excess vs Benchmark"]
+            if avg > 0:
+                return ["color: #26a69a"] * len(row)
+            if avg < 0:
+                return ["color: #ef5350"] * len(row)
+            return [""] * len(row)
+
+        styled_reason = (
+            per_reason_display.style
+            .apply(_excess_row_style, axis=1)
+            .format({"Trades": "{:,}", "Avg Excess vs Benchmark": "{:+.3f}%"})
+        )
+        st.dataframe(styled_reason, use_container_width=True, hide_index=True)
+        st.caption(
+            "Rows are coloured by sign of avg excess.  Look for the bucket "
+            "with the most trades AND the most negative excess — that's where "
+            "alpha is bleeding."
+        )
+
+        # ── Per-trade audit expander ──────────────────────────────────────
+        with st.expander("🔎  Per-trade excess return details"):
+            include_fold_end = st.checkbox(
+                "Include fold_end rows (backtest artifacts)",
+                value=False,
+                key="bench_include_fold_end",
+                help=(
+                    "Default OFF — fold_end exits are forced closures at WF "
+                    "test-window boundaries, not strategy decisions the live "
+                    "system would make.  Toggle ON to audit the filter: the "
+                    "table will show all benchmark-eligible rows including the "
+                    f"{n_fold_end:,} fold_end trades, so you can see exactly "
+                    "what's excluded from the headline metrics above.  Headline "
+                    "cards and chart are NOT affected by this toggle."
+                ),
+            )
+
+            audit_df = bench_df if include_fold_end else strategy_df
+            audit_cols = {
+                "symbol":               "Symbol",
+                "entry_ts":             "Entry Date",
+                "exit_ts":              "Exit Date",
+                "holding_days":         "Days",
+                "pnl_pct":              "Trade Return %",
+                "benchmark_return_pct": "Benchmark Return %",
+                "excess_pct":           "Excess %",
+                "exit_reason":          "Exit Reason",
+            }
+            audit_display = audit_df[list(audit_cols.keys())].rename(columns=audit_cols).copy()
+            audit_display["Trade Return %"]     *= 100.0
+            audit_display["Benchmark Return %"] *= 100.0
+            audit_display["Excess %"]           *= 100.0
+
+            def _excess_cell_style(val: float) -> str:
+                if pd.isna(val):
+                    return ""
+                if val > 0:
+                    return "background-color: #1b3a2a"
+                if val < 0:
+                    return "background-color: #3a1b1b"
+                return ""
+
+            audit_styled = (
+                audit_display.style
+                .apply(
+                    lambda row: [
+                        _excess_cell_style(row["Excess %"]) if c == "Excess %" else ""
+                        for c in audit_display.columns
+                    ],
+                    axis=1,
+                )
+                .format({
+                    "Days":               "{:,.0f}",
+                    "Trade Return %":     "{:+.2f}%",
+                    "Benchmark Return %": "{:+.2f}%",
+                    "Excess %":           "{:+.2f}%",
+                })
+            )
+            st.dataframe(audit_styled, use_container_width=True, hide_index=True, height=420)
+            st.caption(
+                f"Showing {len(audit_display):,} row(s) — "
+                f"{'including' if include_fold_end else 'excluding'} fold_end."
+            )
+
+            audit_csv = audit_display.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Download benchmark-relative trades as CSV",
+                data=audit_csv,
+                file_name=(
+                    f"benchmark_relative_"
+                    f"{'incl' if include_fold_end else 'excl'}_foldend_"
+                    f"{start_date}_{end_date}.csv"
+                ),
+                mime="text/csv",
+            )
 
 # ── 2. Tax-impact view ────────────────────────────────────────────────────────
 

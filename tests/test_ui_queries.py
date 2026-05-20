@@ -39,6 +39,7 @@ def mem_engine(monkeypatch):
     """
     from data.database import Base
     from data.ui_queries import (
+        query_benchmark_returns,
         query_distinct_trade_log_run_ids,
         query_tax_breakdown,
         query_trade_log,
@@ -52,7 +53,8 @@ def mem_engine(monkeypatch):
     monkeypatch.setattr("data.database._engine", engine)
 
     for fn in (query_trade_log, query_trade_summary, query_tax_breakdown,
-               query_trade_log_filter_options, query_distinct_trade_log_run_ids):
+               query_trade_log_filter_options, query_distinct_trade_log_run_ids,
+               query_benchmark_returns):
         try:
             fn.clear()
         except Exception:
@@ -393,3 +395,116 @@ class TestActiveUniverseFilter:
                                                   dedup_to_latest_run=False)
         assert opts_on["symbols"]  == ["AAPL"]
         assert set(opts_off["symbols"]) == {"AAPL", "MMM"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# query_benchmark_returns — Page 10 benchmark-relative section helper
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestQueryBenchmarkReturns:
+    """Helper for the Page 10 Benchmark-Relative Performance section.
+
+    Built on top of query_trade_log, so it inherits the same dedup +
+    active-universe semantics — but adds:
+      - drop rows where benchmark_return_pct IS NULL
+      - add an ``excess_pct`` = pnl_pct − benchmark_return_pct column
+    fold_end rows are NOT filtered at this layer (the page decides).
+    """
+
+    def test_excess_return_uses_net_pnl(self, mem_engine):
+        """Regression canary for the double-count footgun.
+
+        ``excess_pct`` must equal ``pnl_pct − benchmark_return_pct`` exactly.
+        It must NOT subtract costs_charged again — pnl_pct is already net per
+        the Phase A storage convention.  The buggy formula would be:
+            excess = (pnl_pct − costs_pct) − benchmark_return_pct
+        which subtracts fees twice (once in pnl_pct upstream, once here).
+        Pinning the correct formula prevents the asymmetric-comparison bug
+        from sneaking back in alongside future Page 10 refactors.
+        """
+        from data.database import TradeLog
+        from data.ui_queries import query_benchmark_returns
+
+        # Trade: -2.4% net, 0.4% costs, SPY did +1.0% over the same period.
+        # Correct excess: -0.024 − 0.010 = -0.034
+        # Buggy   excess: (-0.024 − 0.004) − 0.010 = -0.038
+        with Session(mem_engine) as session:
+            session.add(TradeLog(
+                source="walk_forward", run_id="r1", fold_index=0,
+                symbol="SPY", signal="BUY",
+                entry_ts=_now(), exit_ts=_now() + timedelta(days=2),
+                entry_px=100.0, exit_px=97.6,
+                exit_reason="stop", shares=10.0,
+                pnl=-24.0, pnl_pct=-0.024,
+                costs_charged=4.0,
+                benchmark_return_pct=0.010,
+                recorded_at=_now(),
+            ))
+            session.commit()
+
+        df = query_benchmark_returns(
+            dedup_to_latest_run=False, active_universe_only=False,
+        )
+        assert len(df) == 1
+        row = df.iloc[0]
+        assert row["excess_pct"] == pytest.approx(-0.034, abs=1e-9)
+        # Specifically NOT the double-counted form:
+        bug = (row["pnl_pct"] - row["costs_charged"] / (row["entry_px"] * row["shares"])) - row["benchmark_return_pct"]
+        assert row["excess_pct"] != pytest.approx(bug), (
+            "excess_pct is double-counting costs — Page 10 bug has regressed"
+        )
+
+    def test_drops_null_benchmark_rows(self, mem_engine):
+        """Rows with NULL benchmark_return_pct must be filtered out, not
+        silently zeroed.  A zero default would distort aggregates: a 0-return
+        benchmark vs a non-zero trade return would appear as pure alpha when
+        in fact we just don't know what the benchmark did over that window.
+        """
+        from data.database import TradeLog
+        from data.ui_queries import query_benchmark_returns
+
+        with Session(mem_engine) as session:
+            # Populated row — should appear.
+            session.add(TradeLog(
+                source="walk_forward", run_id="r1", fold_index=0,
+                symbol="AAPL", signal="BUY",
+                entry_ts=_now(), exit_ts=_now() + timedelta(days=1),
+                entry_px=200.0, exit_px=210.0,
+                exit_reason="tp", shares=1.0,
+                pnl=10.0, pnl_pct=0.05, costs_charged=0.5,
+                benchmark_return_pct=0.01,
+                recorded_at=_now(),
+            ))
+            # NULL row — should be dropped.
+            session.add(TradeLog(
+                source="walk_forward", run_id="r2", fold_index=0,
+                symbol="MSFT", signal="BUY",
+                entry_ts=_now(), exit_ts=_now() + timedelta(days=1),
+                entry_px=300.0, exit_px=310.0,
+                exit_reason="tp", shares=1.0,
+                pnl=10.0, pnl_pct=0.033, costs_charged=0.5,
+                benchmark_return_pct=None,
+                recorded_at=_now(),
+            ))
+            session.commit()
+
+        df = query_benchmark_returns(
+            dedup_to_latest_run=False, active_universe_only=False,
+        )
+        assert len(df) == 1
+        assert df.iloc[0]["symbol"] == "AAPL"
+
+    def test_benchmark_section_handles_empty_trade_log(self, mem_engine):
+        """Empty trade_log returns an empty DataFrame — never crashes.
+
+        The Page 10 section checks ``if bench_df.empty`` and renders an
+        st.info() empty state.  This pins the helper's contract: empty
+        in → empty out, with the right shape (so the page's .empty check
+        works regardless of whether the column exists yet).
+        """
+        from data.ui_queries import query_benchmark_returns
+
+        df = query_benchmark_returns(
+            dedup_to_latest_run=False, active_universe_only=False,
+        )
+        assert df.empty

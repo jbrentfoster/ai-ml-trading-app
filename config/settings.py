@@ -125,6 +125,12 @@ class DataConfig:
     # How often the dashboard auto-suggests refreshing (informational only)
     auto_refresh_interval_minutes: int = 60
 
+    # Benchmark symbol used for relative-performance tracking on Page 10.
+    # OHLCV is stored alongside equities in ohlcv_bars (same convention as ^VIX),
+    # fetched unconditionally by run_pipeline.py and refresh_recent_bars.py so
+    # ingestion does not depend on whether universe selection is enabled.
+    benchmark_symbol: str = "SPY"
+
 
 @dataclass
 class AlpacaConfig:
