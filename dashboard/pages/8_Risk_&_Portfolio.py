@@ -18,6 +18,7 @@ from data.ui_queries import (
     query_circuit_breaker_log,
     query_circuit_breaker_status,
     query_distinct_run_ids,
+    query_intraday_run_log_today,
     query_order_decisions,
     query_signal_runner_log,
     query_trailing_stop_log,
@@ -39,6 +40,7 @@ with st.sidebar:
     if st.button("Refresh cache"):
         query_circuit_breaker_status.clear()
         query_circuit_breaker_log.clear()
+        query_intraday_run_log_today.clear()
         query_order_decisions.clear()
         query_signal_runner_log.clear()
         query_trailing_stop_log.clear()
@@ -376,6 +378,52 @@ stop is used instead.
 
 
 # ── 5. Circuit breaker event log ──────────────────────────────────────────────
+
+st.header("Intraday checks (today)")
+st.caption(
+    "Rows written by `scripts/intraday_check.py` at the 12:00 ET and 15:30 ET "
+    "slots.  Each row covers a Phase 1 circuit-breaker check + Phase 3.5 "
+    "trailing-stop re-evaluation (no signal regeneration; no order submission "
+    "unless the CB trips and `paper_orders_enabled=True`)."
+)
+
+intraday_today = query_intraday_run_log_today()
+if intraday_today.empty:
+    st.info(
+        "No intraday checks have run yet today. The intraday runner fires at "
+        "12:00 ET and 15:30 ET on weekdays (separate from the 09:35 ET daily "
+        "runner).  A `status='gateway_down'` row appears when IB Gateway was "
+        "logged out at the scheduled time — see CLAUDE.md for the design "
+        "rationale on the exit-0-with-row-written behavior."
+    )
+else:
+    def _intraday_color(status: str) -> str:
+        return {
+            "completed":    "background-color: #1b3a2a",   # green
+            "gateway_down": "background-color: #3a2e1b",   # amber
+            "cb_tripped":   "background-color: #3a1b1b",   # red
+            "error":        "background-color: #3a1b1b",   # red
+        }.get(status, "")
+
+    display_cols = [
+        "When", "Status", "Daily Δ", "Weekly Δ",
+        "CB tripped", "Flattened", "Trail eval",
+        "Ratchets", "Conversions", "Duration (s)", "Error",
+    ]
+    visible = intraday_today[[c for c in display_cols if c in intraday_today.columns]].copy()
+    # Render loss-pct columns as percentages where present, leaving NULLs as "—".
+    for pct_col in ("Daily Δ", "Weekly Δ"):
+        if pct_col in visible.columns:
+            visible[pct_col] = visible[pct_col].apply(
+                lambda v: f"{v:+.2%}" if pd.notna(v) else "—"
+            )
+
+    styled = visible.style.apply(
+        lambda row: [_intraday_color(row.get("Status", ""))] * len(row), axis=1
+    )
+    st.dataframe(styled, use_container_width=True, hide_index=True)
+
+st.divider()
 
 st.header("Circuit Breaker Events")
 st.caption("Full history of TRIGGERED / RESET / AUTO_RESET events.")

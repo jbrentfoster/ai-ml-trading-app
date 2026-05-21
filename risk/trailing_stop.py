@@ -28,12 +28,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Callable, Optional
 
 from config.settings import config
 from core.logger import get_logger
 
 log = get_logger("risk.trailing_stop")
+
+# Sub-cent moves are ignored when comparing a logged trail trigger against the
+# live Order.trailStopPrice — IBKR rounds to the contract tick (1¢ for US
+# equities) and a comparison tighter than the tick would generate spurious
+# RATCHETED rows on floating-point noise alone.
+_RATCHET_EPSILON: float = 0.01
 
 
 @dataclass
@@ -45,9 +51,19 @@ class TrailingStopAction:
     where re-fetching ATR would be wasted I/O) can write NULL to
     trailing_stop_log instead of misleading 0.0 values that quietly skew any
     dashboard aggregation.
+
+    ``action`` values:
+      * "CONVERTED" — bracket TP→TRAIL conversion succeeded this run
+      * "RATCHETED" — TRAIL was already active and IBKR has ratcheted the
+                      stop trigger up since the last log entry for this symbol
+                      (intraday-runner observability; not a state change we
+                      caused)
+      * "SKIPPED"   — evaluated but no action taken (already active without
+                      ratchet, below activation, no ATR, manual position, etc.)
+      * "FAILED"    — conversion attempted but a cancel or submit raised
     """
     symbol:        str
-    action:        str        # "CONVERTED" | "SKIPPED" | "FAILED"
+    action:        str        # "CONVERTED" | "RATCHETED" | "SKIPPED" | "FAILED"
     shares:        int                  = 0
     entry_price:   Optional[float]      = None
     current_price: Optional[float]      = None
@@ -83,7 +99,13 @@ class TrailingStopManager:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def manage(self, run_id: str = "") -> list[TrailingStopAction]:
+    def manage(
+        self,
+        run_id: str = "",
+        *,
+        price_source: Optional[Callable[[str], float]] = None,
+        intraday: bool = False,
+    ) -> list[TrailingStopAction]:
         """
         Walk current long positions and convert qualifying bracket TPs into
         trailing stops.  Returns one action record per position evaluated.
@@ -92,6 +114,37 @@ class TrailingStopManager:
         retrospective view (action, entry/current/ATR, trail distance, reason).
         Failures in the persist step are swallowed — logging a row is less
         important than completing the IBKR conversions cleanly.
+
+        Parameters
+        ----------
+        run_id :
+            Persisted to ``trailing_stop_log.run_id`` for run-scoped queries.
+        price_source :
+            Optional sync callable mapping symbol → current price.  When
+            ``None`` (the default — preserves existing daily-runner behavior),
+            current price is read from ``ohlcv_bars`` via ``get_bars(..., limit=1)``.
+            When provided, ``price_source(symbol)`` is called for each evaluated
+            position.  The intraday runner passes a wrapper around
+            ``IBKRConnection.get_last_price()`` so mid-day evaluations use the
+            live IBKR quote instead of yesterday's stored close.
+
+            ATR continues to come from ``indicator_snapshots`` regardless —
+            it is a daily-bar-derived value and does not change intraday.  The
+            trail distance computed when a conversion fires is therefore
+            "ATR-as-of-last-completed-bar", not "ATR-as-of-now".
+        intraday :
+            Signals that this is an intraday cadence run (not the 09:35 ET
+            daily runner).  When True, two gates engage:
+
+              * If ``config.risk.intraday_trail_conversion_enabled`` is False
+                (the default), bracket→TRAIL conversions are suppressed —
+                this run only logs ratchet events and SKIPPED rows.
+              * If conversions are enabled, the activation threshold is
+                tightened by ``config.risk.intraday_conversion_buffer_atr ×
+                ATR`` on top of the daily ``trailing_stop_activation_atr ×
+                ATR`` requirement.  The buffer keeps mid-day conversions to
+                genuinely-strong moves where the cancel+place "no stop"
+                window is least risky.
         """
         if not self._cfg.trailing_stop_enabled:
             log.debug("Trailing stops disabled in config; skipping")
@@ -129,7 +182,10 @@ class TrailingStopManager:
                 actions.append(action)
                 self._persist(action)
                 continue
-            action = self._evaluate_position(pos, shares, open_orders)
+            action = self._evaluate_position(
+                pos, shares, open_orders,
+                price_source=price_source, intraday=intraday,
+            )
             if action is not None:
                 action.run_id = run_id
                 actions.append(action)
@@ -139,23 +195,53 @@ class TrailingStopManager:
     # ── Per-position evaluation ───────────────────────────────────────────────
 
     def _evaluate_position(
-        self, pos: dict, shares: int, open_orders: list[dict]
+        self,
+        pos: dict,
+        shares: int,
+        open_orders: list[dict],
+        *,
+        price_source: Optional[Callable[[str], float]] = None,
+        intraday: bool = False,
     ) -> Optional[TrailingStopAction]:
         symbol = pos["symbol"]
 
-        # 1. Idempotency — skip if a TRAIL order is already open.
-        if any(
-            o.get("symbol") == symbol and o.get("order_type") == "TRAIL"
-            for o in open_orders
-        ):
-            # Populate the cheap-to-fetch fields so the trailing_stop_log row
-            # is informative ("we're at $X, entry was $Y") rather than
-            # all-zeros.  atr / trail_amount stay None — the trail was sized
-            # at the moment of conversion in a prior run; the current ATR is
-            # not what's protecting this position anymore, and writing
-            # today's value would be misleading.
+        # 1. Idempotency — if a TRAIL order is already open, this is either a
+        #    no-op (already converted; nothing to do) or a ratchet event worth
+        #    logging.  Capture the TRAIL leg so we can read its live trigger
+        #    (Order.trailStopPrice) for ratchet detection.
+        existing_trail = next(
+            (o for o in open_orders
+             if o.get("symbol") == symbol and o.get("order_type") == "TRAIL"),
+            None,
+        )
+        if existing_trail is not None:
             entry_price   = float(pos.get("avg_cost", 0.0) or 0.0)
-            current_price = self._get_latest_close(symbol)
+            current_price = self._resolve_current_price(symbol, price_source)
+            # auxPrice (trail distance) is exposed by IBKRConnection.get_open_orders
+            # as the ``stop_price`` field on TRAIL rows.  It doesn't change after
+            # conversion — only the trigger ratchets.
+            trail_distance = self._safe_float(existing_trail.get("stop_price"))
+            live_trigger   = self._safe_float(existing_trail.get("trail_stop_price"))
+
+            ratcheted, prior_trigger = self._detect_ratchet(symbol, live_trigger)
+            if ratcheted:
+                reason = (
+                    f"ratcheted: trigger ${prior_trigger:.2f} → ${live_trigger:.2f}"
+                    if prior_trigger is not None and live_trigger is not None
+                    else "ratcheted (no prior trigger logged)"
+                )
+                return TrailingStopAction(
+                    symbol=symbol, action="RATCHETED", shares=shares,
+                    entry_price=entry_price if entry_price > 0 else None,
+                    current_price=current_price if current_price > 0 else None,
+                    atr=None,
+                    trail_amount=trail_distance,
+                    reason=reason,
+                )
+            # No ratchet detected — preserve the existing SKIPPED behavior so
+            # backward-compat tests keep passing.  atr / trail_amount stay
+            # None on the SKIPPED branch: the trail was sized in a prior run,
+            # so today's ATR isn't what's protecting it.
             return TrailingStopAction(
                 symbol=symbol, action="SKIPPED", shares=shares,
                 entry_price=entry_price if entry_price > 0 else None,
@@ -184,6 +270,21 @@ class TrailingStopManager:
                 reason="no bracket TP/STP legs found (manual position?)",
             )
 
+        # 2b. Intraday conversion gate.  When this is an intraday run AND
+        # mid-day conversions are not enabled, suppress conversion attempts
+        # entirely and log a SKIPPED row (ratchet-only mode for the runner).
+        # The two daily Phase 3.5 calls (paths through signal_runner.py) never
+        # pass intraday=True so this branch is invisible to them.
+        if intraday and not self._cfg.intraday_trail_conversion_enabled:
+            entry_price   = float(pos.get("avg_cost", 0.0) or 0.0)
+            current_price = self._resolve_current_price(symbol, price_source)
+            return TrailingStopAction(
+                symbol=symbol, action="SKIPPED", shares=shares,
+                entry_price=entry_price if entry_price > 0 else None,
+                current_price=current_price if current_price > 0 else None,
+                reason="intraday: conversions disabled (ratchet-only)",
+            )
+
         # 3. Latest ATR.
         from data.database import get_latest_indicators
         ind = get_latest_indicators(symbol, "1d")
@@ -194,10 +295,13 @@ class TrailingStopManager:
                 reason="no ATR available",
             )
 
-        # 4. Current price — use latest daily close from SQLite (no live call
-        # to keep this fast and deterministic).  ATR is daily anyway, so a
-        # daily close is the right comparison point.
-        current_price = self._get_latest_close(symbol)
+        # 4. Current price — daily path reads latest daily close from SQLite;
+        # intraday path uses the supplied price_source (live IBKR quote).
+        # ATR is daily anyway, so the daily close was historically a fine
+        # comparison point — but mid-day at 12:00 ET that close is yesterday's
+        # value, 18+ hours stale.  See "Intraday Phase 3.5 reads price from
+        # IBKR, not the cached daily bar" architectural-decision note.
+        current_price = self._resolve_current_price(symbol, price_source)
         entry_price   = float(pos.get("avg_cost", 0.0) or 0.0)
         if current_price <= 0 or entry_price <= 0:
             return TrailingStopAction(
@@ -206,8 +310,19 @@ class TrailingStopManager:
                 reason="no valid price data",
             )
 
-        # 5. Activation threshold.
-        activation_profit = self._cfg.trailing_stop_activation_atr * atr
+        # 5. Activation threshold.  Intraday runs add a buffer on top of the
+        # daily activation_atr requirement (see intraday_conversion_buffer_atr
+        # in RiskConfig).  Only reached when intraday=True AND
+        # intraday_trail_conversion_enabled=True (the earlier gate at step 2b
+        # short-circuits the disabled case).
+        if intraday:
+            activation_multiplier = (
+                self._cfg.trailing_stop_activation_atr
+                + self._cfg.intraday_conversion_buffer_atr
+            )
+        else:
+            activation_multiplier = self._cfg.trailing_stop_activation_atr
+        activation_profit = activation_multiplier * atr
         threshold         = entry_price + activation_profit
         if current_price < threshold:
             return TrailingStopAction(
@@ -216,7 +331,7 @@ class TrailingStopManager:
                 reason=(
                     f"price {current_price:.2f} below activation "
                     f"{threshold:.2f} (entry {entry_price:.2f} + "
-                    f"{self._cfg.trailing_stop_activation_atr:.1f}×ATR)"
+                    f"{activation_multiplier:.1f}×ATR)"
                 ),
             )
 
@@ -297,6 +412,93 @@ class TrailingStopManager:
         except Exception:
             pass
         return 0.0
+
+    @classmethod
+    def _resolve_current_price(
+        cls,
+        symbol: str,
+        price_source: Optional[Callable[[str], float]],
+    ) -> float:
+        """Return the price input for activation / ratchet checks.
+
+        Daily path (price_source=None) reads the latest bar from ohlcv_bars.
+        Intraday path (price_source supplied) calls the source and tolerates a
+        None/0/raising callable by falling back to 0.0 — the caller treats 0
+        as "no valid price" and emits a SKIPPED row.
+        """
+        if price_source is None:
+            return cls._get_latest_close(symbol)
+        try:
+            value = price_source(symbol)
+        except Exception as exc:
+            log.warning("Custom price_source failed for %s: %s", symbol, exc)
+            return 0.0
+        if value is None:
+            return 0.0
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def _safe_float(value) -> Optional[float]:
+        """Coerce an ib_insync price field to a usable float or None.
+
+        ib_insync fills unused price fields with sys.float_info.max; the
+        ``get_open_orders`` helper already filters those to None for most
+        callers, but defend in depth here in case the caller passes raw
+        order data.
+        """
+        if value is None:
+            return None
+        try:
+            fv = float(value)
+        except (TypeError, ValueError):
+            return None
+        if fv == 0.0:
+            return None
+        # Guard against the sys.float_info.max sentinel from ib_insync.
+        if fv > 1e100 or fv != fv:  # NaN check via self-inequality
+            return None
+        return fv
+
+    @classmethod
+    def _detect_ratchet(
+        cls,
+        symbol: str,
+        live_trigger: Optional[float],
+    ) -> tuple[bool, Optional[float]]:
+        """Compare the live IBKR trail trigger against the last logged trigger.
+
+        Returns ``(ratcheted, prior_trigger)``.  ``ratcheted`` is True only
+        when both the live trigger and a prior-trigger derivation are present
+        AND the live trigger exceeds the prior by more than ``_RATCHET_EPSILON``.
+
+        Prior trigger is derived from the most recent trailing_stop_log row
+        for this symbol: ``last.current_price - last.trail_amount``.  When
+        either field is missing (e.g. the prior row was SKIPPED from the
+        idempotency branch and never populated trail_amount), no comparison
+        is possible — return (False, None).  Same for a TRAIL whose
+        ``trailStopPrice`` IBKR has not yet reported (live_trigger is None).
+        """
+        if live_trigger is None:
+            return False, None
+        try:
+            from data.database import get_latest_trailing_stop_log_for_symbol
+            last = get_latest_trailing_stop_log_for_symbol(symbol)
+        except Exception as exc:
+            log.warning("Could not look up trailing_stop_log for %s: %s", symbol, exc)
+            return False, None
+        if last is None:
+            return False, None
+        prior_price = last.get("current_price")
+        prior_dist  = last.get("trail_amount")
+        if prior_price is None or prior_dist is None:
+            return False, None
+        prior_trigger = float(prior_price) - float(prior_dist)
+        if live_trigger > prior_trigger + _RATCHET_EPSILON:
+            return True, prior_trigger
+        return False, prior_trigger
 
     @staticmethod
     def _persist(action: TrailingStopAction) -> None:

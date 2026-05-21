@@ -16,6 +16,7 @@ Tables:
   order_decisions         — per-signal order decisions from OrderManager
   signal_runner_log       — daily signal_runner.py run summaries
   trade_log               — closed-trade outcomes (walk-forward simulator + live fills)
+  intraday_run_log        — intraday lightweight-runner outcomes (CB check + trail ratchets)
 
 All timestamps are stored as UTC-naive datetimes.
 """
@@ -394,6 +395,40 @@ class TradeLog(Base):
     # silently zeroed).  Populated by scripts/backfill_benchmark_returns.py.
     benchmark_return_pct = Column(Float)
     recorded_at   = Column(DateTime, nullable=False)
+
+
+class IntradayRunLog(Base):
+    """
+    One row per intraday_check.py invocation (12:00 ET / 15:30 ET on weekdays).
+
+    Separate from ``signal_runner_log`` because the intraday runner has a
+    different cadence (multiple per day vs. one per day) and a different scope
+    (Phase 1 circuit-breaker check + Phase 3.5 trailing-stop ratchet-only by
+    default; opt-in mid-day conversions gated by
+    ``RiskConfig.intraday_trail_conversion_enabled``).  Never writes to
+    ``signal_log`` and never regenerates signals — those stay on the daily
+    cadence.
+
+    ``status`` ∈ {'completed', 'gateway_down', 'cb_tripped', 'error'}.
+    Gateway-down rows have NULL loss_pct fields because no IBKR account read
+    succeeded — they exist as observability so a missed run is visible on
+    Page 8 the next morning rather than vanishing silently.
+    """
+    __tablename__ = "intraday_run_log"
+
+    run_id              = Column(String(36), primary_key=True)
+    run_timestamp       = Column(DateTime,   nullable=False)
+    mode                = Column(String(20), nullable=False)  # 'intraday' (future: 'pre-market', etc.)
+    status              = Column(String(20), nullable=False)
+    daily_loss_pct      = Column(Float)
+    weekly_loss_pct     = Column(Float)
+    cb_tripped          = Column(Integer)                     # 0/1, NULL when status='gateway_down'
+    positions_flattened = Column(Integer, default=0)
+    trailing_evaluated  = Column(Integer, default=0)
+    trailing_ratcheted  = Column(Integer, default=0)
+    trailing_converted  = Column(Integer, default=0)
+    duration_seconds    = Column(Float)
+    error_message       = Column(Text)
 
 
 # ── Engine (lazy singleton) ───────────────────────────────────────────────────
@@ -1309,6 +1344,86 @@ def get_trailing_stop_log(
         "trail_amount":  r.trail_amount,
         "reason":        r.reason,
         "decided_at":    r.decided_at,
+    } for r in rows])
+
+
+def get_latest_trailing_stop_log_for_symbol(symbol: str) -> dict | None:
+    """Return the most recent trailing_stop_log row for ``symbol``, or None.
+
+    Used by TrailingStopManager.manage() for ratchet detection: the previous
+    (current_price, trail_amount) pair implies the previous trail trigger
+    (current_price - trail_amount), which is compared against the live
+    Order.trailStopPrice to decide whether IBKR has ratcheted the stop up.
+    """
+    engine = get_engine()
+    with Session(engine) as session:
+        row = (
+            session.query(TrailingStopLog)
+            .filter(TrailingStopLog.symbol == symbol)
+            .order_by(desc(TrailingStopLog.decided_at))
+            .first()
+        )
+    if not row:
+        return None
+    return {
+        "run_id":        row.run_id,
+        "symbol":        row.symbol,
+        "action":        row.action,
+        "shares":        row.shares,
+        "entry_price":   row.entry_price,
+        "current_price": row.current_price,
+        "atr":           row.atr,
+        "trail_amount":  row.trail_amount,
+        "reason":        row.reason,
+        "decided_at":    row.decided_at,
+    }
+
+
+# ── Intraday run log helpers ──────────────────────────────────────────────────
+
+def log_intraday_run(record: dict) -> None:
+    """Persist one intraday_check.py run summary."""
+    engine = get_engine()
+    with Session(engine) as session:
+        session.add(IntradayRunLog(**record))
+        session.commit()
+
+
+def get_intraday_run_log(
+    limit: int = 50,
+    on_date: str | None = None,
+) -> pd.DataFrame:
+    """Return recent intraday_run_log entries, newest first.
+
+    Pass ``on_date`` (YYYY-MM-DD) to scope to a single calendar day — used by
+    Page 8's "Intraday checks (today)" section.
+    """
+    engine = get_engine()
+    with Session(engine) as session:
+        q = session.query(IntradayRunLog)
+        if on_date:
+            # SQLite stores DATETIME as ISO text; substring match is the simplest
+            # date filter that does not depend on driver-specific date functions.
+            q = q.filter(func.substr(
+                func.cast(IntradayRunLog.run_timestamp, String), 1, 10
+            ) == on_date)
+        rows = q.order_by(desc(IntradayRunLog.run_timestamp)).limit(limit).all()
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame([{
+        "run_id":              r.run_id,
+        "run_timestamp":       r.run_timestamp,
+        "mode":                r.mode,
+        "status":              r.status,
+        "daily_loss_pct":      r.daily_loss_pct,
+        "weekly_loss_pct":     r.weekly_loss_pct,
+        "cb_tripped":          r.cb_tripped,
+        "positions_flattened": r.positions_flattened,
+        "trailing_evaluated":  r.trailing_evaluated,
+        "trailing_ratcheted":  r.trailing_ratcheted,
+        "trailing_converted":  r.trailing_converted,
+        "duration_seconds":    r.duration_seconds,
+        "error_message":       r.error_message,
     } for r in rows])
 
 

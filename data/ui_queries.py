@@ -50,6 +50,7 @@ from data.database import (
     get_circuit_breaker_log,
     get_engine,
     get_fundamentals,
+    get_intraday_run_log,
     get_latest_circuit_breaker_event,
     get_latest_indicators,
     get_order_decisions,
@@ -692,6 +693,39 @@ def query_signal_runner_log(limit: int = 50) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=60)
+@st.cache_data(ttl=60)
+def query_intraday_run_log_today() -> pd.DataFrame:
+    """Return today's intraday_run_log rows (newest first) for Page 8.
+
+    Short TTL (60s) because intraday runs land mid-day and the operator may
+    look at Page 8 immediately after an intraday slot fires.  Daily-runner
+    tables use ttl=300 because their rows only land once per day.
+    """
+    today_local = datetime.now(timezone.utc).astimezone().date().strftime("%Y-%m-%d")
+    df = get_intraday_run_log(limit=50, on_date=today_local)
+    if df.empty:
+        return df
+    df = df.copy()
+    if "run_timestamp" in df.columns:
+        df["run_timestamp"] = _to_local_series(df["run_timestamp"])
+    rename = {
+        "run_id":              "Run ID",
+        "run_timestamp":       "When",
+        "mode":                "Mode",
+        "status":              "Status",
+        "daily_loss_pct":      "Daily Δ",
+        "weekly_loss_pct":     "Weekly Δ",
+        "cb_tripped":          "CB tripped",
+        "positions_flattened": "Flattened",
+        "trailing_evaluated":  "Trail eval",
+        "trailing_ratcheted":  "Ratchets",
+        "trailing_converted":  "Conversions",
+        "duration_seconds":    "Duration (s)",
+        "error_message":       "Error",
+    }
+    return df.rename(columns=rename)
+
+
 def query_trailing_stop_log(
     limit: int = 100,
     run_id: str | None = None,

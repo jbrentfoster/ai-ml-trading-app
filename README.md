@@ -149,6 +149,7 @@ The daily and weekly runs are driven by two batch files that execute the pipelin
 | File | When | Steps |
 |------|------|-------|
 | `run_daily.bat` | Mon–Fri 09:40 AM | `run_pipeline.py` → `universe_scheduler.py --rescore-now --no-signal-run` → `train_models.py` (new symbols only) → `signal_runner.py` (data refresh → signals → trailing-stop conversion → new orders) |
+| `run_intraday.bat` | Mon–Fri 12:00 PM ET and 03:30 PM ET | `intraday_check.py` — Phase 1 circuit-breaker check + Phase 3.5 trailing-stop re-evaluation against live IBKR price.  Two scheduled slots per day.  Ratchet-only by default (no new TP→TRAIL conversions; opt-in via `RiskConfig.intraday_trail_conversion_enabled`).  Exits 0 on Gateway-down with a `status='gateway_down'` row in `intraday_run_log` so missed runs are visible on Page 8. |
 | `run_eod.bat`   | Mon–Fri 04:30 PM ET | `refresh_recent_bars.py` — re-fetches the last 5 days of OHLCV + indicators for the union of (active universe, recently-acted symbols, held positions) and overwrites the mid-day partial bars the morning `signal_runner` Phase 2 wrote |
 | `run_weekly.bat` | Sunday 01:00 AM | `universe_scheduler.py --run-now` → `run_pipeline.py` → `train_models.py --force` → `backfill_benchmark_returns.py` |
 
@@ -172,6 +173,9 @@ logs/
   daily/
     daily_run_20260416.log     ← one file per run
     daily_run_20260417.log
+  intraday/
+    intraday_run_20260416_1200.log  ← one file per run_intraday.bat execution
+    intraday_run_20260416_1530.log  (HHMM in filename — multiple runs per day)
   eod/
     eod_run_20260416.log       ← one file per run_eod.bat execution
   weekly/
@@ -202,6 +206,12 @@ Open PowerShell **as Administrator** and run:
 # Mon–Fri at 09:40 AM (pre-market signal run)
 schtasks /create /tn "TradingApp\DailyRun" /tr '"C:\Users\jbren\OneDrive\Documents\VS_Code\trading_app\run_daily.bat"' /sc WEEKLY /d MON,TUE,WED,THU,FRI /st 09:40 /rl HIGHEST /f
 
+# Mon–Fri at 12:00 PM (intraday slot 1 — CB check + trail re-eval)
+schtasks /create /tn "TradingApp\IntradayMidday" /tr '"C:\Users\jbren\OneDrive\Documents\VS_Code\trading_app\run_intraday.bat"' /sc WEEKLY /d MON,TUE,WED,THU,FRI /st 12:00 /rl HIGHEST /f
+
+# Mon–Fri at 03:30 PM (intraday slot 2 — CB check + trail re-eval, 30 min before close)
+schtasks /create /tn "TradingApp\IntradayLateAfternoon" /tr '"C:\Users\jbren\OneDrive\Documents\VS_Code\trading_app\run_intraday.bat"' /sc WEEKLY /d MON,TUE,WED,THU,FRI /st 15:30 /rl HIGHEST /f
+
 # Mon–Fri at 04:30 PM (post-close bar refresh)
 schtasks /create /tn "TradingApp\EodRun" /tr '"C:\Users\jbren\OneDrive\Documents\VS_Code\trading_app\run_eod.bat"' /sc WEEKLY /d MON,TUE,WED,THU,FRI /st 16:30 /rl HIGHEST /f
 
@@ -211,10 +221,14 @@ schtasks /create /tn "TradingApp\WeeklyRun" /tr '"C:\Users\jbren\OneDrive\Docume
 
 Verify registration:
 ```powershell
-schtasks /query /tn "TradingApp\DailyRun"  /fo LIST
-schtasks /query /tn "TradingApp\EodRun"    /fo LIST
-schtasks /query /tn "TradingApp\WeeklyRun" /fo LIST
+schtasks /query /tn "TradingApp\DailyRun"              /fo LIST
+schtasks /query /tn "TradingApp\IntradayMidday"        /fo LIST
+schtasks /query /tn "TradingApp\IntradayLateAfternoon" /fo LIST
+schtasks /query /tn "TradingApp\EodRun"                /fo LIST
+schtasks /query /tn "TradingApp\WeeklyRun"             /fo LIST
 ```
+
+> **Intraday scheduling notes.** Both intraday slots use the same `run_intraday.bat` wrapper — only the time differs.  Run with `--dry-run` (the default in `intraday_check.py` itself) for the first few sessions to validate timing and Gateway availability before flipping the batch file to `--no-dry-run`.  The CB-flatten path only fires under `--no-dry-run` + `paper_orders_enabled=True`; the trail-ratchet logging runs in both modes.  See CLAUDE.md "Key Architectural Decisions" → *Intraday runner exits 0 on Gateway-down rather than raising* for why a missed slot writes a `gateway_down` row instead of failing the scheduled task.
 
 > **Note:** Tasks are created with **Interactive only** logon mode — they run when you are logged in. If the machine reboots and you have not logged back in by 09:40 AM, that day's run will be skipped. To change this, open Task Scheduler → TradingApp → task Properties → General → select **"Run whether user is logged on or not"**.
 

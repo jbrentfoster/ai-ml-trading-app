@@ -282,6 +282,28 @@ class RiskConfig:
     # bracket's original stop)
     trailing_stop_trail_atr: float = 2.0
 
+    # ── Intraday trailing-stop runner (scripts/intraday_check.py) ────────────
+    # The intraday runner (12:00 ET / 15:30 ET on weekdays) re-evaluates
+    # trailing stops against live IBKR price.  By default it only logs
+    # ratchet events and does NOT perform new bracket TP→TRAIL conversions —
+    # mid-day conversions face a sub-second "no stop" window during the
+    # cancel-TP / cancel-STP / submit-TRAIL sequence that is riskier than the
+    # same window at 09:35 (lower liquidity, faster moves).  Flip this to
+    # True (and ensure ``paper_orders_enabled=True``) to allow intraday
+    # conversions, but only after operational experience with the runner.
+    intraday_trail_conversion_enabled: bool = False
+
+    # When intraday conversions are enabled, an additional buffer above the
+    # daily-Phase-3.5 activation threshold is required: a position only
+    # converts mid-day if ``current_price >= entry +
+    # (trailing_stop_activation_atr + intraday_conversion_buffer_atr) × ATR``.
+    # The buffer exists because anything still un-converted by 12:00 ET was
+    # already evaluated at 09:35 ET against the same daily ATR — anything
+    # close to activation by mid-day has, by definition, just crossed the
+    # threshold, and the marginal cases are the worst-positioned for the
+    # no-stop window risk.
+    intraday_conversion_buffer_atr: float = 0.5
+
     # ── Hold timeout ──────────────────────────────────────────────────────────
     # When True and paper_orders_enabled=True, the signal runner closes any
     # held long that hasn't received a fresh BUY signal (signal_log row with

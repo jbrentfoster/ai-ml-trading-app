@@ -351,3 +351,364 @@ class TestTrailingStopManager:
         assert "place TRAIL failed" in actions[0].reason
         # Both cancels were attempted before the failed submit.
         assert ibkr.cancel_order.await_count == 2
+
+
+# ── Phase 1: price_source + ratchet detection (intraday-runner plumbing) ──────
+
+class TestPriceSourceParameter:
+    """Backward-compat + new override path for the intraday runner.
+
+    The daily signal_runner calls ``manage()`` with no kwargs and must keep
+    reading from ohlcv_bars (the legacy path).  The intraday runner passes a
+    ``price_source`` callable so mid-day evaluation uses the live IBKR quote
+    instead of yesterday's stored close.
+    """
+
+    def test_trailing_manager_default_uses_db(self, loop):
+        """Backward compat: manage() with no price_source still reads get_bars."""
+        ibkr = _ibkr_stub(
+            positions=[{"symbol": "AAPL", "quantity": 100, "avg_cost": 100.0}],
+            open_orders=_bracket_orders("AAPL"),
+        )
+        mgr = TrailingStopManager(ibkr, loop)
+
+        with (
+            patch("risk.trailing_stop.config") as cfg,
+            patch("data.database.get_latest_indicators", return_value={"atr_14": 2.0}),
+            patch("data.database.get_bars",
+                  return_value=pd.DataFrame({"Close": [103.0]})) as mock_get_bars,
+        ):
+            cfg.risk.trailing_stop_enabled = True
+            cfg.risk.trailing_stop_activation_atr = 1.0
+            cfg.risk.trailing_stop_trail_atr = 2.0
+            actions = mgr.manage()
+
+        # The DB read happened — that's the regression guard against
+        # accidentally breaking the daily-runner code path while wiring up
+        # the intraday-runner one.
+        assert mock_get_bars.called, "get_bars should be invoked when price_source is None"
+        assert actions[0].action == "CONVERTED"
+        assert actions[0].current_price == pytest.approx(103.0)
+
+    def test_trailing_manager_with_price_source_skips_db(self, loop):
+        """price_source supplied → get_bars NOT called for current price.
+
+        The activation path uses the live source ($105) instead of whatever
+        the DB might contain.  get_latest_indicators is still called (ATR is
+        daily-bar-derived and doesn't change intraday — documented).
+        """
+        ibkr = _ibkr_stub(
+            positions=[{"symbol": "AAPL", "quantity": 100, "avg_cost": 100.0}],
+            open_orders=_bracket_orders("AAPL"),
+        )
+        mgr = TrailingStopManager(ibkr, loop)
+        live_quote = MagicMock(return_value=105.0)
+
+        with (
+            patch("risk.trailing_stop.config") as cfg,
+            patch("data.database.get_latest_indicators", return_value={"atr_14": 2.0}),
+            # If get_bars is called by mistake, return a wildly different price
+            # so the activation check would fail and the test would catch it.
+            patch("data.database.get_bars",
+                  return_value=pd.DataFrame({"Close": [90.0]})) as mock_get_bars,
+        ):
+            cfg.risk.trailing_stop_enabled = True
+            cfg.risk.trailing_stop_activation_atr = 1.0
+            cfg.risk.trailing_stop_trail_atr = 2.0
+            cfg.risk.intraday_trail_conversion_enabled = True
+            cfg.risk.intraday_conversion_buffer_atr = 0.5
+            actions = mgr.manage(price_source=live_quote, intraday=True)
+
+        live_quote.assert_called_once_with("AAPL")
+        assert not mock_get_bars.called, "get_bars must not be called when price_source supplied"
+        # Activation: entry $100 + (1.0 + 0.5) × $2 ATR = $103.  Live $105 clears.
+        assert actions[0].action == "CONVERTED"
+        assert actions[0].current_price == pytest.approx(105.0)
+
+
+class TestRatchetDetection:
+    """The intraday runner's second job: log when IBKR has ratcheted the
+    trailing stop up since the last logged entry, so Page 8 can show the
+    ratchet history without a separate IBKR poll."""
+
+    def test_ratchet_detected_when_live_trigger_above_prior(self, loop, monkeypatch):
+        """Prior log row: current_price=$100, trail_amount=$4 → prior trigger=$96.
+        Live IBKR Order.trailStopPrice=$99 → ratchet of +$3 → RATCHETED row."""
+        live_trail = {
+            "order_id": 5001, "symbol": "AAPL", "action": "SELL",
+            "order_type": "TRAIL", "limit_price": None,
+            "stop_price": 4.0,                # auxPrice = trail distance
+            "trail_stop_price": 99.0,         # IBKR's live ratcheting trigger
+            "quantity": 100, "status": "Submitted",
+        }
+        ibkr = _ibkr_stub(
+            positions=[{"symbol": "AAPL", "quantity": 100, "avg_cost": 100.0}],
+            open_orders=[live_trail],
+        )
+        mgr = TrailingStopManager(ibkr, loop)
+
+        # Prior log row: trigger $96 implied by current_price - trail_amount.
+        import data.database as db
+        monkeypatch.setattr(
+            db, "get_latest_trailing_stop_log_for_symbol",
+            lambda sym: {
+                "current_price": 100.0,
+                "trail_amount":  4.0,
+                "action":        "CONVERTED",
+            },
+        )
+
+        with (
+            patch("risk.trailing_stop.config") as cfg,
+            patch("data.database.get_bars",
+                  return_value=pd.DataFrame({"Close": [107.0]})),
+        ):
+            cfg.risk.trailing_stop_enabled = True
+            cfg.risk.trailing_stop_activation_atr = 2.0
+            cfg.risk.trailing_stop_trail_atr = 2.0
+            actions = mgr.manage()
+
+        assert len(actions) == 1
+        assert actions[0].action == "RATCHETED"
+        assert actions[0].trail_amount == pytest.approx(4.0)
+        assert "96.00" in actions[0].reason
+        assert "99.00" in actions[0].reason
+
+    def test_no_ratchet_when_live_trigger_unchanged(self, loop, monkeypatch):
+        """Live trigger equals prior trigger → SKIPPED, not RATCHETED.
+        Defends against floating-point noise emitting spurious ratchet rows."""
+        live_trail = {
+            "order_id": 5002, "symbol": "AAPL", "action": "SELL",
+            "order_type": "TRAIL", "limit_price": None,
+            "stop_price": 4.0, "trail_stop_price": 96.005,  # within epsilon
+            "quantity": 100, "status": "Submitted",
+        }
+        ibkr = _ibkr_stub(
+            positions=[{"symbol": "AAPL", "quantity": 100, "avg_cost": 100.0}],
+            open_orders=[live_trail],
+        )
+        mgr = TrailingStopManager(ibkr, loop)
+
+        import data.database as db
+        monkeypatch.setattr(
+            db, "get_latest_trailing_stop_log_for_symbol",
+            lambda sym: {"current_price": 100.0, "trail_amount": 4.0,
+                         "action": "CONVERTED"},
+        )
+
+        with (
+            patch("risk.trailing_stop.config") as cfg,
+            patch("data.database.get_bars",
+                  return_value=pd.DataFrame({"Close": [107.0]})),
+        ):
+            cfg.risk.trailing_stop_enabled = True
+            cfg.risk.trailing_stop_activation_atr = 2.0
+            cfg.risk.trailing_stop_trail_atr = 2.0
+            actions = mgr.manage()
+
+        assert actions[0].action == "SKIPPED"
+        assert "already active" in actions[0].reason
+
+    def test_no_ratchet_when_no_prior_log_row(self, loop, monkeypatch):
+        """First time we see this TRAIL — no prior to compare against."""
+        live_trail = {
+            "order_id": 5003, "symbol": "AAPL", "action": "SELL",
+            "order_type": "TRAIL", "limit_price": None,
+            "stop_price": 4.0, "trail_stop_price": 95.0,
+            "quantity": 100, "status": "Submitted",
+        }
+        ibkr = _ibkr_stub(
+            positions=[{"symbol": "AAPL", "quantity": 100, "avg_cost": 100.0}],
+            open_orders=[live_trail],
+        )
+        mgr = TrailingStopManager(ibkr, loop)
+
+        import data.database as db
+        monkeypatch.setattr(
+            db, "get_latest_trailing_stop_log_for_symbol", lambda sym: None,
+        )
+
+        with (
+            patch("risk.trailing_stop.config") as cfg,
+            patch("data.database.get_bars",
+                  return_value=pd.DataFrame({"Close": [107.0]})),
+        ):
+            cfg.risk.trailing_stop_enabled = True
+            cfg.risk.trailing_stop_activation_atr = 2.0
+            actions = mgr.manage()
+
+        assert actions[0].action == "SKIPPED"
+
+    def test_no_ratchet_when_live_trigger_not_yet_reported(self, loop):
+        """IBKR hasn't sent the first trailStopPrice update yet → SKIPPED.
+        Common on the first intraday check after a morning conversion."""
+        live_trail = {
+            "order_id": 5004, "symbol": "AAPL", "action": "SELL",
+            "order_type": "TRAIL", "limit_price": None,
+            "stop_price": 4.0,
+            "trail_stop_price": None,         # not yet populated by IBKR
+            "quantity": 100, "status": "Submitted",
+        }
+        ibkr = _ibkr_stub(
+            positions=[{"symbol": "AAPL", "quantity": 100, "avg_cost": 100.0}],
+            open_orders=[live_trail],
+        )
+        mgr = TrailingStopManager(ibkr, loop)
+
+        with (
+            patch("risk.trailing_stop.config") as cfg,
+            patch("data.database.get_bars",
+                  return_value=pd.DataFrame({"Close": [107.0]})),
+        ):
+            cfg.risk.trailing_stop_enabled = True
+            cfg.risk.trailing_stop_activation_atr = 2.0
+            actions = mgr.manage()
+
+        # No live trigger to compare → can't claim a ratchet.  SKIPPED, not
+        # RATCHETED.  No DB lookup needed either (short-circuits before that).
+        assert actions[0].action == "SKIPPED"
+
+
+class TestIntradayConversionGate:
+    """When intraday=True AND config.intraday_trail_conversion_enabled=False
+    (the default), conversions are suppressed even if the position would
+    otherwise qualify.  Buffer applied on top of activation_atr when enabled.
+    """
+
+    def test_intraday_conversion_suppressed_by_default(self, loop):
+        """Position would qualify for conversion at the daily activation
+        threshold, but intraday=True + config flag off → SKIPPED."""
+        ibkr = _ibkr_stub(
+            positions=[{"symbol": "AAPL", "quantity": 100, "avg_cost": 100.0}],
+            open_orders=_bracket_orders("AAPL"),
+        )
+        mgr = TrailingStopManager(ibkr, loop)
+        live_quote = MagicMock(return_value=103.0)
+
+        with (
+            patch("risk.trailing_stop.config") as cfg,
+            patch("data.database.get_latest_indicators", return_value={"atr_14": 2.0}),
+        ):
+            cfg.risk.trailing_stop_enabled = True
+            cfg.risk.trailing_stop_activation_atr = 1.0      # threshold $102
+            cfg.risk.trailing_stop_trail_atr = 2.0
+            cfg.risk.intraday_trail_conversion_enabled = False
+            cfg.risk.intraday_conversion_buffer_atr = 0.5
+            actions = mgr.manage(price_source=live_quote, intraday=True)
+
+        assert actions[0].action == "SKIPPED"
+        assert "ratchet-only" in actions[0].reason.lower() or \
+               "conversions disabled" in actions[0].reason.lower()
+        # No cancel / place attempted in ratchet-only mode.
+        ibkr.cancel_order.assert_not_called()
+        ibkr.place_trailing_stop.assert_not_called()
+
+    def test_intraday_conversion_requires_buffer_above_activation(self, loop):
+        """With conversions enabled, intraday needs activation_atr + buffer ATRs.
+        Daily-runner-qualifying $103 sits between daily threshold $102 and
+        intraday threshold $103 (entry $100 + (1.0 + 0.5)×$2 = $103) — equal
+        is not strictly greater, so still SKIPPED.  Step up to $103.50."""
+        ibkr = _ibkr_stub(
+            positions=[{"symbol": "AAPL", "quantity": 100, "avg_cost": 100.0}],
+            open_orders=_bracket_orders("AAPL"),
+        )
+        mgr = TrailingStopManager(ibkr, loop)
+
+        # Sub-threshold: $102.99 fails the intraday threshold $103.
+        live_quote = MagicMock(return_value=102.99)
+        with (
+            patch("risk.trailing_stop.config") as cfg,
+            patch("data.database.get_latest_indicators", return_value={"atr_14": 2.0}),
+        ):
+            cfg.risk.trailing_stop_enabled = True
+            cfg.risk.trailing_stop_activation_atr = 1.0
+            cfg.risk.trailing_stop_trail_atr = 2.0
+            cfg.risk.intraday_trail_conversion_enabled = True
+            cfg.risk.intraday_conversion_buffer_atr = 0.5
+            actions = mgr.manage(price_source=live_quote, intraday=True)
+        assert actions[0].action == "SKIPPED"
+        assert "below activation" in actions[0].reason
+
+        # Step up: $103.50 clears the intraday threshold.
+        live_quote2 = MagicMock(return_value=103.50)
+        ibkr2 = _ibkr_stub(
+            positions=[{"symbol": "AAPL", "quantity": 100, "avg_cost": 100.0}],
+            open_orders=_bracket_orders("AAPL"),
+        )
+        mgr2 = TrailingStopManager(ibkr2, loop)
+        with (
+            patch("risk.trailing_stop.config") as cfg,
+            patch("data.database.get_latest_indicators", return_value={"atr_14": 2.0}),
+        ):
+            cfg.risk.trailing_stop_enabled = True
+            cfg.risk.trailing_stop_activation_atr = 1.0
+            cfg.risk.trailing_stop_trail_atr = 2.0
+            cfg.risk.intraday_trail_conversion_enabled = True
+            cfg.risk.intraday_conversion_buffer_atr = 0.5
+            actions2 = mgr2.manage(price_source=live_quote2, intraday=True)
+        assert actions2[0].action == "CONVERTED"
+
+
+class TestIntradayRunLogSchema:
+    """Phase 1 verification: the new intraday_run_log table is created on
+    first DB engine init and exposes the expected columns."""
+
+    def test_intraday_run_log_table_exists_with_columns(self, tmp_path, monkeypatch):
+        """Fresh DB → create_all + _migrate run → intraday_run_log present."""
+        from config.settings import config as _cfg
+        import data.database as db
+
+        # Point the engine at a throwaway DB and reset the singleton so this
+        # test creates its own fresh engine.
+        monkeypatch.setattr(_cfg.data, "db_path", str(tmp_path / "test.db"))
+        monkeypatch.setattr(db, "_engine", None)
+        engine = db.get_engine()
+
+        from sqlalchemy import inspect
+        insp = inspect(engine)
+        assert "intraday_run_log" in insp.get_table_names()
+
+        cols = {c["name"] for c in insp.get_columns("intraday_run_log")}
+        expected = {
+            "run_id", "run_timestamp", "mode", "status",
+            "daily_loss_pct", "weekly_loss_pct", "cb_tripped",
+            "positions_flattened", "trailing_evaluated",
+            "trailing_ratcheted", "trailing_converted",
+            "duration_seconds", "error_message",
+        }
+        missing = expected - cols
+        assert not missing, f"Missing columns in intraday_run_log: {missing}"
+
+    def test_log_intraday_run_round_trip(self, tmp_path, monkeypatch):
+        """Schema is wired correctly end-to-end: write + read returns the row."""
+        from config.settings import config as _cfg
+        import data.database as db
+        from datetime import datetime, timezone
+
+        monkeypatch.setattr(_cfg.data, "db_path", str(tmp_path / "test.db"))
+        monkeypatch.setattr(db, "_engine", None)
+
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        db.log_intraday_run({
+            "run_id":              "abc-123",
+            "run_timestamp":       now,
+            "mode":                "intraday",
+            "status":              "completed",
+            "daily_loss_pct":      -0.01,
+            "weekly_loss_pct":     -0.02,
+            "cb_tripped":          0,
+            "positions_flattened": 0,
+            "trailing_evaluated":  3,
+            "trailing_ratcheted":  1,
+            "trailing_converted":  0,
+            "duration_seconds":    2.4,
+            "error_message":       None,
+        })
+
+        df = db.get_intraday_run_log(limit=10)
+        assert len(df) == 1
+        row = df.iloc[0]
+        assert row["run_id"] == "abc-123"
+        assert row["status"] == "completed"
+        assert row["trailing_ratcheted"] == 1
+        assert row["mode"] == "intraday"

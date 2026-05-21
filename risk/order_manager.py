@@ -509,3 +509,115 @@ class OrderManager:
         except Exception as exc:
             log.error("Bracket order submission failed for %s: %s", symbol, exc)
             return False
+
+
+# ── Module-level flatten helper (used by the intraday CB-trip path) ───────────
+
+def flatten_all_longs(ibkr, loop, run_id: str = "") -> int:
+    """Cancel bracket children for every long position then market-sell each one.
+
+    Triggered by the intraday runner when the circuit breaker auto-trips —
+    the operational stance is "stop bleeding now; reconcile later."  Does not
+    open shorts (long-only codepath) and does not depend on a SignalResult
+    (the trigger is a portfolio-level loss, not a per-symbol signal).
+
+    Each closure is persisted to ``order_decisions`` with
+    ``decision='CB_FLATTENED'`` so Page 8 can show what the breaker did.
+
+    Bracket-child cancel filter is the broader 4-type set including TRAIL.
+    The existing ``OrderManager._cancel_bracket_children`` has a 3-type filter
+    that misses TRAIL — that bug is tracked separately and is intentionally
+    NOT fixed in this PR (different codepath, different test surface).  The
+    intraday flatten path is built correct from day one.
+
+    Returns the count of positions flattened.  Caller logs the count; this
+    function does not raise on per-position failures (a failed cancel of one
+    symbol's bracket should not block flattening the rest).
+    """
+    try:
+        positions = loop.run_until_complete(ibkr.get_positions())
+    except Exception as exc:
+        log.error("flatten_all_longs: could not fetch positions: %s", exc)
+        return 0
+
+    long_positions = [p for p in positions if int(p.get("quantity", 0) or 0) > 0]
+    if not long_positions:
+        return 0
+
+    try:
+        open_orders = loop.run_until_complete(ibkr.get_open_orders())
+    except Exception as exc:
+        log.error(
+            "flatten_all_longs: could not fetch open orders (%s) — "
+            "proceeding to flatten WITHOUT pre-cancelling bracket children; "
+            "orphan stops may remain live and open unintended shorts post-close",
+            exc,
+        )
+        open_orders = []
+
+    flattened = 0
+    for pos in long_positions:
+        symbol = pos.get("symbol")
+        shares = int(pos.get("quantity", 0) or 0)
+        if not symbol or shares <= 0:
+            continue
+
+        # Cancel any open bracket children (LMT TP, STP / STP LMT stop, TRAIL)
+        # before the market sell.  Same broader filter the Phase 3.6 hold-timeout
+        # path uses — TRAIL inclusion is critical so a converted trailing stop
+        # doesn't fire against zero shares after the flatten and open a short.
+        targets = [
+            o for o in open_orders
+            if o.get("symbol") == symbol
+            and o.get("action") == "SELL"
+            and o.get("order_type") in ("LMT", "STP", "STP LMT", "TRAIL")
+        ]
+        for o in targets:
+            order_id = o.get("order_id")
+            try:
+                loop.run_until_complete(ibkr.cancel_order(order_id))
+                log.info(
+                    "[%s] CB-flatten: cancelled bracket child %s id=%s",
+                    symbol, o.get("order_type"), order_id,
+                )
+            except Exception as exc:
+                log.error(
+                    "[%s] CB-flatten: could not cancel bracket child id=%s: %s — "
+                    "orphan order may remain live in IBKR",
+                    symbol, order_id, exc,
+                )
+
+        entry_price = float(pos.get("avg_cost", 0.0) or 0.0)
+        ok = False
+        try:
+            loop.run_until_complete(ibkr.place_market_order(symbol, "SELL", shares))
+            log.info(
+                "[%s] CB-flatten: market close submitted (%d shares)", symbol, shares
+            )
+            ok = True
+        except Exception as exc:
+            log.error("[%s] CB-flatten: market close failed: %s", symbol, exc)
+
+        # Persist the decision regardless of fill outcome — both states are
+        # interesting for post-mortem.
+        try:
+            log_order_decision({
+                "run_id":            run_id,
+                "symbol":            symbol,
+                "signal":            "SELL",
+                "decision":          "CB_FLATTENED" if ok else "REJECTED",
+                "shares":            shares,
+                "entry_price":       entry_price,
+                "stop_price":        0.0,
+                "take_profit_price": 0.0,
+                "position_value":    shares * entry_price,
+                "reject_reason":     "" if ok else "CB flatten: place_market_order raised",
+                "decided_at":        datetime.now(timezone.utc).replace(tzinfo=None),
+            })
+        except Exception as exc:
+            log.warning("Could not persist CB-flatten decision for %s: %s", symbol, exc)
+
+        if ok:
+            flattened += 1
+
+    return flattened

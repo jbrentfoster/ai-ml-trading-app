@@ -204,12 +204,17 @@ See `docs/findings/README.md` for the full scope rule, document structure, and l
 | When | What runs | What gets written |
 |------|-----------|-------------------|
 | Mon–Fri 09:40 ET | `run_daily.bat` | `logs/daily/daily_run_YYYYMMDD.log`, DB writes to `signal_log` / `order_decisions` / `trailing_stop_log` / `signal_runner_log` / `equity_snapshots` |
-| After each daily run | `/daily-run-review` (user-invoked) | `followups.md` mutations, may auto-invoke `/trade-case-study`, CLAUDE.md proposals in chat |
+| Mon–Fri 12:00 ET | `run_intraday.bat` (midday slot) | `logs/intraday/intraday_run_YYYYMMDD_1200.log`, DB write to `intraday_run_log` (Phase 1 CB check + Phase 3.5 trail ratchet/eval; no signal regeneration) |
+| Mon–Fri 15:30 ET | `run_intraday.bat` (late-afternoon slot) | `logs/intraday/intraday_run_YYYYMMDD_1530.log`, DB write to `intraday_run_log` (same scope as 12:00) |
+| Mon–Fri 16:30 ET | `run_eod.bat` | `logs/eod/eod_run_YYYYMMDD.log`, DB writes to `ohlcv_bars` / `indicator_snapshots` (post-close refresh of mid-day partial bars) |
+| After each daily run | `/daily-run-review` (user-invoked) | `followups.md` mutations, may auto-invoke `/trade-case-study`, CLAUDE.md proposals in chat. **Also picks up that day's `intraday_run_log` rows** alongside the daily log — no dedicated intraday-review skill in this PR. |
 | Sunday 01:00 ET | `run_weekly.bat` | `logs/weekly/weekly_run_YYYYMMDD.log`, DB writes to `walk_forward_results` / `trade_log` / `universe_assets` |
 | After each weekly run | `/weekly-run-review` (user-invoked) | Same as daily + prunes Resolved >30 days + prompts on Open >4 weeks |
 | Hard trigger fires inside a review | `/trade-case-study <SYMBOL>` (auto-invoked) | New or appended `docs/case_studies/*.md` file |
 | Anytime | `/trade-case-study <SYMBOL>` (user-invoked) | Same — bypasses §0 trigger evaluation |
 | When a CLAUDE.md fix verifies live | (manual move) | Entry migrates from CLAUDE.md to CHANGELOG.md |
+
+The intraday slots are **observability + Phase-1-only writes** by default — they do not regenerate signals, do not refresh data, and do not submit new bracket orders.  The two paths that *can* mutate the account are gated behind config: `RiskConfig.intraday_trail_conversion_enabled` (off by default — opt-in for mid-day TP→TRAIL conversions) and the CB-trip flatten path (fires only when the breaker auto-trips AND `paper_orders_enabled=True` AND not `--dry-run`).  See CLAUDE.md "Key Architectural Decisions" → *Intraday Phase 3.5 reads price from IBKR, not the cached daily bar* for the rationale.
 
 ---
 
