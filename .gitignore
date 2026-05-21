@@ -8,9 +8,20 @@ __pycache__/
 # Environment / secrets
 .env
 *.env
+.envrc
+secrets.*
+*_secrets.*
+credentials.*
+*.key
+*.pem
+*.pfx
+*.p12
 
 # Database
 db/
+*.db
+*.sqlite
+*.sqlite3
 
 # Logs
 logs/

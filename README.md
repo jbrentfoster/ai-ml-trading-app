@@ -1,6 +1,14 @@
+> ⚠️ **For educational and paper trading use only. Not financial advice.** See [Disclaimer](#disclaimer).
+
 # AI Trading App
 
 A Python-based algorithmic trading system that uses an ML ensemble (LSTM + XGBoost + FinBERT) to generate daily trade signals, managed by a full risk layer (Kelly sizing, ATR stops, bracket orders with optional trailing-stop conversion, circuit breaker, portfolio guard). Connects to Interactive Brokers via `ib_insync` for live/paper order execution. Built on a Streamlit dashboard that explains each component visually.
+
+---
+
+## Disclaimer
+
+This software is provided for educational and paper trading purposes only. It is not financial or investment advice. The authors make no guarantees regarding performance, accuracy, or fitness for any particular purpose. Use in live or real-money trading is entirely at your own risk. The authors are not liable for any financial losses, damages, or other consequences arising from use of this software.
 
 ---
 
