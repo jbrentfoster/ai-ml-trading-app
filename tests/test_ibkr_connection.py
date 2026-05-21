@@ -232,3 +232,34 @@ class TestErrorHandling:
             # Should silently handle informational codes (no exception)
             conn._on_error(0, 2104, "Market data farm connection is OK", None)
             conn._on_error(0, 2106, "HMDS data farm connection is OK", None)
+
+    def test_on_error_10089_logs_at_debug_not_error(self):
+        """Regression guard for the 2026-05-20 followup: IBKR error 10089
+        ("Requested market data requires additional subscription — Delayed
+        market data is available") is the same conceptual fallback as 10167
+        in a different IBKR wire format.  Both should route to DEBUG so the
+        intraday-runner log isn't flooded with 13× ERROR lines per scheduled
+        slot (one per evaluated symbol when no real-time subscription).
+
+        Asserts the routing by patching the module-level ``log`` and checking
+        that ``log.debug`` is called and ``log.error`` is not — same shape
+        a future "is 10167 still routed to DEBUG?" test would take.
+        """
+        with patch("execution.ibkr_connection._IB_AVAILABLE", True), \
+             patch("execution.ibkr_connection.IB"), \
+             patch("execution.ibkr_connection.log") as mock_log:
+            from execution.ibkr_connection import IBKRConnection
+            conn = IBKRConnection()
+            conn._on_error(
+                0, 10089,
+                "Requested market data requires additional subscription for API. "
+                "Delayed market data is available.AAPL NYSE/TOP/ALL",
+                None,
+            )
+
+            # Should route to DEBUG (informational), not ERROR.
+            mock_log.debug.assert_called()
+            mock_log.error.assert_not_called()
+            # Sanity: the message text was passed through to the log call.
+            args, _kwargs = mock_log.debug.call_args
+            assert any("10089" in str(a) or a == 10089 for a in args)

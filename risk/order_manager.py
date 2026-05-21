@@ -359,10 +359,17 @@ class OrderManager:
 
     def _cancel_bracket_children(self, symbol: str) -> None:
         """
-        Cancel any open SELL LMT (take-profit) and SELL STP / STP LMT (stop)
-        legs for `symbol` before a long is closed.  Errors are logged but not
-        raised — the caller still attempts the market close so a stale bracket
-        doesn't block flattening.
+        Cancel any open SELL LMT (take-profit), SELL STP / STP LMT (stop), and
+        SELL TRAIL legs for `symbol` before a long is closed.  Errors are
+        logged but not raised — the caller still attempts the market close so
+        a stale bracket doesn't block flattening.
+
+        TRAIL inclusion is critical: when Phase 3.5 has already converted a
+        bracket TP→TRAIL earlier in the same run, leaving the TRAIL live
+        after the market close means it can fire against zero shares once the
+        position is flat and open an unintended SHORT.  Production incident
+        on 2026-05-20 (ASTS, orphan TRAIL id=173, manually cancelled at
+        10:37 ET) is the canonical example.
         """
         try:
             coro_get = self._ibkr.get_open_orders()
@@ -385,7 +392,7 @@ class OrderManager:
             o for o in open_orders
             if o.get("symbol") == symbol
             and o.get("action") == "SELL"
-            and o.get("order_type") in ("LMT", "STP", "STP LMT")
+            and o.get("order_type") in ("LMT", "STP", "STP LMT", "TRAIL")
         ]
         if not targets:
             return

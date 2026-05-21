@@ -694,6 +694,10 @@ class IBKRConnection:
             10148,  # Order cannot be cancelled — already in Cancelled state (benign race
                     # during cancel+place flows, e.g. trailing-stop conversion or long-only close
                     # where the bracket child was already cancelled by IBKR before our cancel arrived)
+            10089,  # "Requested market data requires additional subscription — Delayed market
+                    # data is available" — same conceptual fallback as 10167 in a different IBKR
+                    # format.  The 3-tier get_last_price fallback (live → 15-min delayed → yfinance)
+                    # handles it; the intraday runner produces one of these per evaluated symbol.
         }
         if error_code in informational:
             log.debug("IBKR info [%d]: %s", error_code, error_string)

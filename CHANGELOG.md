@@ -6,6 +6,18 @@ The retirement convention lives in CLAUDE.md → *Convention: documenting fixed 
 
 ---
 
+## 2026-05-21
+
+### Phase 4 long-only close doesn't cancel TRAIL orders, leaving orphans after same-run trail conversion + signal flip
+
+*(code complete 2026-05-21 → verified 2026-05-21 via the 2026-05-20 ASTS production incident)* (`risk/order_manager.py:384-389`): when a position has a trailing stop converted in Phase 3.5 AND the same run generates a SELL signal that routes to `_close_long_position` in Phase 4, the bracket-child cancel filter only includes `("LMT", "STP", "STP LMT")` — TRAIL is missing. The MKT close flattens the position but the TRAIL order stays live at IBKR; when price subsequently drops by the trail distance, IBKR fires SELL against a zero-share position and may open an unintended SHORT depending on account permissions. Observed 2026-05-20 on ASTS: Phase 3.5 placed TRAIL id=173 at 10:08:41, Phase 4 placed MKT id=179 at 10:08:44 to close, TRAIL id=173 was not cancelled — verified by absence of any `Cancel request sent for order_id=173` in `logs/daily/daily_run_20260520.log` and by the cancel-filter source. The orphan was manually cancelled at 10:37 ET via `scripts/open_orders.py --cancel --id 173` (response: `cancel sent for id=173`, `Remaining open: 24`); position is fully clean, no short opened. The Phase 3.6 hold-timeout path uses a broader filter that already includes TRAIL, so the fix pattern exists in-repo.
+
+**Status:** one-character widening of the cancel-filter tuple in `OrderManager._cancel_bracket_children` from `("LMT", "STP", "STP LMT")` to `("LMT", "STP", "STP LMT", "TRAIL")`. Docstring on the function updated to mention TRAIL alongside LMT/STP and to reference the 2026-05-20 ASTS production incident as the canonical example of why TRAIL inclusion matters.  No signature change, no new parameters, no refactor of any caller (single caller: `_close_long_position`).  The CLAUDE.md note about Phase 3.6's "broader filter as `OrderManager._cancel_bracket_children` plus TRAIL" was reworded to "same 4-type filter as `OrderManager._cancel_bracket_children`" because the two sites are now aligned (along with `risk.order_manager.flatten_all_longs` which was built with the 4-type filter from day one in the 2026-05-20 intraday-runner PR).  Regression test: 1 new in `tests/test_risk.py::TestOrderManager::test_cancel_bracket_children_cancels_trail_orders` — includes a live TRAIL in the mock open-orders list alongside the typical LMT/STP pair, asserts all three are cancelled before the market sell, and confirms unrelated symbols / BUY-action orders are untouched.  Existing `test_close_long_cancels_orphan_bracket_children` left unchanged (its mock had no TRAIL entry — that absence is exactly the gap the new test fills).  Full suite **272 passed + 1 skipped** (was 270).
+
+**Verified (2026-05-21):** two-part verification.  (1) **Production incident on 2026-05-20** is the live demonstration of the bug class — orphan TRAIL id=173 survived `_close_long_position` and required manual cancellation 29 minutes later.  Without the user noticing and intervening, the next trail trigger would have opened an unintended SHORT against zero shares.  (2) **Regression test** `test_cancel_bracket_children_cancels_trail_orders` pins the post-fix filter membership: any future change that removes TRAIL from the cancel tuple fails the test loudly.  Together these constitute "the bug fired in real life, was caught manually, and now the regression test prevents recurrence" — the exact shape the CLAUDE.md *Convention: documenting fixed bugs* was designed to capture.
+
+---
+
 ## 2026-05-08
 
 ### Universe rescore can orphan held positions

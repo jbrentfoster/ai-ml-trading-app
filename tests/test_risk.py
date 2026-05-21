@@ -842,6 +842,86 @@ class TestOrderManager:
             config.trading.allow_short_selling  = original_short
             config.trading.paper_orders_enabled = original_enabled
 
+    def test_cancel_bracket_children_cancels_trail_orders(self, mem_engine):
+        """Regression guard against the orphan-TRAIL bug observed in production
+        on 2026-05-20 (ASTS TRAIL id=173 survived a same-run trail-conversion +
+        signal-flip close; manually cleaned up 29 minutes later by the user).
+        The orphan, if not caught manually, would have fired as a short on the
+        next price trigger, defeating the long-only gate.
+
+        The fix is a one-character widening of the cancel-filter tuple in
+        ``OrderManager._cancel_bracket_children`` from ``("LMT", "STP", "STP LMT")``
+        to ``("LMT", "STP", "STP LMT", "TRAIL")``.  This test pins that filter
+        membership by including a live TRAIL alongside the typical LMT/STP
+        pair and asserting all three are cancelled (and only the matching
+        ones — unrelated orders for other symbols / BUY actions stay live).
+        """
+        import asyncio
+        from config.settings import config
+        from risk.order_manager import OrderManager
+
+        original_short   = config.trading.allow_short_selling
+        original_enabled = config.trading.paper_orders_enabled
+        config.trading.allow_short_selling  = False
+        config.trading.paper_orders_enabled = True
+
+        try:
+            loop = asyncio.new_event_loop()
+
+            async def _orders():
+                return [
+                    # The three bracket-child legs for the symbol being closed —
+                    # all must be cancelled before the market sell.  TRAIL is
+                    # the key addition this test pins.
+                    {"order_id": 100, "symbol": "ASTS", "action": "SELL",
+                     "order_type": "LMT", "limit_price": 95.0, "stop_price": None},
+                    {"order_id": 101, "symbol": "ASTS", "action": "SELL",
+                     "order_type": "STP", "limit_price": None, "stop_price": 78.0},
+                    {"order_id": 102, "symbol": "ASTS", "action": "SELL",
+                     "order_type": "TRAIL", "limit_price": None, "stop_price": 6.0},
+                    # Unrelated orders that must NOT be cancelled
+                    {"order_id": 200, "symbol": "MSFT", "action": "SELL",
+                     "order_type": "TRAIL", "limit_price": None, "stop_price": 8.0},
+                    {"order_id": 201, "symbol": "ASTS", "action": "BUY",
+                     "order_type": "LMT", "limit_price": 80.0, "stop_price": None},
+                ]
+
+            async def _cancel(order_id):
+                return True
+
+            async def _market(*_a, **_k):
+                return True
+
+            ibkr_mock = MagicMock()
+            ibkr_mock.get_open_orders = MagicMock(side_effect=lambda: _orders())
+            ibkr_mock.cancel_order    = MagicMock(side_effect=lambda oid: _cancel(oid))
+            ibkr_mock.place_market_order = MagicMock(side_effect=lambda *a, **k: _market())
+
+            mgr = OrderManager(
+                ibkr_connection=ibkr_mock, dry_run=False, event_loop=loop,
+            )
+            positions = {"ASTS": {"shares": 100, "entry_price": 84.0, "current_price": 90.0}}
+
+            with patch("risk.order_manager.OrderManager._get_latest_close", return_value=90.0):
+                decision = mgr.process(
+                    signal_result=self._signal_result("ASTS", "SELL"),
+                    equity=100_000,
+                    positions=positions,
+                )
+
+            assert decision.decision == "CLOSED_LONG"
+            cancelled_ids = [c.args[0] for c in ibkr_mock.cancel_order.call_args_list]
+            assert 100 in cancelled_ids   # SELL LMT (TP) cancelled
+            assert 101 in cancelled_ids   # SELL STP cancelled
+            assert 102 in cancelled_ids   # SELL TRAIL cancelled — the bug fix
+            assert 200 not in cancelled_ids  # different symbol untouched
+            assert 201 not in cancelled_ids  # BUY LMT untouched
+            ibkr_mock.place_market_order.assert_called_once()
+            loop.close()
+        finally:
+            config.trading.allow_short_selling  = original_short
+            config.trading.paper_orders_enabled = original_enabled
+
     def test_sell_signal_ignored_when_no_long_held(self, mem_engine):
         """SELL + no existing position → REJECTED_NO_POSITION, no order placed."""
         from config.settings import config
