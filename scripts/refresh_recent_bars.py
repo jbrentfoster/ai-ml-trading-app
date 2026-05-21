@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import argparse
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -67,7 +67,7 @@ def _recently_acted_symbols(days: int = 14) -> set[str]:
     df = get_order_decisions(limit=2000)
     if df.empty:
         return set()
-    cutoff = datetime.utcnow() - timedelta(days=days)
+    cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=days)
     recent = df[
         (df["decided_at"] >= cutoff)
         & (df["decision"].isin(["APPROVED", "DRY_RUN", "CLOSED_LONG"]))
@@ -120,7 +120,7 @@ def _refresh_indicators(symbol: str, interval: str) -> int:
 
 def main(days_back: int = 5, use_ibkr: bool = True, interval: str = "1d") -> None:
     print(f"=== End-of-day bar refresh (days_back={days_back}, interval={interval}) ===")
-    started = datetime.utcnow()
+    started = datetime.now(timezone.utc).replace(tzinfo=None)
 
     universe = _universe_symbols()
     recent   = _recently_acted_symbols(days=14)
@@ -159,7 +159,7 @@ def main(days_back: int = 5, use_ibkr: bool = True, interval: str = "1d") -> Non
             log.error("Refresh failed for %s: %s", sym, exc, exc_info=True)
             print(f"  {sym}: FAILED — {exc}")
 
-    duration = (datetime.utcnow() - started).total_seconds()
+    duration = (datetime.now(timezone.utc).replace(tzinfo=None) - started).total_seconds()
     print()
     print(f"=== Done in {duration:.1f}s — {len(symbols)} symbols, "
           f"{bars_total} bars + {ind_total} indicator rows refreshed, "
