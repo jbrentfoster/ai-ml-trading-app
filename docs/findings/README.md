@@ -17,7 +17,7 @@ The category exists because the other artifacts in `docs/review-system.md` each 
 | An architectural or methodological *rule* (constant across the system, already diagnosed) | CLAUDE.md *Key Architectural Decisions* |
 | A confirmed bug with a fix in flight or about to ship | CLAUDE.md *Outstanding bugs* |
 | A direction worth pursuing once evidence accumulates | CLAUDE.md *Enhancements* with a *Trigger to revisit* |
-| A "watch whether X holds next run" gate | `logs/reviews/followups.md` |
+| A "watch whether X holds next run" gate | `docs/reviews/followups.md` |
 
 The boundary between *finding* and *case study* is the **unit of analysis**: a case study reasons from *specific named trades* (entry signals, day-by-day price action, exit mechanics, counterfactual knobs); a finding reasons from *aggregate distributions* (per-bucket averages, hypothesis discriminators, sample sizes).
 

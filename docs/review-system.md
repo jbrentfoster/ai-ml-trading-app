@@ -26,7 +26,7 @@ Three skills and four living documents fall out of those observations.
 |------|-----------|--------------------|
 | `logs/daily/daily_run_YYYYMMDD.log` | One day (input) | Raw stdout/stderr from `run_daily.bat`. Source material, not a destination. |
 | `logs/weekly/weekly_run_YYYYMMDD.log` | One week (input) | Raw stdout/stderr from `run_weekly.bat`. Source material, not a destination. |
-| `logs/reviews/followups.md` | Days to ~4 weeks | A single-observation gate awaiting next-run confirmation. "Did X behave as expected in the *next* run?" |
+| `docs/reviews/followups.md` | Days to ~4 weeks | A single-observation gate awaiting next-run confirmation. "Did X behave as expected in the *next* run?" |
 | `CLAUDE.md` → *Outstanding bugs* / *Enhancements* | Until verified live | A confirmed bug with a fix in flight, or a sustained signal warranting a code change. "Did the fix hold up over multiple runs?" |
 | `CHANGELOG.md` | Permanent | A CLAUDE.md fix that has been verified live in production. Terminal home — entries don't move out. |
 | `docs/case_studies/*.md` | Permanent (living) | Deep post-mortem of a single trade or trade cluster. Updated when sister-doc triggers fire, not pruned. |
