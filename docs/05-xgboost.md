@@ -82,37 +82,37 @@ Unlike the LSTM (which sees raw sequences), XGBoost receives a **snapshot** of t
 #### 12 Technical indicators
 | Feature | Source |
 |---------|--------|
-| RSI-14 | `indicator_snapshots` |
-| MACD | `indicator_snapshots` |
-| MACD Signal | `indicator_snapshots` |
-| Bollinger Upper | `indicator_snapshots` |
-| Bollinger Lower | `indicator_snapshots` |
-| EMA-20 | `indicator_snapshots` |
-| EMA-50 | `indicator_snapshots` |
-| ATR-14 | `indicator_snapshots` |
-| Volume SMA-20 | `indicator_snapshots` |
-| BB %B | `indicator_snapshots` |
-| BB Width | `indicator_snapshots` |
-| MACD Histogram | `indicator_snapshots` |
+| rsi_14 | `indicator_snapshots` |
+| macd | `indicator_snapshots` |
+| macd_signal | `indicator_snapshots` |
+| macd_hist | `indicator_snapshots` |
+| bb_upper | `indicator_snapshots` |
+| bb_middle | `indicator_snapshots` |
+| bb_lower | `indicator_snapshots` |
+| ema_9 | `indicator_snapshots` |
+| ema_21 | `indicator_snapshots` |
+| ema_50 | `indicator_snapshots` |
+| atr_14 | `indicator_snapshots` |
+| volume_sma_20 | `indicator_snapshots` |
 
 #### 13 Fundamental metrics
 | Feature | Source |
 |---------|--------|
-| P/E Ratio | `fundamental_data` |
-| Forward P/E | `fundamental_data` |
-| Price-to-Book | `fundamental_data` |
-| EV/EBITDA | `fundamental_data` |
-| Revenue Growth | `fundamental_data` |
-| Earnings Growth | `fundamental_data` |
-| Profit Margin | `fundamental_data` |
-| Return on Equity | `fundamental_data` |
-| Debt-to-Equity | `fundamental_data` |
-| Current Ratio | `fundamental_data` |
-| Free Cash Flow | `fundamental_data` |
-| Analyst Target Price | `fundamental_data` |
-| % to Analyst Target | derived |
+| market_cap | `fundamental_data` |
+| pe_ratio | `fundamental_data` |
+| forward_pe | `fundamental_data` |
+| price_to_book | `fundamental_data` |
+| ev_to_ebitda | `fundamental_data` |
+| revenue_growth | `fundamental_data` |
+| earnings_growth | `fundamental_data` |
+| profit_margin | `fundamental_data` |
+| roe | `fundamental_data` |
+| debt_to_equity | `fundamental_data` |
+| current_ratio | `fundamental_data` |
+| free_cashflow | `fundamental_data` |
+| analyst_target | `fundamental_data` |
 
-Fundamentals are cached in SQLite with a 24-hour TTL and fetched from yfinance via `FundamentalsClient`. They change slowly (quarterly earnings), so daily caching is sufficient.
+Fundamentals are cached in SQLite with a 24-hour TTL and fetched from yfinance via `FundamentalsClient`. They change slowly (quarterly earnings), so daily caching is sufficient.  The canonical feature lists live in `models/xgboost_model.py:_INDICATOR_FEATURES` / `_FUNDAMENTAL_FEATURES` — that's the source of truth if these tables ever drift.
 
 ### Target variable
 

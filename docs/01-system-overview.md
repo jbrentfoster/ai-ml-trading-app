@@ -43,9 +43,9 @@ External data sources
 
 ---
 
-## The six phases of a daily run
+## The seven phases of a daily run
 
-The `signal_runner.py` script works in six sequential phases (Phase 3.5 is opt-in):
+The `signal_runner.py` script works in seven sequential phases (Phase 3.5 and Phase 3.6 are both opt-in):
 
 ### Phase 1 — Startup
 Determine which symbols to process, check the circuit breaker state, capture an equity-baseline snapshot from IBKR (when not in dry-run), and auto-trip the circuit breaker if the realised + unrealised P&L vs that baseline has exceeded the daily / weekly loss limits. Includes orphan-position detection so any held long not in the active universe still gets pulled into the symbol list.
@@ -65,11 +65,26 @@ The signal gate then runs three sequential filters — threshold, regime-adjuste
 ### Phase 3.5 — Trailing-stop conversion (opt-in)
 When `risk.trailing_stop_enabled=True` AND `trading.paper_orders_enabled=True` AND NOT dry-run, the `TrailingStopManager` walks every open long position. For each position that has moved ≥ `trailing_stop_activation_atr × ATR` into profit, the bracket's TP and STP legs are cancelled and replaced by a single standalone GTC `TRAIL` order. Idempotent — positions with an existing TRAIL order are skipped.
 
+### Phase 3.6 — Hold-timeout flatten (opt-in)
+When `risk.hold_timeout_enabled=True` AND `trading.paper_orders_enabled=True` AND NOT dry-run AND `max_hold_days > 0`, each held long is checked against `signal_log` for its most recent passed-gate BUY. If that BUY is older than `max_hold_days` (default 30 calendar days), the position is flattened with a market sell after cancelling its bracket children (LMT TP / STP / STP LMT / TRAIL). Positions with no BUY history in `signal_log` are skipped — manual positions / pre-history holdings have no staleness anchor. The "re-confirming signal" semantic preserves winners the model still actively likes; only positions the model has ignored for a full month are flattened. Each closure persists to `order_decisions` with `decision='CLOSED_TIMEOUT'`.
+
 ### Phase 4 — Risk & order decisions
 Each signal passes through the portfolio guard (seven checks) and position sizer (Kelly criterion + ATR). The result is an `OrderDecision` with entry price, stop loss, and take profit levels. SELL signals against existing longs flatten the position (`CLOSED_LONG`); SELL signals from flat without `allow_short_selling` are rejected (`REJECTED_NO_POSITION`).
 
 ### Phase 5 — Summary
-Write a `signal_runner_log` row with run-level counters (signals generated, orders submitted, rejected, longs closed, trailing conversions, skipped duplicates, stale-bar drops) and print a summary table. Order submission itself happens inside Phase 4 — in dry-run mode (default) decisions are written to `order_decisions` only; in paper mode bracket orders are submitted to IBKR; in live mode they go to the live account.
+Write a `signal_runner_log` row with run-level counters (signals generated, orders submitted, rejected, longs closed, trailing conversions, hold-timeout flattens, skipped duplicates, stale-bar drops) and print a summary table. Order submission itself happens inside Phase 4 — in dry-run mode (default) decisions are written to `order_decisions` only; in paper mode bracket orders are submitted to IBKR; in live mode they go to the live account.
+
+---
+
+## Complementary runners (intraday and post-close)
+
+The seven-phase daily runner above fires once per weekday at 09:35 ET via `run_daily.bat`. Two smaller runners handle work that has to happen on a different cadence:
+
+### Intraday lightweight runner — `scripts/intraday_check.py`
+Scheduled at 12:00 ET and 15:30 ET via `run_intraday.bat`. Runs only Phase 1 (circuit-breaker check against live IBKR account P&L) and Phase 3.5 (trailing-stop re-evaluation against live `IBKRConnection.get_last_price()`, NOT the cached daily bar). Does **not** regenerate signals, refresh data, fetch news, retrain models, rescore the universe, or evaluate hold-timeouts — those stay on the daily/weekly cadence. Each invocation writes one row to `intraday_run_log` (status ∈ `completed` / `gateway_down` / `cb_tripped` / `error`). Ratchet-only by default; new TP→TRAIL conversions are opt-in via `RiskConfig.intraday_trail_conversion_enabled`. Exits 0 on Gateway-down to avoid Task Scheduler retry storms — a missed slot surfaces as a `status='gateway_down'` row on Page 8 instead.
+
+### End-of-day bar refresh — `scripts/refresh_recent_bars.py`
+Scheduled at 16:30 ET via `run_eod.bat`. The morning Phase 2 fetches today's daily bar pre-market, which is a partial intraday snapshot. Symbols that subsequently drop out of the active universe AND aren't held never have that partial bar corrected — its recorded daily high/low can sit wrong forever, hiding intraday stop-outs from the dashboard and biasing walk-forward retraining. The EOD refresh overwrites the last 5 days of bars + indicators for the union of (active universe, recently-acted symbols via `order_decisions` last 14 days, currently-held IBKR positions) using `upsert_bars(..., overwrite=True)`. Tolerates IB Gateway being down via `--no-ibkr`.
 
 ---
 
@@ -150,7 +165,7 @@ walk_forward bracket simulator        ← during model training
 
 ## The database (SQLite)
 
-Fourteen tables in `db/trading.db`. You never need to interact with it directly — the dashboard reads from it, and all writes go through the ORM helper functions in `data/database.py`.
+Sixteen tables in `db/trading.db`. You never need to interact with it directly — the dashboard reads from it, and all writes go through the ORM helper functions in `data/database.py`.
 
 The most important tables:
 
@@ -166,4 +181,4 @@ The most important tables:
 | `trailing_stop_log` | TrailingStopManager | Dashboard page 8 |
 | `signal_runner_log` | signal_runner.py | Dashboard page 8 |
 
-Schema migrations are handled by `_migrate()` in `data/database.py` — it runs at every engine init and adds new columns with idempotent `ALTER TABLE` statements. See [CLAUDE.md](../../CLAUDE.md) for the full 14-table schema reference.
+Schema migrations are handled by `_migrate()` in `data/database.py` — it runs at every engine init and adds new columns with idempotent `ALTER TABLE` statements. See [CLAUDE.md](../CLAUDE.md) for the full 16-table schema reference (the two not shown above are `equity_snapshots`, used as the circuit-breaker baseline, and `intraday_run_log`, one row per `intraday_check.py` invocation).

@@ -103,8 +103,11 @@ trading_app/
 ├── README.md
 ├── requirements.txt
 ├── run_daily.bat            — Mon–Fri scheduler: run_pipeline.py → universe_scheduler.py --rescore-now
-│                              --no-signal-run → train_models.py (skip-existing) → signal_runner.py;
-│                              logs to logs/daily/daily_run_YYYYMMDD.log
+│                              --no-signal-run → train_models.py (skip-existing) →
+│                              backfill_benchmark_returns.py → signal_runner.py --no-dry-run;
+│                              logs to logs/daily/daily_run_YYYYMMDD.log.  Backfill is positioned
+│                              before the runner so Page 10's benchmark-relative view never lags the
+│                              latest trade_log rows by a full day.
 ├── run_weekly.bat           — Sunday scheduler: universe_scheduler.py --run-now → run_pipeline.py →
 │                              train_models.py --force → backfill_benchmark_returns.py;
 │                              logs to logs/weekly/weekly_run_YYYYMMDD.log.  Universe refresh runs
@@ -156,6 +159,14 @@ trading_app/
 │   │                          note "Intraday runner exits 0 on Gateway-down rather than raising").
 │   │                          --dry-run (default), --no-dry-run (enables CB-flatten + opt-in
 │   │                          trail-conversion paths), --symbol (informational only).
+│   ├── backfill_benchmark_returns.py — Idempotent backfill of `trade_log.benchmark_return_pct`
+│   │                            (raw SPY/benchmark return over each trade's holding period).
+│   │                            Operates only on `WHERE benchmark_return_pct IS NULL` so re-runs
+│   │                            are no-ops on already-populated rows.  Wired into `run_weekly.bat`
+│   │                            after `train_models.py --force` (and `run_daily.bat` after the
+│   │                            skip-existing training pass) so the column stays current across
+│   │                            retrains.  See the "Benchmark-relative tracking" architectural-
+│   │                            decision note for the raw-vs-net semantics.
 │   ├── refresh_recent_bars.py — End-of-day refresh: overwrites the last `--days` (default 5) of
 │   │                            OHLCV bars + indicator snapshots for the union of
 │   │                            (active universe, recently-acted symbols via order_decisions
@@ -329,7 +340,7 @@ FundamentalsClient.get()     → upsert_fundamentals() → SQLite (fundamental_d
 
 ## Database Schema
 
-14 tables in `db/trading.db`. All timestamps are UTC-naive datetimes.
+16 tables in `db/trading.db`. All timestamps are UTC-naive datetimes.
 
 | Table | Key columns | Notes |
 |-------|-------------|-------|
@@ -343,6 +354,7 @@ FundamentalsClient.get()     → upsert_fundamentals() → SQLite (fundamental_d
 | `universe_assets` | symbol PK, name, asset_class, exchange, is_fixture, stage, market_cap, avg_dollar_volume, stage3_score, active, added_at, last_scored_at, removed_at | dynamic universe candidates. `stage3_score` ∈ [0, 1] — rank-percentile blend of 20-day return + ADV (was `xgb_score` until 2026-05-10) |
 | `universe_run_log` | run_id, run_type, stage, symbol_count, duration_seconds, recorded_at, notes | per-stage timing from universe selector |
 | `circuit_breaker_log` | event, reason, daily_loss_pct, weekly_loss_pct, triggered_at, reset_at, recorded_at | TRIGGERED / RESET / AUTO_RESET events |
+| `equity_snapshots` | snapshot_date (unique), net_liquidation, total_cash, unrealized_pnl, realized_pnl, recorded_at | per-day NLV baseline written once per `signal_runner.py` run (Phase 1) before any orders submit. Re-running the runner same day overwrites the row via `log_equity_snapshot`. The CB's daily/weekly loss-pct math reads these snapshots — without them the auto-trigger has no baseline to compare against |
 | `order_decisions` | run_id, symbol, signal, decision, shares, entry/stop/tp prices, position_value, reject_reason, decided_at | per-signal decisions from OrderManager |
 | `signal_runner_log` | run_id, run_date, mode, symbols_processed, signals_generated, orders_submitted, orders_rejected, skipped_duplicates, longs_closed, trailing_conversions, hold_timeouts, duration_seconds | daily run summaries |
 | `trailing_stop_log` | run_id, symbol, action, shares, entry_price, current_price, atr, trail_amount, reason, decided_at | one row per position evaluated by TrailingStopManager per run (action ∈ CONVERTED / SKIPPED / FAILED) |

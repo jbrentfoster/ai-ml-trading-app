@@ -121,6 +121,8 @@ Each bracket is submitted **GTC** (Good-Till-Cancelled) so orders placed outside
 
 When `risk.trailing_stop_enabled=True`, a **Phase 3.5 trailing-stop conversion** runs before new-order submission: for each open long position that has moved at least `trailing_stop_activation_atr × ATR` into profit, the bracket's take-profit and stop legs are cancelled and replaced by a single standalone GTC `TRAIL` order. The trailing stop ratchets up with price and triggers only on reversal, letting winners run past the original take-profit. See [docs/08-risk-management.md](docs/08-risk-management.md#trailing-stops-phase-35--opt-in) for the full explanation.
 
+When `risk.hold_timeout_enabled=True`, a **Phase 3.6 hold-timeout flatten** runs after trailing-stop conversion and before new orders: any held long whose most recent passed-gate BUY in `signal_log` is older than `risk.max_hold_days` (default 30 calendar days) is closed with a market sell after cancelling its bracket children. The semantic is "the model still actively likes this position" — winners that the gate keeps re-confirming survive indefinitely; only positions the model has ignored for a full month are flattened. Positions with no BUY history (manual entries) are left alone.
+
 > In production, `signal_runner.py` is called automatically as the final step of `run_daily.bat`. Do not schedule it separately.
 
 ### Step 4 — View results
@@ -156,7 +158,7 @@ The daily and weekly runs are driven by two batch files that execute the pipelin
 
 | File | When | Steps |
 |------|------|-------|
-| `run_daily.bat` | Mon–Fri 09:40 AM | `run_pipeline.py` → `universe_scheduler.py --rescore-now --no-signal-run` → `train_models.py` (new symbols only) → `signal_runner.py` (data refresh → signals → trailing-stop conversion → new orders) |
+| `run_daily.bat` | Mon–Fri 09:40 AM | `run_pipeline.py` → `universe_scheduler.py --rescore-now --no-signal-run` → `train_models.py` (new symbols only) → `backfill_benchmark_returns.py` → `signal_runner.py` (data refresh → signals → trailing-stop conversion → hold-timeout flatten → new orders) |
 | `run_intraday.bat` | Mon–Fri 12:00 PM ET and 03:30 PM ET | `intraday_check.py` — Phase 1 circuit-breaker check + Phase 3.5 trailing-stop re-evaluation against live IBKR price.  Two scheduled slots per day.  Ratchet-only by default (no new TP→TRAIL conversions; opt-in via `RiskConfig.intraday_trail_conversion_enabled`).  Exits 0 on Gateway-down with a `status='gateway_down'` row in `intraday_run_log` so missed runs are visible on Page 8. |
 | `run_eod.bat`   | Mon–Fri 04:30 PM ET | `refresh_recent_bars.py` — re-fetches the last 5 days of OHLCV + indicators for the union of (active universe, recently-acted symbols, held positions) and overwrites the mid-day partial bars the morning `signal_runner` Phase 2 wrote |
 | `run_weekly.bat` | Sunday 01:00 AM | `universe_scheduler.py --run-now` → `run_pipeline.py` → `train_models.py --force` → `backfill_benchmark_returns.py` |
@@ -336,6 +338,10 @@ Key settings:
 | `risk.trailing_stop_enabled` | False | Opt-in: convert bracket TPs to trailing stops once a position is +N ATR in profit |
 | `risk.trailing_stop_activation_atr` | 2.0 | Convert once `price ≥ entry + N × ATR` |
 | `risk.trailing_stop_trail_atr` | 2.0 | Trailing distance below the highest reached price, in ATR units |
+| `risk.intraday_trail_conversion_enabled` | False | Opt-in: allow `intraday_check.py` to perform new TP→TRAIL conversions at 12:00 / 15:30 ET (default off — ratchet-only intraday mode) |
+| `risk.intraday_conversion_buffer_atr` | 0.5 | Extra ATR buffer above the daily activation threshold required for intraday conversions |
+| `risk.hold_timeout_enabled` | False | Opt-in: flatten held longs whose latest passed-gate BUY in `signal_log` is older than `max_hold_days` |
+| `risk.max_hold_days` | 30 | Calendar-day threshold for the hold-timeout rule (Phase 3.6). 0 disables defensively |
 
 ---
 
@@ -437,5 +443,7 @@ SQLite at `db/trading.db` (auto-created on first run). Schema migrations are han
 | `universe_run_log` | Per-stage timing + symbol counts for each universe refresh |
 | `order_decisions` | Every DRY_RUN / APPROVED / REJECTED / CLOSED_LONG decision |
 | `circuit_breaker_log` | All halt trigger and reset events |
+| `equity_snapshots` | Per-day net-liquidation baseline used as the CB's loss-pct denominator |
 | `trailing_stop_log` | Per-position evaluation by `TrailingStopManager` (CONVERTED / SKIPPED / FAILED) |
 | `signal_runner_log` | Daily run summaries (signals generated, orders submitted, longs closed, etc.) |
+| `intraday_run_log` | One row per `intraday_check.py` invocation (12:00 ET / 15:30 ET); status ∈ completed / gateway_down / cb_tripped / error |

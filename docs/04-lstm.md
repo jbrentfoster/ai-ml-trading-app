@@ -84,18 +84,20 @@ The model sees a **rolling window** of the last 60 trading bars (approximately 3
 | Low | Intraday low |
 | Close | Closing price |
 | Volume | Shares traded |
-| RSI-14 | Relative Strength Index |
-| MACD | Moving Average Convergence/Divergence |
-| MACD Signal | Signal line |
-| BB Upper | Bollinger Band upper |
-| BB Lower | Bollinger Band lower |
-| EMA-20 | 20-bar exponential moving average |
-| EMA-50 | 50-bar exponential moving average |
-| ATR-14 | Average True Range |
-| Volume SMA-20 | 20-bar volume moving average |
-| BB %B | Position within Bollinger Bands |
-| BB Width | Band width (volatility measure) |
-| MACD Histogram | MACD minus signal |
+| rsi_14 | Relative Strength Index (14-bar) |
+| macd | MACD line (EMA-12 − EMA-26) |
+| macd_signal | MACD signal line (EMA-9 of macd) |
+| macd_hist | MACD histogram (macd − macd_signal) |
+| bb_upper | Bollinger Band upper (SMA-20 + 2σ) |
+| bb_middle | Bollinger Band middle (SMA-20) |
+| bb_lower | Bollinger Band lower (SMA-20 − 2σ) |
+| ema_9 | 9-bar exponential moving average |
+| ema_21 | 21-bar exponential moving average |
+| ema_50 | 50-bar exponential moving average |
+| atr_14 | Average True Range (14-bar) |
+| volume_sma_20 | 20-bar simple moving average of volume |
+
+The canonical list lives in `models/lstm_model.py:_FEATURE_COLS` — that's the source of truth if these ever fall out of sync.
 
 Each feature is **normalized using statistics from the training window only** — no data from the test set is used to compute mean or standard deviation. This prevents a subtle form of lookahead bias called **feature leakage**.
 
