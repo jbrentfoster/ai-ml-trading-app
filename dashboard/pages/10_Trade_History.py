@@ -389,9 +389,115 @@ else:
             "artifacts of WF test-window boundaries, not real exit decisions the live "
             "system would ever make.  Toggle the expander below to audit the filter.  "
             f"**Sum of per-trade excess** (NOT a portfolio compound return): "
-            f"{cum_excess_pct:+.2f}% — informative as a trajectory in the chart below, "
-            "but the per-trade stats above are the honest alpha estimate."
+            f"{cum_excess_pct:+.2f}% — informative as a trajectory in the cumulative "
+            "chart below, but the per-trade stats above are the honest alpha estimate."
         )
+
+        # ── Per-trade excess distribution histogram ───────────────────────
+        # Visualises the same data the cards summarise — bulk vs tails, skew,
+        # mean-median gap.  Skipped below n=20 since histograms are unstable
+        # at low n and the cards already cover the small-sample case.
+        import math
+        if n_strategy >= 20:
+            # Bin edges aligned to multiples of 2 so the 0% benchmark line
+            # always falls on a bin boundary (no half-positive / half-negative
+            # bars that would confuse the red/teal split).
+            bin_size = 2.0
+            x_min = math.floor(excess_series_pct.min() / bin_size) * bin_size
+            x_max = math.ceil (excess_series_pct.max() / bin_size) * bin_size
+            xbins_full = dict(start=x_min, end=x_max, size=bin_size)
+
+            # Split at 0 for the red/teal colour convention (matches rest of page).
+            neg_excess = excess_series_pct[excess_series_pct <  0]
+            pos_excess = excess_series_pct[excess_series_pct >= 0]
+
+            hist_fig = go.Figure()
+
+            # IQR (p25-p75) shaded band — sits behind the bars.
+            hist_fig.add_vrect(
+                x0=p25_excess_pct, x1=p75_excess_pct,
+                fillcolor="rgba(255,255,255,0.08)",
+                line_width=0,
+                layer="below",
+                annotation_text=f"IQR (middle 50%): {p25_excess_pct:+.1f}% to {p75_excess_pct:+.1f}%",
+                annotation_position="top left",
+                annotation_font_size=11,
+                annotation_font_color="rgba(255,255,255,0.55)",
+            )
+
+            if not neg_excess.empty:
+                hist_fig.add_trace(go.Histogram(
+                    x=neg_excess, xbins=xbins_full,
+                    marker_color="#ef5350",
+                    marker_line=dict(width=0.5, color="rgba(0,0,0,0.4)"),
+                    name=f"Lagged benchmark ({len(neg_excess):,})",
+                    hovertemplate="excess %{x}%<br>trades: %{y}<extra></extra>",
+                ))
+            if not pos_excess.empty:
+                hist_fig.add_trace(go.Histogram(
+                    x=pos_excess, xbins=xbins_full,
+                    marker_color="#26a69a",
+                    marker_line=dict(width=0.5, color="rgba(0,0,0,0.4)"),
+                    name=f"Beat benchmark ({len(pos_excess):,})",
+                    hovertemplate="excess %{x}%<br>trades: %{y}<extra></extra>",
+                ))
+
+            # Annotation lines: benchmark (0), median, mean.
+            # Stagger label positions so they don't overlap when mean ≈ median.
+            hist_fig.add_vline(
+                x=0,
+                line_color="rgba(255,255,255,0.55)",
+                line_width=1.5,
+                line_dash="dash",
+                annotation_text="benchmark (0%)",
+                annotation_position="top",
+                annotation_font_color="rgba(255,255,255,0.75)",
+            )
+            hist_fig.add_vline(
+                x=med_excess_pct,
+                line_color="#ffb74d",
+                line_width=2,
+                annotation_text=f"median {med_excess_pct:+.2f}%",
+                annotation_position="top left" if med_excess_pct >= avg_excess_pct else "bottom left",
+                annotation_font_color="#ffb74d",
+            )
+            hist_fig.add_vline(
+                x=avg_excess_pct,
+                line_color="#ffd54f",
+                line_width=2,
+                annotation_text=f"mean {avg_excess_pct:+.2f}%",
+                annotation_position="top right" if avg_excess_pct >= med_excess_pct else "bottom right",
+                annotation_font_color="#ffd54f",
+            )
+
+            hist_fig.update_layout(
+                height=340,
+                template="plotly_dark",
+                xaxis=dict(title=f"Excess return per trade vs {_app_config.data.benchmark_symbol} (%)"),
+                yaxis=dict(title="Number of trades"),
+                margin=dict(l=0, r=0, t=40, b=0),
+                barmode="overlay",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                bargap=0.05,
+            )
+            st.plotly_chart(hist_fig, use_container_width=True)
+            st.caption(
+                f"Distribution of per-trade excess returns vs {_app_config.data.benchmark_symbol} "
+                f"across {n_strategy:,} strategy-decided trades, in 2% bins.  "
+                "**Read the shape**: bars to the left of the dashed white line lagged the "
+                "benchmark; bars to the right beat it.  The shaded band marks the middle "
+                "50% of trades (IQR).  A **healthy alpha distribution** is roughly symmetric "
+                "around 0% — mean and median sit close together.  When the **mean line sits "
+                "well to the right of the median**, the strategy depends on a small number "
+                "of large winners (right-skewed); the typical trade is closer to the median "
+                "than to the headline mean."
+            )
+        else:
+            st.info(
+                f"Distribution histogram skipped — only {n_strategy:,} trades available "
+                "(need at least 20 for the bin counts to be meaningful).  Widen the date "
+                "range or clear sidebar filters to see more trades."
+            )
 
         # ── Cumulative excess return chart ────────────────────────────────
         cum_excess_df = strategy_df.sort_values("exit_ts")[["exit_ts", "excess_pct"]].copy()
