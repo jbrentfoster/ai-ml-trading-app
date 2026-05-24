@@ -9,8 +9,8 @@ Two groups:
 
 2. Baseline-pin canaries against the production db/trading.db (skipped when
    the file doesn't exist — keeps CI clean):
-     - test_benchmark_aggregates_deduped_baseline_2026_05_19
-     - test_benchmark_aggregates_raw_baseline_2026_05_19
+     - test_benchmark_aggregates_deduped_baseline_2026_05_24
+     - test_benchmark_aggregates_raw_baseline_2026_05_24
    These deliberately fail after each weekly --force retrain (which inserts
    fresh trade_log rows under new run_ids).  The failure IS the canary —
    eyeball the new aggregates, re-pin to the new date, ship.  See the
@@ -256,33 +256,33 @@ class TestBenchmarkAggregatesBaseline20260519:
             "win_rate_vs_bench": 100.0 * (strategy["excess_pct"] > 0).sum() / n,
         }
 
-    def test_benchmark_aggregates_deduped_baseline_2026_05_19(self):
+    def test_benchmark_aggregates_deduped_baseline_2026_05_24(self):
         """Default page view (dedup=ON, active_universe=ON), fold_end excluded.
 
-        Pin date: 2026-05-19.  Tolerances are wide enough to absorb
+        Pin date: 2026-05-24.  Tolerances are wide enough to absorb
         floating-point recomputation but tight enough to catch a real shift.
         FAILURE EXPECTED after the next weekly retrain — re-pin to new
         numbers and bump the date in the test name."""
         m = self._strategy_metrics(dedup=True, active_universe=True)
-        assert m["n"]                 == 49,                       (
-            f"Row count drifted from 2026-05-19 baseline of 49 — got {m['n']}.  "
+        assert m["n"]                 == 93,                       (
+            f"Row count drifted from 2026-05-24 baseline of 93 — got {m['n']}.  "
             "Likely cause: a new weekly --force retrain has landed.  Eyeball "
             "the new numbers (Page 10 default view) and re-pin this test."
         )
-        assert m["cum_excess_pct"]    == pytest.approx(+124.69, abs=0.5)
-        assert m["win_rate_vs_bench"] == pytest.approx(  51.0,  abs=0.5)
+        assert m["cum_excess_pct"]    == pytest.approx(+538.11, abs=0.5)
+        assert m["win_rate_vs_bench"] == pytest.approx(  48.4,  abs=0.5)
 
-    def test_benchmark_aggregates_raw_baseline_2026_05_19(self):
+    def test_benchmark_aggregates_raw_baseline_2026_05_24(self):
         """Multi-run view (dedup=OFF, active_universe=OFF), fold_end excluded.
 
-        Pin date: 2026-05-19.  Same fold_end-excluded slice as the deduped
+        Pin date: 2026-05-24.  Same fold_end-excluded slice as the deduped
         baseline — the divergence vs the deduped numbers is the architectural
         finding (see CLAUDE.md 'Dedup vs raw views are honest answers')."""
         m = self._strategy_metrics(dedup=False, active_universe=False)
-        assert m["n"]                 == 839,                      (
-            f"Row count drifted from 2026-05-19 baseline of 839 — got {m['n']}.  "
+        assert m["n"]                 == 932,                      (
+            f"Row count drifted from 2026-05-24 baseline of 932 — got {m['n']}.  "
             "Likely cause: a new --force retrain inserted rows OR the backfill "
             "skipped rows for some symbols.  Investigate before re-pinning."
         )
-        assert m["cum_excess_pct"]    == pytest.approx(-1711.41, abs=2.0)
-        assert m["win_rate_vs_bench"] == pytest.approx(   32.4,  abs=0.5)
+        assert m["cum_excess_pct"]    == pytest.approx(-1173.30, abs=2.0)
+        assert m["win_rate_vs_bench"] == pytest.approx(   34.0,  abs=0.5)
