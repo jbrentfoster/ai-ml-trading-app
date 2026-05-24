@@ -324,37 +324,73 @@ else:
     else:
         n_strategy = len(strategy_df)
         n_fold_end = len(fold_end_df)
-        cum_excess_pct = float(strategy_df["excess_pct"].sum()) * 100.0
-        avg_excess_pct = float(strategy_df["excess_pct"].mean()) * 100.0
+
+        # Per-trade distribution stats (all in % units, not fractions)
+        excess_series_pct = strategy_df["excess_pct"] * 100.0
+        cum_excess_pct = float(excess_series_pct.sum())
+        avg_excess_pct = float(excess_series_pct.mean())
+        med_excess_pct = float(excess_series_pct.median())
+        std_excess_pct = float(excess_series_pct.std())
+        p25_excess_pct = float(excess_series_pct.quantile(0.25))
+        p75_excess_pct = float(excess_series_pct.quantile(0.75))
         n_wins_vs_b   = int((strategy_df["excess_pct"] > 0).sum())
         win_vs_b_pct  = 100.0 * n_wins_vs_b / n_strategy
+        mean_median_gap = avg_excess_pct - med_excess_pct
 
         bc1, bc2, bc3 = st.columns(3)
         bc1.metric(
-            "Cumulative Excess Return",
-            f"{cum_excess_pct:+.2f}%",
-            delta=f"{cum_excess_pct:+.2f}% vs benchmark",
-            delta_color="normal",
+            "Avg Excess per Trade",
+            f"{avg_excess_pct:+.3f}%",
+            delta=f"± {std_excess_pct:.2f}% std across {n_strategy:,} trades",
+            delta_color="off",
         )
         bc2.metric(
+            "Median Excess per Trade",
+            f"{med_excess_pct:+.3f}%",
+            delta=("half above / half below"
+                   if abs(med_excess_pct) < 0.05
+                   else f"typical trade {'beats' if med_excess_pct > 0 else 'lags'} benchmark"),
+            delta_color="off",
+        )
+        bc3.metric(
             "Win Rate vs Benchmark",
             f"{win_vs_b_pct:.1f}%",
             delta=f"{n_wins_vs_b:,} / {n_strategy:,} trades beat benchmark",
             delta_color="off",
         )
-        bc3.metric(
-            "Avg Excess per Trade",
-            f"{avg_excess_pct:+.3f}%",
-            delta=f"{avg_excess_pct:+.3f}% mean excess",
-            delta_color="normal",
-        )
+
+        # Diagnostic flag: mean-vs-median spread reveals whether alpha is
+        # broad-based or driven by a few outlier wins.  2pp threshold picked
+        # to match the std-dispersion floor below which symmetric noise is
+        # expected; above it, the distribution is meaningfully right-skewed.
+        if abs(mean_median_gap) >= 2.0:
+            direction = "right" if mean_median_gap > 0 else "left"
+            polarity = "winners" if mean_median_gap > 0 else "losers"
+            st.warning(
+                f"**Outlier-driven (mean − median = {mean_median_gap:+.2f}pp)** — "
+                f"distribution is {direction}-skewed; alpha is concentrated in "
+                f"a small number of large {polarity}.  "
+                f"Top 25% of trades beat benchmark by ≥{p75_excess_pct:+.2f}%; "
+                f"bottom 25% lag by ≤{p25_excess_pct:+.2f}%.  "
+                f"If the big {polarity} stop coming, the headline avg will "
+                f"collapse toward the median ({med_excess_pct:+.2f}%)."
+            )
+        else:
+            st.success(
+                f"**Distribution looks symmetric (mean − median = {mean_median_gap:+.2f}pp)** — "
+                f"mean and median agree, so the per-trade alpha estimate is broad-based "
+                f"rather than driven by a few outlier trades."
+            )
 
         st.caption(
             "**Headline metrics computed over strategy-decided exits only** "
             f"(stop / tp / signal_flip / trailing — {n_strategy:,} trades).  "
             f"Excludes {n_fold_end:,} fold-end forced closures — those are backtest "
             "artifacts of WF test-window boundaries, not real exit decisions the live "
-            "system would ever make.  Toggle the expander below to audit the filter."
+            "system would ever make.  Toggle the expander below to audit the filter.  "
+            f"**Sum of per-trade excess** (NOT a portfolio compound return): "
+            f"{cum_excess_pct:+.2f}% — informative as a trajectory in the chart below, "
+            "but the per-trade stats above are the honest alpha estimate."
         )
 
         # ── Cumulative excess return chart ────────────────────────────────
@@ -387,9 +423,13 @@ else:
         )
         st.plotly_chart(excess_fig, use_container_width=True)
         st.caption(
-            f"Each point is the cumulative sum of (trade return − "
+            "**Trajectory only — not a portfolio compound return.**  "
+            f"Each point is the cumulative *sum* of (trade return − "
             f"{_app_config.data.benchmark_symbol} return over the same holding period) "
             "for **strategy-decided exits** — stop, tp, signal_flip, trailing.  "
+            "Magnitude scales linearly with trade count, so look at the *shape* "
+            "(rising / flat / falling), not the endpoint value — the per-trade "
+            "stats in the cards above are the honest alpha estimate.  "
             "Fold-end forced closures excluded — they are backtest artifacts, not real "
             "exit decisions the live system would ever make.  A persistently rising line "
             "is evidence of alpha; a flat or falling line means the strategy is not "
