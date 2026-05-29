@@ -17,6 +17,8 @@ Tables:
   signal_runner_log       — daily signal_runner.py run summaries
   trade_log               — closed-trade outcomes (walk-forward simulator + live fills)
   intraday_run_log        — intraday lightweight-runner outcomes (CB check + trail ratchets)
+  fill_log                — raw IBKR executions (Phase B reconciliation audit trail)
+  reconciliation_state    — Phase B reconciliation watermark per (source, account)
 
 All timestamps are stored as UTC-naive datetimes.
 """
@@ -395,6 +397,13 @@ class TradeLog(Base):
     # silently zeroed).  Populated by scripts/backfill_benchmark_returns.py.
     benchmark_return_pct = Column(Float)
     recorded_at   = Column(DateTime, nullable=False)
+    # Phase B live-fill linkage (NULL on source='walk_forward' rows).  The
+    # closing fill's exec_id (exit_exec_id) is the per-round-trip dedup key,
+    # enforced by the partial unique index uq_trade_live_exit.
+    entry_exec_id   = Column(String(40))
+    exit_exec_id    = Column(String(40))
+    parent_order_id = Column(Integer)
+    account         = Column(String(20))
 
 
 class IntradayRunLog(Base):
@@ -429,6 +438,61 @@ class IntradayRunLog(Base):
     trailing_converted  = Column(Integer, default=0)
     duration_seconds    = Column(Float)
     error_message       = Column(Text)
+
+
+class FillLog(Base):
+    """
+    Raw IBKR executions ingested by Phase B reconciliation — the audit trail
+    from which trade_log source='live' rows are aggregated.
+
+    One row per IBKR Execution.  ``exec_id`` is IBKR's stable per-fill ID and
+    the sole idempotency key: re-running reconciliation over an overlapping
+    window can never double-write.  The only mutable columns after insert are
+    ``commission`` / ``realized_pnl`` — commissionReport can arrive on a later
+    fetch than the Execution itself (see upsert_fill + the commission-race note
+    in execution/reconciliation.py).
+    """
+    __tablename__ = "fill_log"
+
+    id              = Column(Integer, primary_key=True, autoincrement=True)
+    exec_id         = Column(String(40), nullable=False, unique=True)
+    order_id        = Column(Integer)
+    perm_id         = Column(Integer)
+    parent_order_id = Column(Integer)
+    account         = Column(String(20))
+    symbol          = Column(String(10), nullable=False)
+    conid           = Column(Integer)
+    side            = Column(String(4),  nullable=False)   # 'BUY' | 'SELL'
+    order_type      = Column(String(10))                   # 'LMT'|'STP'|'STP LMT'|'TRAIL'|'MKT'|None
+    shares          = Column(Float, nullable=False)
+    price           = Column(Float, nullable=False)        # avg fill price for this exec
+    commission      = Column(Float)                        # may be None until commissionReport lands
+    realized_pnl    = Column(Float)                        # IBKR per-fill realised P&L (cross-check only)
+    exec_time       = Column(DateTime, nullable=False)     # UTC-naive
+    recorded_at     = Column(DateTime, nullable=False)
+
+
+class ReconciliationState(Base):
+    """
+    Watermark for Phase B reconciliation — one row per (source, account).
+
+    ``last_reconciled_ts`` is the newest exec_time persisted so far; it bounds
+    the next reqExecutions ExecutionFilter.time.  NULL (first run) defaults to
+    now - 7d, the IBKR server-side retention horizon.
+    """
+    __tablename__ = "reconciliation_state"
+
+    id                 = Column(Integer, primary_key=True, autoincrement=True)
+    source             = Column(String(20), nullable=False)   # 'live'
+    account            = Column(String(20))                   # None for the current single-account setup
+    last_reconciled_ts = Column(DateTime)
+    last_run_ts        = Column(DateTime)
+    last_n_fills       = Column(Integer)
+    notes              = Column(Text)
+
+    __table_args__ = (
+        UniqueConstraint("source", "account", name="uq_reconciliation_state"),
+    )
 
 
 # ── Engine (lazy singleton) ───────────────────────────────────────────────────
@@ -561,6 +625,31 @@ def _migrate(engine) -> None:
                 ))
                 conn.commit()
                 log.info("Migration applied: trade_log.benchmark_return_pct")
+
+            # trade_log live-fill linkage (Phase B — 2026-05-29).  Links an
+            # aggregated source='live' trade back to the IBKR executions it was
+            # built from.  walk_forward rows leave these NULL.
+            for col, coltype in (
+                ("entry_exec_id",   "VARCHAR(40)"),
+                ("exit_exec_id",    "VARCHAR(40)"),
+                ("parent_order_id", "INTEGER"),
+                ("account",         "VARCHAR(20)"),
+            ):
+                if col not in tl_cols:
+                    conn.execute(text(
+                        f"ALTER TABLE trade_log ADD COLUMN {col} {coltype}"
+                    ))
+                    conn.commit()
+                    log.info("Migration applied: trade_log.%s", col)
+
+            # Partial unique index on the closing exec_id — the per-round-trip
+            # dedup key for live reconciliation.  Scoped to source='live' so
+            # walk_forward rows (NULL exit_exec_id) are excluded entirely.
+            conn.execute(text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_trade_live_exit "
+                "ON trade_log(exit_exec_id) WHERE source='live'"
+            ))
+            conn.commit()
 
         # fundamental_data: drop UNIQUE(symbol) so the table can hold append-only
         # snapshot history (needed for derived features like analyst-target
@@ -1498,4 +1587,227 @@ def get_trade_log(
         "costs_charged": r.costs_charged,
         "benchmark_return_pct": r.benchmark_return_pct,
         "recorded_at":   r.recorded_at,
+        "entry_exec_id": r.entry_exec_id,
+        "exit_exec_id":  r.exit_exec_id,
+        "parent_order_id": r.parent_order_id,
+        "account":       r.account,
     } for r in rows])
+
+
+# ── Fill log / reconciliation helpers (Phase B) ───────────────────────────────
+
+def upsert_fill(record: dict) -> str:
+    """Ingest one IBKR execution into fill_log.  Returns the action taken.
+
+    - ``"inserted"``    — new exec_id, row created.
+    - ``"cost_updated"``— exec_id already present with commission IS NULL and the
+                          incoming record carries a value: only the cost columns
+                          (commission, realized_pnl) are refreshed.  This is the
+                          *deliberate* exception to insert-or-ignore — see the
+                          commission-race note in execution/reconciliation.py.
+    - ``"skipped"``     — exec_id already present and nothing to update.
+
+    ``exec_id`` is the sole dedup key; only commission / realized_pnl are ever
+    mutated on an existing row.
+    """
+    engine = get_engine()
+    with Session(engine) as session:
+        existing = (
+            session.query(FillLog)
+            .filter_by(exec_id=record["exec_id"])
+            .first()
+        )
+        if existing is None:
+            row = FillLog(recorded_at=_utc_now())
+            for k, v in record.items():
+                if hasattr(row, k):
+                    setattr(row, k, v)
+            session.add(row)
+            session.commit()
+            return "inserted"
+
+        if existing.commission is None and record.get("commission") is not None:
+            existing.commission = record.get("commission")
+            existing.realized_pnl = record.get("realized_pnl")
+            session.commit()
+            return "cost_updated"
+
+        return "skipped"
+
+
+def get_fills(
+    since: datetime | None = None,
+    symbol: str | None = None,
+) -> list[dict]:
+    """Return fill_log rows (optionally filtered), oldest first.
+
+    Ordered ascending by ``exec_time`` so the reconciliation aggregator can walk
+    fills chronologically to pair entries with exits.
+    """
+    engine = get_engine()
+    with Session(engine) as session:
+        q = session.query(FillLog)
+        if since is not None:
+            q = q.filter(FillLog.exec_time >= since)
+        if symbol:
+            q = q.filter(FillLog.symbol == symbol)
+        rows = q.order_by(FillLog.exec_time.asc()).all()
+    return [{
+        "exec_id":         r.exec_id,
+        "order_id":        r.order_id,
+        "perm_id":         r.perm_id,
+        "parent_order_id": r.parent_order_id,
+        "account":         r.account,
+        "symbol":          r.symbol,
+        "conid":           r.conid,
+        "side":            r.side,
+        "order_type":      r.order_type,
+        "shares":          r.shares,
+        "price":           r.price,
+        "commission":      r.commission,
+        "realized_pnl":    r.realized_pnl,
+        "exec_time":       r.exec_time,
+    } for r in rows]
+
+
+def get_reconciliation_state(source: str, account: str | None) -> dict | None:
+    """Return the reconciliation watermark row for (source, account), or None."""
+    engine = get_engine()
+    with Session(engine) as session:
+        row = (
+            session.query(ReconciliationState)
+            .filter_by(source=source, account=account)
+            .first()
+        )
+    if not row:
+        return None
+    return {
+        "source":             row.source,
+        "account":            row.account,
+        "last_reconciled_ts": row.last_reconciled_ts,
+        "last_run_ts":        row.last_run_ts,
+        "last_n_fills":       row.last_n_fills,
+        "notes":              row.notes,
+    }
+
+
+def set_reconciliation_state(
+    source: str,
+    account: str | None,
+    last_reconciled_ts: datetime | None,
+    last_run_ts: datetime | None,
+    last_n_fills: int | None,
+    notes: str | None = None,
+) -> None:
+    """Upsert the reconciliation watermark for (source, account)."""
+    engine = get_engine()
+    with Session(engine) as session:
+        row = (
+            session.query(ReconciliationState)
+            .filter_by(source=source, account=account)
+            .first()
+        )
+        if row is None:
+            row = ReconciliationState(source=source, account=account)
+            session.add(row)
+        row.last_reconciled_ts = last_reconciled_ts
+        row.last_run_ts        = last_run_ts
+        row.last_n_fills       = last_n_fills
+        row.notes              = notes
+        session.commit()
+
+
+def live_trade_exists(exit_exec_id: str) -> bool:
+    """True if a source='live' trade_log row already closed on ``exit_exec_id``.
+
+    The per-round-trip dedup guard — mirrors the uq_trade_live_exit partial
+    unique index but lets the caller skip with a clean log line instead of
+    catching an IntegrityError.
+    """
+    if not exit_exec_id:
+        return False
+    engine = get_engine()
+    with Session(engine) as session:
+        row = (
+            session.query(TradeLog.id)
+            .filter(TradeLog.source == "live", TradeLog.exit_exec_id == exit_exec_id)
+            .first()
+        )
+    return row is not None
+
+
+# ── Exit-reason inference helpers (Phase B reconciliation) ────────────────────
+
+def get_latest_approved_bracket(symbol: str, before_ts: datetime) -> dict | None:
+    """Latest APPROVED BUY order_decision for ``symbol`` before ``before_ts``.
+
+    Returns the recorded entry/stop/TP prices so the reconciler can match a
+    live exit price to the original bracket levels (the
+    ``order_decisions_price_match`` exit-reason path).  None if no qualifying row.
+    """
+    engine = get_engine()
+    with Session(engine) as session:
+        row = (
+            session.query(OrderDecisionRecord)
+            .filter(
+                OrderDecisionRecord.symbol == symbol,
+                OrderDecisionRecord.signal == "BUY",
+                OrderDecisionRecord.decision == "APPROVED",
+                OrderDecisionRecord.decided_at < before_ts,
+            )
+            .order_by(desc(OrderDecisionRecord.decided_at))
+            .first()
+        )
+    if not row:
+        return None
+    return {
+        "entry_price":       row.entry_price,
+        "stop_price":        row.stop_price,
+        "take_profit_price": row.take_profit_price,
+        "decided_at":        row.decided_at,
+    }
+
+
+def has_converted_trailing_before(symbol: str, before_ts: datetime) -> bool:
+    """True if ``symbol`` has a CONVERTED trailing_stop_log row before ``before_ts``.
+
+    Used by the reconciler's session-independent exit-reason inference: a
+    position whose bracket TP was converted to a TRAIL and then filled exits
+    via ``trailing`` even when the order is no longer in the live session.
+    """
+    engine = get_engine()
+    with Session(engine) as session:
+        row = (
+            session.query(TrailingStopLog.id)
+            .filter(
+                TrailingStopLog.symbol == symbol,
+                TrailingStopLog.action == "CONVERTED",
+                TrailingStopLog.decided_at < before_ts,
+            )
+            .first()
+        )
+    return row is not None
+
+
+def has_closed_long_near(symbol: str, ts: datetime, minutes: int = 1) -> bool:
+    """True if ``symbol`` has a CLOSED_LONG order_decision within ±``minutes`` of ``ts``.
+
+    Disambiguates a MKT exit: a market sell paired with an in-window CLOSED_LONG
+    decision is a signal-flip close, otherwise it's a manual close.
+    """
+    from datetime import timedelta
+    lo = ts - timedelta(minutes=minutes)
+    hi = ts + timedelta(minutes=minutes)
+    engine = get_engine()
+    with Session(engine) as session:
+        row = (
+            session.query(OrderDecisionRecord.id)
+            .filter(
+                OrderDecisionRecord.symbol == symbol,
+                OrderDecisionRecord.decision == "CLOSED_LONG",
+                OrderDecisionRecord.decided_at >= lo,
+                OrderDecisionRecord.decided_at <= hi,
+            )
+            .first()
+        )
+    return row is not None

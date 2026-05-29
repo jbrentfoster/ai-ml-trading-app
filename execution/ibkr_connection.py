@@ -45,6 +45,7 @@ try:
     from ib_insync import (
         IB,
         Contract,
+        ExecutionFilter,
         LimitOrder,
         MarketOrder,
         Order,
@@ -553,6 +554,77 @@ class IBKRConnection:
                 "status":           t.orderStatus.status,
                 "filled":           t.orderStatus.filled,
                 "remaining":        t.orderStatus.remaining,
+            })
+        return result
+
+    async def get_executions(self, since: Optional[datetime] = None) -> list[dict]:
+        """Return IBKR executions (fills) since ``since`` as plain dicts.
+
+        Wraps ``reqExecutionsAsync(ExecutionFilter(time=...))``.  IBKR retains
+        ~7 days of execution history server-side, so this works regardless of
+        whether the client was connected when the fill happened — the basis for
+        Phase B polling reconciliation.
+
+        ``order_type`` is resolved best-effort from the current session's trades
+        by ``orderId``; it is ``None`` for fills whose parent order is no longer
+        in this session (the common case for off-session bracket fills).  The
+        reconciler has a session-independent exit-reason fallback for that case.
+        """
+        self._require_connection()
+
+        # We deliberately do NOT set ExecutionFilter.time.  Its string format is
+        # timezone-ambiguous (a bare 'yyyymmdd HH:MM:SS' triggers IBKR warning
+        # 2174 and applies an implied TZ; the 'yyyymmdd-hh:mm:ss UTC' form IBKR
+        # *recommends* was observed to silently return zero rows on this Gateway
+        # build).  IBKR caps server-side retention at ~7 days regardless, so we
+        # request the full available set with an empty filter and let the
+        # reconciler bound it client-side on the normalised UTC ``exec_time``.
+        # ``since`` is accepted for interface compatibility but unused here.
+        fills = await self._ib.reqExecutionsAsync(ExecutionFilter())
+
+        # ib_insync fills unused numeric fields with sys.float_info.max rather
+        # than None — same sentinel guard as get_open_orders().
+        def _clean(v):
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                return None
+            if not math.isfinite(fv) or abs(fv) > 1e100:
+                return None
+            return fv
+
+        # Build an orderId -> orderType map from the current session's trades.
+        order_types: dict[int, str] = {}
+        try:
+            for t in self._ib.trades():
+                oid = getattr(t.order, "orderId", None)
+                if oid is not None:
+                    order_types[oid] = t.order.orderType
+        except Exception:
+            pass
+
+        result = []
+        for f in fills:
+            ex = f.execution
+            cr = getattr(f, "commissionReport", None)
+            side = "BUY" if ex.side == "BOT" else "SELL"
+            order_id = getattr(ex, "orderId", None)
+            price = _clean(ex.price)
+            result.append({
+                "exec_id":         ex.execId,
+                "order_id":        order_id,
+                "perm_id":         getattr(ex, "permId", None),
+                "parent_order_id": None,   # not exposed on Execution; resolved later if needed
+                "account":         getattr(ex, "acctNumber", None),
+                "symbol":          f.contract.symbol,
+                "conid":           getattr(f.contract, "conId", None),
+                "side":            side,
+                "order_type":      order_types.get(order_id),
+                "shares":          _clean(ex.shares),
+                "price":           round(price, 2) if price is not None else None,
+                "commission":      _clean(getattr(cr, "commission", None)) if cr else None,
+                "realized_pnl":    _clean(getattr(cr, "realizedPNL", None)) if cr else None,
+                "exec_time":       ex.time,   # tz-aware UTC — normalised by the reconciler
             })
         return result
 

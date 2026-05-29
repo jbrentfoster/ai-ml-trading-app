@@ -139,9 +139,12 @@ trading_app/
 │   ├── train_models.py      — Walk-forward training for all symbols; saves checkpoints to
 │   │                          models/cache/{symbol}/; run between run_pipeline.py and signal_runner.py
 │   │                          --symbol, --quick, --force, --interval flags
-│   ├── signal_runner.py     — Daily automation: refresh data → generate signals → trailing stops →
+│   ├── signal_runner.py     — Daily automation: (Phase 1) reconcile off-cycle IBKR fills →
+│   │                          refresh data → generate signals → trailing stops →
 │   │                          hold-timeout flatten → risk/order decisions
-│   │                          7-phase flow (1, 2, 3, 3.5, 3.6, 4, 5); --dry-run (default),
+│   │                          7-phase flow (1, 2, 3, 3.5, 3.6, 4, 5); Phase 1 calls
+│   │                          execution/reconciliation.py before the CB/baseline check when
+│   │                          not dry-run; --dry-run (default),
 │   │                          --no-dry-run (submit live paper orders — requires IB Gateway +
 │   │                          trading.paper_orders_enabled=True), --symbol, --schedule flags.
 │   │                          Bracket orders submitted GTC with prices rounded to $0.01 tick size.
@@ -176,6 +179,11 @@ trading_app/
 │   │                            with final post-close values from yfinance.  Tolerates IB Gateway
 │   │                            being down (--no-ibkr flag, also auto-degrades on connect failure).
 │   │                            Invoked by run_eod.bat.
+│   ├── reconcile_fills.py   — Phase B CLI: reconcile IBKR fills → fill_log + trade_log via
+│   │                          execution/reconciliation.py (same core as signal_runner Phase 1);
+│   │                          --since / --dry-run / --symbol.  Backfills off-cycle bracket fills
+│   │                          within IBKR's retention window (shorter than the nominal 7d — see
+│   │                          arch-decision note)
 │   ├── open_orders.py       — Ops CLI: list open IBKR orders (default, read-only); add
 │   │                          --cancel plus --id / --symbol / --all to cancel
 │   ├── open_positions.py    — Ops CLI: list held IBKR positions (default, read-only); add
@@ -197,11 +205,15 @@ trading_app/
 │                              root logger captures WARNING+ from libraries to logs/python/
 │
 ├── execution/
-│   └── ibkr_connection.py   — IBKRConnection async context manager; AccountSummary dataclass;
-│                              paper + live port switching; all account/order methods are async;
-│                              get_last_price(): 3-tier fallback (IBKR live → IBKR 15-min delayed → yfinance);
-│                              informational error codes {2104, 2106, 2107, 2119, 2158, 300, 399, 10167, 10197, 10349, 202}
-│                              are suppressed from WARNING logs
+│   ├── ibkr_connection.py   — IBKRConnection async context manager; AccountSummary dataclass;
+│   │                          paper + live port switching; all account/order methods are async;
+│   │                          get_last_price(): 3-tier fallback (IBKR live → IBKR 15-min delayed → yfinance);
+│   │                          get_executions(): reqExecutions wrapper (no server-side time filter — see
+│   │                          arch-decision note); informational error codes {2104, 2106, 2107, 2119, 2158,
+│   │                          300, 399, 10167, 10197, 10349, 202} are suppressed from WARNING logs
+│   └── reconciliation.py    — Phase B live-fill reconciliation core: reconcile_fills() ingests IBKR
+│                              executions → fill_log, aggregates paired round trips → trade_log
+│                              (source='live'); shared by signal_runner Phase 1 + scripts/reconcile_fills.py
 │
 ├── data/
 │   ├── database.py          — SQLAlchemy ORM + upsert/query helpers; _migrate() for schema
@@ -340,7 +352,7 @@ FundamentalsClient.get()     → upsert_fundamentals() → SQLite (fundamental_d
 
 ## Database Schema
 
-16 tables in `db/trading.db`. All timestamps are UTC-naive datetimes.
+18 tables in `db/trading.db`. All timestamps are UTC-naive datetimes.
 
 | Table | Key columns | Notes |
 |-------|-------------|-------|
@@ -358,8 +370,10 @@ FundamentalsClient.get()     → upsert_fundamentals() → SQLite (fundamental_d
 | `order_decisions` | run_id, symbol, signal, decision, shares, entry/stop/tp prices, position_value, reject_reason, decided_at | per-signal decisions from OrderManager |
 | `signal_runner_log` | run_id, run_date, mode, symbols_processed, signals_generated, orders_submitted, orders_rejected, skipped_duplicates, longs_closed, trailing_conversions, hold_timeouts, duration_seconds | daily run summaries |
 | `trailing_stop_log` | run_id, symbol, action, shares, entry_price, current_price, atr, trail_amount, reason, decided_at | one row per position evaluated by TrailingStopManager per run (action ∈ CONVERTED / SKIPPED / FAILED) |
-| `trade_log` | source ('walk_forward' \| 'live'), run_id, fold_index, symbol, signal, entry_ts, entry_px, exit_ts, exit_px, exit_reason, shares, pnl, pnl_pct, costs_charged, benchmark_return_pct, recorded_at | closed-trade outcomes; populated by MLWalkForwardOrchestrator's bracket simulator (Phase 4.5 — Phase A) and, in future, IBKR fill subscriptions (Phase B). exit_reason ∈ stop / tp / trailing / signal_flip / fold_end / manual_close.  `benchmark_return_pct` (added 2026-05-19) is the raw price return on `config.data.benchmark_symbol` (default SPY) over the trade's holding period — NOT net of costs; deliberately asymmetric with `pnl_pct` to give the correct retail-alpha frame.  NULL for pre-migration rows + any row whose entry_ts / exit_ts has no benchmark bar; populated by `scripts/backfill_benchmark_returns.py` |
+| `trade_log` | source ('walk_forward' \| 'live'), run_id, fold_index, symbol, signal, entry_ts, entry_px, exit_ts, exit_px, exit_reason, shares, pnl, pnl_pct, costs_charged, benchmark_return_pct, recorded_at, entry_exec_id, exit_exec_id, parent_order_id, account | closed-trade outcomes; populated by MLWalkForwardOrchestrator's bracket simulator (Phase 4.5 — Phase A) and by IBKR fill reconciliation (Phase B, shipped 2026-05-29 — `source='live'` rows). exit_reason ∈ stop / tp / trailing / signal_flip / fold_end / manual_close (`fold_end` is walk-forward-only; never written for live rows).  `benchmark_return_pct` (added 2026-05-19) is the raw price return on `config.data.benchmark_symbol` (default SPY) over the trade's holding period — NOT net of costs; deliberately asymmetric with `pnl_pct` to give the correct retail-alpha frame.  NULL for pre-migration rows + any row whose entry_ts / exit_ts has no benchmark bar; populated by `scripts/backfill_benchmark_returns.py`.  `entry_exec_id`/`exit_exec_id`/`parent_order_id`/`account` (added 2026-05-29, Phase B) link a `source='live'` row to the IBKR executions it was aggregated from; NULL on `walk_forward` rows; `exit_exec_id` is the per-round-trip dedup key (partial unique index `uq_trade_live_exit WHERE source='live'`) |
 | `intraday_run_log` | run_id PK, run_timestamp, mode ('intraday'), status ('completed' \| 'gateway_down' \| 'cb_tripped' \| 'error'), daily_loss_pct, weekly_loss_pct, cb_tripped, positions_flattened, trailing_evaluated, trailing_ratcheted, trailing_converted, duration_seconds, error_message | one row per `scripts/intraday_check.py` invocation (12:00 ET + 15:30 ET on weekdays). Separate from `signal_runner_log` because cadence (multiple per day) and scope (Phase 1 CB + Phase 3.5 only — never writes to `signal_log` and never regenerates signals) differ. `status='gateway_down'` rows have NULL loss_pct fields and are written even when IBKR is unreachable so missed slots are visible on Page 8.  `trailing_ratcheted` counts positions where IBKR has moved `Order.trailStopPrice` up since the last `trailing_stop_log` entry for that symbol (intraday-runner observability — see new `RATCHETED` action value). |
+| `fill_log` | exec_id (UNIQUE), order_id, perm_id, parent_order_id, account, symbol, conid, side ('BUY'\|'SELL'), order_type, shares, price, commission, realized_pnl, exec_time, recorded_at | raw IBKR executions ingested by Phase B reconciliation (shipped 2026-05-29) — the audit trail from which `trade_log` `source='live'` rows are aggregated. `exec_id` is the sole idempotency key; only `commission`/`realized_pnl` are ever mutated after insert (commissionReport can arrive on a later fetch than the Execution — `upsert_fill` refreshes them when previously NULL). Written by `execution/reconciliation.py`; populated via `IBKRConnection.get_executions()`. |
+| `reconciliation_state` | source, account, last_reconciled_ts, last_run_ts, last_n_fills, notes; UNIQUE(source, account) | Phase B reconciliation watermark (one row per source/account). `last_reconciled_ts` = newest exec_time persisted so far; seeds the next run's window display (NULL first run → now − 7d). Note: IBKR's effective retention is shorter than the 7-day nominal (see arch-decision note) so the watermark is advisory — ingestion takes IBKR's full returned set regardless. |
 
 **Schema migrations:** `_migrate()` in `data/database.py` runs at every engine init. When adding a new ORM column, add an `if "column_name" not in cols: ALTER TABLE` block there — never rely on `create_all()` to add columns to existing tables.
 
@@ -584,6 +598,10 @@ This is the correct retail-alpha frame: the counterfactual is "would I have done
 **Intraday TP→TRAIL conversion is gated behind a separate config flag and a buffer above the daily-Phase-3.5 activation threshold** (`config/settings.py` → `RiskConfig.intraday_trail_conversion_enabled` + `intraday_conversion_buffer_atr`).  The daily Phase 3.5 at 09:35 ET converts bracket TPs into trailing stops once `current_price >= entry + activation_atr × ATR`.  The intraday runner could in principle do the same at 12:00 / 15:30 ET — but two arguments against making it the default: (1) the cancel-TP → cancel-STP → submit-TRAIL sequence leaves a sub-second "no stop" window that is acceptable at 09:35 ET (lower volatility, opening-auction price discovery still settling) but riskier mid-session when liquidity has thinned and moves are faster; (2) anything close to activation at 12:00 ET was *just* evaluated at 09:35 against the same daily ATR — the marginal cases are by definition the worst-positioned ones for a mid-day decision.  Default is therefore opt-in: `intraday_trail_conversion_enabled=False` ⇒ intraday runs only emit `RATCHETED` / `SKIPPED` rows; no conversions attempted.  When operators flip it on, the activation threshold tightens by `intraday_conversion_buffer_atr × ATR` (default 0.5) on top of the daily `activation_atr` — so a position that would clear $102 (activation) at 09:35 must clear $103 at 12:00.  The buffer keeps mid-day conversions to genuinely-strong moves where the no-stop-window risk is least likely to bite.  Symmetric `intraday=True` kwarg on `manage()` engages the gate; the daily runner never passes it, so the legacy path is unaffected.
 
 **Intraday runner exits 0 on Gateway-down rather than raising** (`scripts/intraday_check.py:run` + `main`).  When `IBKRConnection.connect()` fails (or `IBKRConnection()` itself raises during construction), the runner writes a `status='gateway_down'` row to `intraday_run_log`, logs a WARNING, prints a marked stdout line, and **exits with code 0**.  Same behaviour at the outer `main()` `try/except` — any unhandled exception writes a `status='error'` row and still exits 0.  Why: Windows Task Scheduler treats non-zero exits as failures and applies its retry policy.  IB Gateway logs itself out overnight on this account; a typical morning has a non-zero chance of Gateway being unreachable at the 12:00 ET slot.  A runner that exits 1 on that condition would cause Task Scheduler to retry against an already-flaky gateway, potentially spinning into a noise storm.  A runner that exits 0 leaves Task Scheduler quiet but writes a row that makes the missed run visible on Page 8 the next morning (silent skip ≠ invisible skip).  The exit-0 invariant is defended in three places: (a) the gateway-down branch in `run()` writes its row inside its own `try/except` so a DB failure doesn't propagate; (b) the outer `main()` `try/except BaseException` writes a row and returns 0; (c) the fallback `print` in (b) is ASCII-only so even a `_force_utf8_streams()` failure can't re-raise.  Pinned by `test_intraday_runner_gateway_down_exits_clean` and `test_intraday_runner_top_level_exception_writes_error_row`.
+
+**IBKR `reqExecutions` retention is shorter than documented** (`execution/ibkr_connection.py:get_executions`, `execution/reconciliation.py`, Phase B).  IBKR's docs describe ~7 days of server-side execution history, but the 2026-05-29 Phase B verification found this is a **soft maximum, not a guarantee**: a SCHW stop fill from **2026-05-27 (only 2 days prior) was already absent** from `reqExecutions`, while 5/21 fills (AON/SNOW) were long gone.  The effective window may depend on account type, paper-vs-live, or server-side housekeeping we can't observe.  **Operational consequence:** the daily reconciliation in `signal_runner` Phase 1 must run **reliably every weekday**, not best-effort — a skipped run is *not* recoverable later, because any fill that both opened and closed inside the skipped gap will have aged out before the next reconciliation sees it.  This is a scheduling-reliability requirement, satisfied by the existing `run_daily.bat` Windows Task Scheduler entry; it is **not** a code requirement.  Do not assume the 7-day window is forgiving when reasoning about missed runs or backfill windows.  (The four 5/21–5/27 invisible exits that motivated Phase B were themselves unrecoverable for this reason — see CHANGELOG.md 2026-05-29.)
+
+**`get_executions` requests IBKR's full retention and bounds client-side — no server-side time filter** (`execution/ibkr_connection.py:get_executions`).  `ExecutionFilter.time` is too brittle to rely on: a bare `'yyyymmdd HH:MM:SS'` string triggers IBKR **warning 2174** ("submitted request without explicit time zone … implied time zone functionality will be removed") and applies an *implied* timezone that silently shifts the window; the `'yyyymmdd-hh:mm:ss UTC'` form IBKR's own warning *recommends* was observed (2026-05-29, this Gateway build) to **silently return zero rows**.  So `get_executions` passes an **empty `ExecutionFilter()`** — IBKR caps retention at ~7 days regardless (see the note above) — and the reconciler bounds/aggregates client-side on the normalised UTC `exec_time`.  **Do not "optimize" this by re-adding a server-side `time` filter** to reduce payload size: the payload is tiny (a handful of fills), and the filter's failure modes are silent (wrong window or zero rows) rather than loud.  `_to_naive_utc` (in `execution/reconciliation.py`) asserts/coerces UTC before stripping tzinfo so the watermark comparison stays correct.
 
 **Distributional patterns observed across many trades** — patterns that don't fit case studies (no single-trade narrative), Outstanding bugs (no fix in flight), Enhancements (no forward-looking direction), or followups (not a single-run gate) — are tracked under `docs/findings/`. See `docs/findings/README.md` for the scope rule, document structure, and lifecycle. Current findings: `stop_bleed.md` (2026-05-19, observed/hypothesized), `tp_concentration.md` (2026-05-19, observed/hypothesized).
 
@@ -831,7 +849,7 @@ systematically negative f* on the LSTM > 0.7 + MACD < 0 subset.
 
   **Scope correction (2026-05-07)**: this enhancement is **no longer a Phase B prerequisite**. Phase B's design pivoted from a live `execDetails` subscription (which would have required Gateway uptime continuity to avoid missing fills) to polling reconciliation via `reqExecutions` at the start of each daily run — that approach tolerates Gateway downtime by design, since IBKR retains 7 days of execution history server-side regardless of connection state. IBC remains valuable for *Phase 4 live-order submission* (a Gateway-down morning still means brackets aren't placed when signals fire, which is a missed-trade cost not a missed-fill cost), but no longer gates Phase B work. Updated priority: nice-to-have for trade execution timeliness; not blocking any current roadmap item.
 
-- **Phase 4.5 — Realised P&L plumbing (brackets in WF + `trade_log` + realised-Kelly)** *(Phase A verified live 2026-05-04 — long-only gate confirmed; Phase C implemented 2026-05-07 — Sunday-retrain verification pending; Phase B design pivoted 2026-05-07 from live subscription to polling reconciliation — acceptance gates documented in the Phase B section below)*: Bundles four previously-separate items that share a single keystone — the `trade_log` table:
+- **Phase 4.5 — Realised P&L plumbing (brackets in WF + `trade_log` + realised-Kelly)** *(Phase A verified live 2026-05-04 — long-only gate confirmed; Phase C implemented 2026-05-07 — Sunday-retrain verification pending; **Phase B SHIPPED 2026-05-29 — pipeline verified live, moved to CHANGELOG.md (2026-05-29 section); end-to-end paired round-trip verification deferred to the first COHR/MRVL/WDC/USO exit, tracked in `docs/reviews/followups.md`**)*: Bundles four previously-separate items that share a single keystone — the `trade_log` table:
     - Bug: *Kelly disconnected from realised outcomes* (above)
     - Enhancement: *Persist trade outcomes from IBKR*
     - Enhancement: *Position sizing in walk-forward*
@@ -876,7 +894,7 @@ systematically negative f* on the LSTM > 0.7 + MACD < 0 subset.
   5. Persist each closed trade to `trade_log` with `source='walk_forward'`, `run_id=<wf_run_id>`, `fold_index=<i>`. Charge slippage + commissions per existing cost model, plus the extra stop-slippage on `exit_reason='stop'`.
   6. Optional: dashboard Page 4 "Exit reason" breakdown. Defer to follow-up; keep PR focused on backtester correctness.
 
-  **Phase B — live fill reconciliation** (design pivoted 2026-05-07 from live subscription to polling reconciliation):
+  **Phase B — live fill reconciliation** *(SHIPPED 2026-05-29 — see CHANGELOG.md 2026-05-29 section for the as-built summary + live-verification caveats; the design text below is retained as the spec it was built against)* (design pivoted 2026-05-07 from live subscription to polling reconciliation):
 
   **Design rationale**: bracket orders are GTC, so fills happen *between* daily runs (e.g. TP filling at 14:42 Tuesday while signal_runner only runs at 09:35). A live `execDetails` subscription would miss every such fill unless IB Gateway stayed up continuously and signal_runner stayed connected — exactly the operating environment we *don't* have today (Gateway logs out overnight, signal_runner exits after each daily run). IBKR retains 7 days of execution history server-side via `reqExecutions`, so a polling reconciliation at the start of each daily run is **strictly more robust than a live subscription**: tolerates Gateway outages, tolerates skipped runs, idempotent on rerun, and drops the IBC-uptime prerequisite entirely. Only failure mode is signal_runner not running for >7 consecutive days, recoverable via IBKR Flex Query reports (manual one-off).
 

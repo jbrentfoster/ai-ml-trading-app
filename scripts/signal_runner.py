@@ -2,9 +2,13 @@
 Daily signal runner — five-phase automation script.
 
 Phases:
-  1. Startup      — load config, determine symbol list, snapshot equity from
-                    IBKR + auto-trigger circuit breaker if daily/weekly loss
-                    thresholds are breached vs. prior snapshots
+  1. Startup      — (Phase B, not dry-run) reconcile off-cycle IBKR fills into
+                    fill_log + trade_log via execution/reconciliation.py BEFORE
+                    anything else, so exits filled between runs are captured ahead
+                    of Phase-4 realised-Kelly sizing; then load config, determine
+                    symbol list, snapshot equity from IBKR + auto-trigger circuit
+                    breaker if daily/weekly loss thresholds are breached vs. prior
+                    snapshots
   2. Data refresh — fetch OHLCV + indicators for each symbol
   3. Signal gen   — drop symbols whose newest bar is older than
                     config.risk.max_bar_staleness_days, then run ensemble
@@ -272,6 +276,53 @@ def _fetch_held_long_symbols() -> set[str]:
             pass
 
 
+def _phase1_reconcile_fills(dry_run: bool) -> None:
+    """Phase B: reconcile IBKR fills into fill_log + trade_log.
+
+    Runs at the very start of Phase 1 — *before* the circuit-breaker /
+    equity-baseline logic and well before Phase 4 sizing — so any off-cycle
+    fills since the last run populate trade_log before realised-Kelly reads it.
+    Skipped in dry-run.  Gateway-down → log + continue (no state mutation),
+    the same graceful-degradation contract as every other IBKR phase.  Opens
+    and closes its own short-lived connection (< 1 s), like Phase 3.5.
+    """
+    if dry_run:
+        return
+
+    ibkr, loop = _connect_ibkr_if_needed(dry_run)
+    if ibkr is None or loop is None:
+        print("  ⚠  IBKR unreachable — skipping fill reconciliation.")
+        return
+
+    try:
+        from execution.reconciliation import reconcile_fills
+        result = reconcile_fills(
+            lambda since: loop.run_until_complete(ibkr.get_executions(since)),
+        )
+        print(
+            f"  Reconciliation: {result.n_new_fills} new fill(s), "
+            f"{result.n_cost_updated} cost-updated, "
+            f"{result.n_trades_written} live trade(s) written, "
+            f"{result.n_orphans} orphan(s)."
+        )
+    except Exception as exc:
+        log.warning("Fill reconciliation failed: %s", exc)
+        print(f"  ⚠  Fill reconciliation failed — {exc}")
+    finally:
+        try:
+            loop.run_until_complete(ibkr.disconnect())
+        except Exception as exc:
+            log.warning("IBKR disconnect error after reconciliation: %s", exc)
+        try:
+            loop.close()
+        except Exception:
+            pass
+        try:
+            asyncio.set_event_loop(None)
+        except Exception:
+            pass
+
+
 def _phase1_startup(dry_run: bool, symbol_filter: str) -> tuple[list[str], bool, str]:
     """
     Return (symbols, is_halted, halt_reason).
@@ -282,6 +333,9 @@ def _phase1_startup(dry_run: bool, symbol_filter: str) -> tuple[list[str], bool,
     realized + unrealized losses breach configured thresholds.
     """
     print("=== Phase 1: Startup ===")
+
+    # Phase B — reconcile any off-cycle fills before CB / baseline / sizing.
+    _phase1_reconcile_fills(dry_run)
 
     cb = CircuitBreaker()
     halted, reason = cb.is_halted()

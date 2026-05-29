@@ -292,6 +292,7 @@ All tests mock external dependencies (yfinance, ib_insync, Alpaca API) so no net
 |------|---------|
 | `test_data_pipeline.py` | DataFetcher, IndicatorEngine |
 | `test_ibkr_connection.py` | IBKRConnection |
+| `test_reconciliation.py` | Phase B fill reconciliation: pair-and-write, partial-fill VWAP, idempotent re-run, orphan skip, net-P&L canary, commission-race defer/cost-update, session-independent exit_reason waterfall, price-match tolerance regimes |
 | `test_walk_forward.py` | WalkForwardSplit, compute_metrics, orchestrator, bracket simulator, realised-Kelly handoff, universe_policy tagging |
 | `test_models.py` | LSTM, XGBoost, FinBERT, RegimeDetector, SignalGate (incl. regime weight halving + Wilder ADX) |
 | `test_universe.py` | UniverseSelector, stage 1/2/3, fixtures, DB roundtrip |

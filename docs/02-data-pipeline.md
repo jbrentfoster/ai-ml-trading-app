@@ -56,7 +56,7 @@ The symptom is silent and asymmetric: held positions get their bars refreshed in
 To close the gap, `scripts/refresh_recent_bars.py` runs once per weekday at 04:30 PM ET (via `run_eod.bat` in Windows Task Scheduler) and re-fetches the last 5 days of bars for the union of:
 
 1. **Active universe** — `universe_assets WHERE active=1` (or `config.data.watchlist` when universe is disabled)
-2. **Recently-acted symbols** — `order_decisions` rows with decision in (`APPROVED`, `DRY_RUN`, `CLOSED_LONG`) and `decided_at` within the last 14 days (proxy for "recently-held" until Phase 4.5 Phase B populates `trade_log.live` rows)
+2. **Recently-acted symbols** — `order_decisions` rows with decision in (`APPROVED`, `DRY_RUN`, `CLOSED_LONG`) and `decided_at` within the last 14 days (proxy for "recently-held"; Phase 4.5 Phase B shipped 2026-05-29 and now writes `trade_log` `source='live'` rows, but this lookup still uses the `order_decisions` proxy — switching it to `trade_log.live` is a pending follow-up, gated on those rows accumulating)
 3. **Currently-held IBKR positions** — optional; degrades cleanly when IB Gateway is unreachable (`--no-ibkr` flag, or auto-degrades on connect failure)
 
 For each symbol, the script calls `DataFetcher.refresh_recent()` (which writes via `upsert_bars(... overwrite=True)`) then recomputes the derived indicators from the refreshed bars and writes them via `upsert_indicators(... overwrite=True)`. The whole pass runs in ~5–10 seconds for the current universe.

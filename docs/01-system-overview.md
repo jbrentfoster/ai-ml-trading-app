@@ -48,7 +48,7 @@ External data sources
 The `signal_runner.py` script works in seven sequential phases (Phase 3.5 and Phase 3.6 are both opt-in):
 
 ### Phase 1 — Startup
-Determine which symbols to process, check the circuit breaker state, capture an equity-baseline snapshot from IBKR (when not in dry-run), and auto-trip the circuit breaker if the realised + unrealised P&L vs that baseline has exceeded the daily / weekly loss limits. Includes orphan-position detection so any held long not in the active universe still gets pulled into the symbol list.
+First (when not in dry-run) reconcile any off-cycle IBKR fills into `fill_log` + `trade_log` (Phase B — `execution/reconciliation.py`), so exits that filled between runs are captured before sizing reads `trade_log`. Then determine which symbols to process, check the circuit breaker state, capture an equity-baseline snapshot from IBKR, and auto-trip the circuit breaker if the realised + unrealised P&L vs that baseline has exceeded the daily / weekly loss limits. Includes orphan-position detection so any held long not in the active universe still gets pulled into the symbol list.
 
 ### Phase 2 — Data refresh
 Fetch the latest OHLCV bars and news for the symbols selected in Phase 1. This is an incremental update — only new bars since the last run are fetched. yfinance is the primary source for price data; IBKR/Alpaca/yfinance are tried in order for news. Symbols whose newest cached daily bar is older than `risk.max_bar_staleness_days` (default 3) are dropped before Phase 3 generates signals.
@@ -177,7 +177,8 @@ The most important tables:
 | `fundamental_data` | FundamentalsClient | XGBoost |
 | `signal_log` | Orchestrator | Dashboard page 3 |
 | `order_decisions` | OrderManager | Dashboard page 8 |
-| `trade_log` | Walk-forward simulator (and, with Phase B, IBKR fills) | Dashboard page 10, realised-Kelly |
+| `trade_log` | Walk-forward simulator (`source='walk_forward'`) + IBKR fill reconciliation (`source='live'`, Phase B — `execution/reconciliation.py`) | Dashboard page 10, realised-Kelly |
+| `fill_log` / `reconciliation_state` | IBKR fill reconciliation (Phase B) | `trade_log` aggregation (audit trail + watermark) |
 | `trailing_stop_log` | TrailingStopManager | Dashboard page 8 |
 | `signal_runner_log` | signal_runner.py | Dashboard page 8 |
 
