@@ -262,6 +262,26 @@ if trades_df.empty:
         "No trades match the current filters.  Widen the date range or clear "
         "the symbol / exit-reason filters in the sidebar."
     )
+    # Diagnostic: echo the active filters + the unfiltered row count so an
+    # empty result is debuggable.  The raw (dedup-off) set is always a
+    # superset of the deduped set, so toggling dedup OFF can never empty a
+    # non-empty deduped view on its own — if this fires after unchecking
+    # dedup, look at Source / Run ID / date range below, not the dedup box.
+    _unfiltered = query_trade_log(
+        source=source_filter, dedup_to_latest_run=False, active_universe_only=False,
+    )
+    st.caption(
+        f"Active filters → source=`{source_filter or 'Both'}`, "
+        f"symbols=`{list(selected_symbols) or 'all'}`, "
+        f"exit_reasons=`{list(selected_reasons) or 'all'}`, "
+        f"dates=`{start_date} … {end_date}`, "
+        f"run_id=`{run_id_filter or 'all'}`, "
+        f"dedup=`{dedup_to_latest}`, active_universe=`{active_universe_only}`.  "
+        f"With **all filters cleared except Source**, `trade_log` holds "
+        f"**{len(_unfiltered):,}** `{source_filter or 'any-source'}` row(s).  "
+        "If that count is 0, the **Source** radio is the cause "
+        "(`live` has no rows until Phase B writes a paired round trip)."
+    )
     st.stop()
 
 # ── 1. Summary cards ──────────────────────────────────────────────────────────
