@@ -6,6 +6,76 @@ The retirement convention lives in CLAUDE.md → *Convention: documenting fixed 
 
 ---
 
+## 2026-05-31
+
+*Verification sweep — eight "code complete — awaiting live verification" entries whose verification triggers had fired (the daily/weekly cadence ran them many times since the code landed) and whose evidence was confirmed in the DB / logs from today's 2026-05-31 weekly retrain, or by an active test this session.*
+
+### FinBERT weight floor defeats coverage scaling
+
+*(code complete 2026-05-01 → verified 2026-05-31)* (`models/ensemble.py` rebalance): after multiplying FinBERT weight by `finbert_coverage`, the 10 % `ensemble_weight_floor` is reapplied unconditionally. A symbol with 0 % coverage still ends up with ≥ 10 % FinBERT weight. Fix: skip the floor when `finbert_coverage == 0`, or apply the floor only to LSTM/XGBoost.
+
+**Status:** `_normalise_weights` now floors only LSTM and XGBoost; FinBERT weight passes through untouched so the coverage scaling in `rebalance` step 2 governs it across the entire range (not just at coverage=0). No new tests — the existing `test_models.py` ensemble suite covers the rebalance/normalise flow and continues to pass (146/146).
+
+**Verified (2026-05-31 weekly retrain):** `ensemble_weight_history` rows written this run show **min `finbert_weight` = 0.0 and 232/340 rows below the old 0.10 floor**. Pre-fix the unconditional floor forced every row to `finbert ≥ 0.10`; now 0-coverage symbols pass through at ≈0 and low-coverage symbols scale proportionally — exactly the post-fix signature the entry called for.
+
+### FinBERT `published_at` type assumption
+
+*(code complete 2026-05-12 → verified 2026-05-31)* (`models/finbert_model.py:123`): `[a for a in articles if a["published_at"] <= now]` assumes every source returns a `datetime`. ORM reads do, but `NewsClient` has three fallback providers (IBKR / Alpaca / yfinance) — confirm each hands off a `datetime` before reaching this filter, or coerce with `pd.to_datetime(a["published_at"])` to be safe. Silent wrong comparison under Py3 is the concern; TypeError is possible if any provider returns a string.
+
+**Status:** new `FinBERTModel._coerce_published_at(value)` staticmethod runs every article through `pd.to_datetime(..., errors='coerce')`, strips tz to match the tz-naive pipeline convention (DB + `now`), and returns `None` on NaT / unparseable input — unparseable rows are dropped rather than poisoning the weighted average. Applied at two sites in `_aggregate_sentiment`: (a) after `get_recent_news` returns DB rows, (b) after the live `_news_client.fetch_news` path (which bypasses the DB and so wasn't covered by the first pass). Test coverage: 2 new in `tests/test_models.py::TestFinBERTModel` — `test_coerce_published_at_handles_all_provider_types` and `test_aggregate_sentiment_filters_string_published_at_without_typeerror` (the regression guard pinning the original "TypeError: '<=' not supported between str and datetime" failure). Full suite: 206/206 passing + 1 skipped.
+
+**Verified (2026-05-31):** **zero** `TypeError: '<=' not supported between ... str ... datetime` occurrences across `logs/weekly/*.log` and `logs/python/trading_app.log` over weeks of live fetches that hit the Alpaca fallback tier (~56 % of universe symbols per the 2026-05-03 weekly run). Silent success against real ISO-string input is exactly the verification target — before the fix those symbols' FinBERT contributions would have crashed or silently mis-ordered.
+
+### Non-Wilder ADX
+
+*(code complete 2026-05-12 → verified 2026-05-31)* (`models/regime_detector.py:_compute_adx`): ADX used `ewm(span=period, adjust=False)` which gives α=2/(N+1)≈0.133 for N=14 — roughly twice Wilder's α=1/N≈0.071. Effect: ADX reacted too fast, climbed above 25 more readily than a textbook ADX, biasing the regime detector toward TRENDING classifications.
+
+**Status:** all four `ewm` calls (TR→ATR, DM+→DI+, DM-→DI-, DX→ADX) switched from `span=period` to `alpha=1/period`. Test coverage: 2 new in `tests/test_models.py::TestRegimeDetector` — `test_adx_uses_wilder_smoothing` (pins the smoothing factor) and `test_adx_strong_trend_exceeds_threshold` (confirms a clean uptrend still produces ADX > 25 after the slowdown). Full suite: 199/199 passing. The original entry flagged a watch-item: Wilder is slower-changing, so post-fix more bars classify as MEAN_REVERTING, which could partially undo the 2026-05-11 SELL-bias mitigation (Option A+C) in mixed regimes.
+
+**Verified (2026-05-31):** `signal_log.regime` over the trailing 14 days (2026-05-17→) splits **332 MEAN_REVERTING / 333 TRENDING** — a balanced distribution consistent with Wilder's slower smoothing rather than the pre-fix TRENDING bias. No runaway shift toward MEAN_REVERTING, so the watch-item interaction with the SELL-bias mitigation did not materialise.
+
+### YAML unknown-key warning
+
+*(code complete 2026-05-12 → verified 2026-05-31)* (`config/settings.py:_apply_yaml_section`): the loader silently ignored YAML keys that don't match a dataclass field, so typos like `min_trades_for_realised_kellly` (three L's, surfaced 2026-05-07 during Phase C verification) disabled a config override without warning. Bonus: same warning at the top level for unknown sections (a `config:` typo would otherwise silently drop the whole section).
+
+**Status:** implemented via `warnings.warn(...)` (UserWarning — Python's `warnings` machinery surfaces on stderr at import time before logging is configured). `_apply_yaml_section` accepts a `section_name` kwarg and warns per unknown key; `load_yaml_config` warns per unknown top-level section. Test coverage: 5 new in `tests/test_settings.py`. Full suite: 197/197 passing.
+
+**Verified (2026-05-31, active test):** calling `_apply_yaml_section(RiskConfig(), {'kelly_fractoin': 0.5, 'kelly_fraction': 0.3}, section_name='risk')` emitted `Unknown YAML key 'risk.kelly_fractoin' in config/settings.yaml — ignored` while still applying the valid `kelly_fraction = 0.3`. The unknown-section branch likewise warned on a bogus `mlmodels:` section. Both paths fire as designed.
+
+### trade_log.pnl semantics — cross-reference checklist
+
+*(code complete 2026-05-12 → verified 2026-05-31)* (carry-over from 2026-05-07 Page 10 P&L fix): three semantic flips happened in 8 days around `trade_log.pnl` (Phase A wrote net, Phase C consumed via pnl_pct, Page 10 misread net as gross). A "if you touch trade_log.pnl semantics, also update" checklist prevents the next divergence — touch points: `_close_trade` (writer), `query_trade_log`/`query_trade_summary`, `compute_realised_kelly`, Phase B reconciliation Pass 2, Page 10 column labels, and `test_net_pnl_equals_stored_pnl` (canary).
+
+**Status:** implemented as a comment block immediately above `_close_trade` — first thing anyone editing the function sees. Lists the convention (`pnl is net`, `gross_pnl = pnl + costs_charged`), the `net_pnl = pnl - costs_charged` double-count anti-pattern, and all touch points. No code change beyond the comment; the entry itself noted "nothing to verify live."
+
+**Verified (2026-05-31):** doc-only change confirmed present — `models/walk_forward.py:425` ("...double-counts fees. The correct derivations are:") and `:433` (the Phase-B `pnl is net` reminder) sit immediately above `_close_trade`. Nothing to observe in a live run; closing the loop on the documentation deliverable.
+
+### Survivorship-bias column on `walk_forward_results`
+
+*(code complete 2026-05-12 → verified 2026-05-31)*: add `universe_policy` ∈ {`dynamic`, `static`} per row so dashboard Page 4 can flag biased runs. Previously the survivorship warning was only logged.
+
+**Status:** ORM column + idempotent `_migrate()` `ALTER TABLE` added (existing rows backfilled to NULL). `MLWalkForwardOrchestrator.run` writes `"dynamic"` when `self._universe_selector is not None`, `"static"` otherwise. `query_walk_forward_results` surfaces it as `"Universe Policy"`. Page 4 renders a `st.warning(...)` banner when any row is `dynamic` + a colour-coded `Universe Policy` column. Test coverage: 3 new in `tests/test_walk_forward.py::TestUniversePolicyTagging`. Full suite: 206/206 passing + 1 skipped.
+
+**Verified (2026-05-31 weekly retrain):** **340 `walk_forward_results` rows written today carry `universe_policy='static'`** (matching `config.universe.enabled=False` for this run); the 3777 pre-migration rows remain NULL as expected. The column populates correctly on every run — the first non-NULL write the entry was waiting for.
+
+### Raw Kelly f* values below -1 logged without clamping note
+
+*(code complete 2026-05-12 → verified 2026-05-31)* (`models/walk_forward.py` Phase C diagnostic): the per-fold `realised-Kelly history` log line printed the raw computed f*, which can be < -1 on loss-heavy history (e.g. `f*=-2.177`). `PositionSizer._kelly_fraction` correctly floors negative f* to 0 (no sizing bug), but the raw log value was misleading — a reader could think the system was about to short > 2× capital. Fix: append `(→ 0, would short)` to the log line when `f* < 0`.
+
+**Status:** implemented as `_format_kelly_fstar` static helper on `MLWalkForwardOrchestrator` — `None` → `"n/a"`, negative → `"-X.XXX (→ 0, would short)"`, positive → `"X.XXX"`. Called from the fold-start diagnostic log site.
+
+**Verified (2026-05-31 weekly log):** the annotation fires throughout the run — e.g. `Fold 5: realised-Kelly history n=2 win_rate=0.50 f*=-1.185 (→ 0, would short)` and `Fold 3: realised-Kelly history n=6 win_rate=0.33 f*=-0.292 (→ 0, would short)`. Multiple instances confirm loss-heavy folds now make the floor explicit in the audit trail.
+
+### Page 10 symbol filter dropdown still lists symbols absent from the deduped view
+
+*(code complete 2026-05-12 → verified 2026-05-31)* (UX nit): `query_trade_log_filter_options` populated the sidebar Symbol multiselect from the *raw* `trade_log`, so symbols whose latest WF run produced zero closed trades (BA, CHTR, CRCL, IWM, NFLX) were still selectable but yielded an empty table while dedup was on.
+
+**Status:** `query_trade_log_filter_options` now accepts a `dedup_to_latest_run: bool = True` parameter and routes through the same `_keep_latest_run_per_symbol` helper used by `query_trade_log` before extracting unique symbols / exit_reasons / sources. The Page 10 dedup checkbox is wired to a `trade_history_dedup` session_state key so the filter-options query picks up the checkbox value. No new unit tests — a one-line dedup gate over a helper already covered by `query_trade_log`'s dedup tests.
+
+**Verified (2026-05-31, by inspection):** the dedup flag threads through `query_trade_log_filter_options` → `_keep_latest_run_per_symbol`, the same path the trades table uses; with dedup ON the zero-trade symbols drop from both the table and the dropdown, and toggling dedup OFF restores the full list. UX behaviour confirmed by code-path review (the entry explicitly called for inspection rather than a unit test).
+
+---
+
 ## 2026-05-29
 
 ### Phase 4.5 Phase B — live-fill reconciliation (reqExecutions → fill_log → trade_log)
