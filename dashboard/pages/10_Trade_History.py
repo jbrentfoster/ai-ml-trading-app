@@ -519,8 +519,19 @@ else:
                 "range or clear sidebar filters to see more trades."
             )
 
-        # ── Cumulative excess return chart ────────────────────────────────
-        cum_excess_df = strategy_df.sort_values("exit_ts")[["exit_ts", "excess_pct"]].copy()
+        # ── Cumulative strategy vs benchmark chart ────────────────────────
+        # Plot the two component lines (strategy / benchmark) whose vertical
+        # gap IS the cumulative excess.  Same units for all three series —
+        # cumulative SUM of per-trade % — so excess == strategy − benchmark
+        # holds pointwise and the shaded gap reads as the alpha band.
+        _benchmark_sym = _app_config.data.benchmark_symbol
+        cum_excess_df = strategy_df.sort_values("exit_ts")[
+            ["exit_ts", "pnl_pct", "benchmark_return_pct", "excess_pct"]
+        ].copy()
+        cum_excess_df["cum_strategy_pct"] = cum_excess_df["pnl_pct"].cumsum() * 100.0
+        cum_excess_df["cum_benchmark_pct"] = (
+            cum_excess_df["benchmark_return_pct"].cumsum() * 100.0
+        )
         cum_excess_df["cum_excess_pct"] = cum_excess_df["excess_pct"].cumsum() * 100.0
 
         final_cum = float(cum_excess_df["cum_excess_pct"].iloc[-1])
@@ -530,36 +541,49 @@ else:
         )
 
         excess_fig = go.Figure()
+        # Benchmark first (no fill) so the strategy trace can fill 'tonexty'
+        # down/up to it — the shaded band between the two lines is the excess.
         excess_fig.add_trace(go.Scatter(
             x=cum_excess_df["exit_ts"],
-            y=cum_excess_df["cum_excess_pct"],
+            y=cum_excess_df["cum_benchmark_pct"],
             mode="lines",
-            name="Cumulative excess",
+            name=f"{_benchmark_sym} (benchmark)",
+            line=dict(color="#90a4ae", width=2, dash="dot"),
+        ))
+        excess_fig.add_trace(go.Scatter(
+            x=cum_excess_df["exit_ts"],
+            y=cum_excess_df["cum_strategy_pct"],
+            mode="lines",
+            name="Strategy",
             line=dict(color=line_color, width=2),
-            fill="tozeroy",
+            fill="tonexty",
             fillcolor=fill_color,
         ))
         excess_fig.add_hline(y=0, line_color="rgba(255,255,255,0.4)", line_width=1)
         excess_fig.update_layout(
             height=340, template="plotly_dark",
-            yaxis=dict(title="Cumulative excess return (%)"),
+            yaxis=dict(title="Cumulative return (%)"),
             xaxis=dict(title="Exit date"),
             margin=dict(l=0, r=0, t=20, b=0),
-            showlegend=False,
+            showlegend=True,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                        xanchor="right", x=1),
         )
         st.plotly_chart(excess_fig, use_container_width=True)
         st.caption(
             "**Trajectory only — not a portfolio compound return.**  "
-            f"Each point is the cumulative *sum* of (trade return − "
-            f"{_app_config.data.benchmark_symbol} return over the same holding period) "
-            "for **strategy-decided exits** — stop, tp, signal_flip, trailing.  "
-            "Magnitude scales linearly with trade count, so look at the *shape* "
-            "(rising / flat / falling), not the endpoint value — the per-trade "
-            "stats in the cards above are the honest alpha estimate.  "
-            "Fold-end forced closures excluded — they are backtest artifacts, not real "
-            "exit decisions the live system would ever make.  A persistently rising line "
-            "is evidence of alpha; a flat or falling line means the strategy is not "
-            f"adding value over simply holding {_app_config.data.benchmark_symbol}."
+            f"Two lines: cumulative *sum* of per-trade strategy returns vs the "
+            f"cumulative sum of {_benchmark_sym} returns over the same holding "
+            "periods, for **strategy-decided exits** (stop, tp, signal_flip, "
+            "trailing).  **The shaded gap between them is the cumulative excess** "
+            f"({final_cum:+.1f}%) — green when the strategy leads {_benchmark_sym}, "
+            "red when it trails.  Magnitude scales linearly with trade count, so "
+            "read the *gap's shape* (widening / flat / narrowing), not the endpoint "
+            "value — the per-trade stats in the cards above are the honest alpha "
+            "estimate.  Fold-end forced closures excluded — backtest artifacts, not "
+            "real exit decisions.  A persistently widening gap in the strategy's "
+            f"favour is evidence of alpha; lines that track together mean no edge "
+            f"over simply holding {_benchmark_sym}."
         )
 
         # ── Per-exit-reason excess breakdown ──────────────────────────────
