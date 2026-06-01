@@ -256,33 +256,47 @@ class TestBenchmarkAggregatesBaseline20260519:
             "win_rate_vs_bench": 100.0 * (strategy["excess_pct"] > 0).sum() / n,
         }
 
-    def test_benchmark_aggregates_deduped_baseline_2026_05_31(self):
+    def test_benchmark_aggregates_deduped_baseline_2026_06_01(self):
         """Default page view (dedup=ON, active_universe=ON), fold_end excluded.
 
-        Pin date: 2026-05-31.  Tolerances are wide enough to absorb
+        Pin date: 2026-06-01.  Tolerances are wide enough to absorb
         floating-point recomputation but tight enough to catch a real shift.
         FAILURE EXPECTED after the next weekly retrain — re-pin to new
-        numbers and bump the date in the test name."""
+        numbers and bump the date in the test name.
+
+        Re-pin note (2026-06-01): n grew 127 -> 150 (+23) vs the 2026-05-31
+        pin because the one-time IBKR Flex backfill (scripts/backfill_flex_trades.py)
+        wrote 23 source='live' round trips to trade_log *after* the 5/31 re-pin.
+        Live rows pass through dedup untouched, so they add +23 to both this
+        deduped slice and the raw slice below; their net excess is +24.61 pp,
+        which is why cum_excess moved +319.80 -> +344.41 here (identical +24.61
+        on the raw slice).  No weekly --force retrain ran 6/01 (daily skip-existing)."""
         m = self._strategy_metrics(dedup=True, active_universe=True)
-        assert m["n"]                 == 127,                      (
-            f"Row count drifted from 2026-05-31 baseline of 127 — got {m['n']}.  "
+        assert m["n"]                 == 150,                      (
+            f"Row count drifted from 2026-06-01 baseline of 150 — got {m['n']}.  "
             "Likely cause: a new weekly --force retrain has landed.  Eyeball "
             "the new numbers (Page 10 default view) and re-pin this test."
         )
-        assert m["cum_excess_pct"]    == pytest.approx(+319.80, abs=0.5)
-        assert m["win_rate_vs_bench"] == pytest.approx(  52.0,  abs=0.5)
+        assert m["cum_excess_pct"]    == pytest.approx(+344.41, abs=0.5)
+        assert m["win_rate_vs_bench"] == pytest.approx(  50.7,  abs=0.5)
 
-    def test_benchmark_aggregates_raw_baseline_2026_05_31(self):
+    def test_benchmark_aggregates_raw_baseline_2026_06_01(self):
         """Multi-run view (dedup=OFF, active_universe=OFF), fold_end excluded.
 
-        Pin date: 2026-05-31.  Same fold_end-excluded slice as the deduped
+        Pin date: 2026-06-01.  Same fold_end-excluded slice as the deduped
         baseline — the divergence vs the deduped numbers is the architectural
-        finding (see CLAUDE.md 'Dedup vs raw views are honest answers')."""
+        finding (see CLAUDE.md 'Dedup vs raw views are honest answers').
+
+        Re-pin note (2026-06-01): n grew 1059 -> 1082 (+23) for the same reason
+        as the deduped slice — the 23 Flex-backfilled source='live' rows landed
+        after the 5/31 re-pin.  cum_excess moved -853.50 -> -828.89 (+24.61,
+        identical delta to the deduped slice — the internal-consistency check
+        that confirms it's the same 23 live rows in both views)."""
         m = self._strategy_metrics(dedup=False, active_universe=False)
-        assert m["n"]                 == 1059,                     (
-            f"Row count drifted from 2026-05-31 baseline of 1059 — got {m['n']}.  "
+        assert m["n"]                 == 1082,                     (
+            f"Row count drifted from 2026-06-01 baseline of 1082 — got {m['n']}.  "
             "Likely cause: a new --force retrain inserted rows OR the backfill "
             "skipped rows for some symbols.  Investigate before re-pinning."
         )
-        assert m["cum_excess_pct"]    == pytest.approx(-853.50, abs=2.0)
-        assert m["win_rate_vs_bench"] == pytest.approx(   36.2,  abs=0.5)
+        assert m["cum_excess_pct"]    == pytest.approx(-828.89, abs=2.0)
+        assert m["win_rate_vs_bench"] == pytest.approx(   36.3,  abs=0.5)
