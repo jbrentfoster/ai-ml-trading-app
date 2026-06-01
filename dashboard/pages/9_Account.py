@@ -26,7 +26,7 @@ asyncio.set_event_loop(asyncio.new_event_loop())
 
 from config.settings import config, TradingMode
 from data.database import get_latest_risk_levels
-from data.ui_queries import query_company_name
+from data.ui_queries import query_company_name, query_trade_summary
 from risk.portfolio_guard import get_sector
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -333,25 +333,51 @@ if st.session_state.ibkr_data:
     b3.metric("Total Position Value",  f"${summary.gross_position_value:,.2f}")
 
     # Row 2 — P&L breakdown
+    # Lifetime realized P&L is summed from every closed live trade in trade_log
+    # (Phase B fills + the one-time Flex backfill).  active_universe_only=False
+    # and dedup_to_latest_run=False so no real broker trade is ever dropped —
+    # live rows pass both filters untouched, but the explicit flags document the
+    # intent (a closed trade can't vanish because the universe rotated).
+    live_summary = query_trade_summary(
+        source="live",
+        active_universe_only=False,
+        dedup_to_latest_run=False,
+    )
+    lifetime_net   = live_summary["net_pnl"]
+    lifetime_count = live_summary["n_trades"]
+
     p1, p2, p3 = st.columns(3)
     p1.metric("Unrealized P&L",        f"${summary.unrealized_pnl:+,.2f}")
     p2.metric("Realized P&L (today)",  f"${summary.realized_pnl:+,.2f}")
-    p3.metric(
-        "Realized P&L (lifetime)",
-        "— pending Phase B",
-        help=(
-            "Cumulative realized P&L across all closed live trades. "
-            "Disabled until Phase 4.5 Phase B (live-fill ingestion via "
-            "`reqExecutions` polling) populates `trade_log` with `source='live'` rows."
-        ),
-    )
+    if lifetime_count:
+        p3.metric(
+            "Realized P&L (lifetime)",
+            f"${lifetime_net:+,.2f}",
+            help=(
+                f"Cumulative realized P&L (net of costs) across {lifetime_count} "
+                "closed live trade(s) in `trade_log` (`source='live'`), populated "
+                "by Phase 4.5 Phase B reconciliation and the one-time Flex backfill. "
+                "See Page 10 for the per-trade breakdown."
+            ),
+        )
+    else:
+        p3.metric(
+            "Realized P&L (lifetime)",
+            "— no live trades yet",
+            help=(
+                "Cumulative realized P&L across all closed live trades. "
+                "No `source='live'` rows in `trade_log` yet — the first reconciled "
+                "round trip will populate this."
+            ),
+        )
 
     st.caption(
         f"Account ID: {summary.account_id}  |  Currency: {summary.currency}  |  "
         "**Unrealized P&L** is cumulative across all open positions (current price vs avg cost), not a today-only figure. "
         "**Realized P&L (today)** is the intraday figure from IBKR — it resets at session start. "
-        "**Realized P&L (lifetime)** is a placeholder pending Phase B — IBKR's real-time API doesn't expose a "
-        "cumulative figure, so this will be summed from `trade_log` once live fills are ingested."
+        "**Realized P&L (lifetime)** is summed net-of-costs from every closed live trade in `trade_log` "
+        "(Phase B reconciliation + Flex backfill); IBKR's real-time API doesn't expose a cumulative figure. "
+        "See Page 10 for the full trade history."
     )
 
     # ── Open positions ────────────────────────────────────────────────────────
