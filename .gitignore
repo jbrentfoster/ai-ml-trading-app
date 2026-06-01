@@ -52,6 +52,11 @@ config/settings.yaml
 # Project-local agent memory (user-specific notes accumulated across sessions)
 memory/
 
+# IBKR Flex Query exports (contain account numbers + full trade history;
+# consumed one-time by scripts/backfill_flex_trades.py, never committed)
+*.xml
+Trade_History.xml
+
 # misc
 notes.txt
 TODO
