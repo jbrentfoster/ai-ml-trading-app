@@ -41,6 +41,8 @@ def mem_engine(monkeypatch):
     from data.ui_queries import (
         query_benchmark_returns,
         query_distinct_trade_log_run_ids,
+        query_held_symbols,
+        query_symbol_options,
         query_tax_breakdown,
         query_trade_log,
         query_trade_log_filter_options,
@@ -54,7 +56,7 @@ def mem_engine(monkeypatch):
 
     for fn in (query_trade_log, query_trade_summary, query_tax_breakdown,
                query_trade_log_filter_options, query_distinct_trade_log_run_ids,
-               query_benchmark_returns):
+               query_benchmark_returns, query_held_symbols, query_symbol_options):
         try:
             fn.clear()
         except Exception:
@@ -508,3 +510,119 @@ class TestQueryBenchmarkReturns:
             dedup_to_latest_run=False, active_universe_only=False,
         )
         assert df.empty
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# query_held_symbols / query_symbol_options — sidebar picker symbol list
+#
+# The Model Signals (and every other page's) symbol picker sources its options
+# from query_symbol_options, which lists the active Stage 3 universe.  Held
+# positions that have been rotated out of the universe (e.g. VRT, dropped
+# 2026-05-24 but still net-long 120sh) were silently absent from the dropdown
+# even though signal_runner still evaluates them daily via
+# _fetch_held_long_symbols.  query_held_symbols derives "currently held" from
+# the live fill_log (net BUY-SELL > 0) — a DB-only proxy so the shared picker
+# never has to touch IBKR — and query_symbol_options unions it on top.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _seed_fill(engine, *, symbol: str, side: str, shares: float,
+               exec_id: str, exec_time: datetime | None = None,
+               price: float = 100.0) -> None:
+    """Insert one fill_log row (one IBKR Execution)."""
+    from data.database import FillLog
+
+    exec_time = exec_time or _now()
+    with Session(engine) as session:
+        session.add(FillLog(
+            exec_id=exec_id,
+            symbol=symbol,
+            side=side,
+            order_type="MKT",
+            shares=shares,
+            price=price,
+            exec_time=exec_time,
+            recorded_at=exec_time,
+        ))
+        session.commit()
+
+
+class TestHeldSymbolPicker:
+
+    def test_empty_fill_log_returns_no_held(self, mem_engine):
+        """Pre-Phase-B databases (no fills) must yield an empty held list,
+        never crash."""
+        from data.ui_queries import query_held_symbols
+
+        assert query_held_symbols() == []
+
+    def test_net_long_symbol_is_held(self, mem_engine):
+        """A symbol with SUM(BUY) - SUM(SELL) > 0 across its fills is held.
+
+        Mirrors VRT's real shape: three partial BUY fills, no SELL.
+        """
+        from data.ui_queries import query_held_symbols
+
+        _seed_fill(mem_engine, symbol="VRT", side="BUY", shares=40, exec_id="v1")
+        _seed_fill(mem_engine, symbol="VRT", side="BUY", shares=50, exec_id="v2")
+        _seed_fill(mem_engine, symbol="VRT", side="BUY", shares=30, exec_id="v3")
+
+        assert query_held_symbols() == ["VRT"]
+
+    def test_net_flat_symbol_not_held(self, mem_engine):
+        """A fully-closed position (BUY shares == SELL shares) is net-flat and
+        must NOT count as held — otherwise the picker keeps showing symbols the
+        user has already exited."""
+        from data.ui_queries import query_held_symbols
+
+        _seed_fill(mem_engine, symbol="FLAT", side="BUY",  shares=100, exec_id="f1")
+        _seed_fill(mem_engine, symbol="FLAT", side="SELL", shares=100, exec_id="f2")
+
+        assert query_held_symbols() == []
+
+    def test_partially_closed_symbol_still_held(self, mem_engine):
+        """A position reduced but not flattened (net shares still > 0) remains
+        held."""
+        from data.ui_queries import query_held_symbols
+
+        _seed_fill(mem_engine, symbol="PART", side="BUY",  shares=100, exec_id="p1")
+        _seed_fill(mem_engine, symbol="PART", side="SELL", shares=40,  exec_id="p2")
+
+        assert query_held_symbols() == ["PART"]
+
+    def test_held_symbol_unioned_into_picker_options(self, mem_engine):
+        """The headline fix: a held symbol absent from the active universe is
+        still offered by the sidebar picker (the VRT case)."""
+        from data.ui_queries import query_symbol_options
+
+        # Active universe = AAPL only; VRT held but rotated out.
+        _seed_universe(mem_engine, ["AAPL"], active=True)
+        _seed_fill(mem_engine, symbol="VRT", side="BUY", shares=120, exec_id="v1")
+
+        opts = query_symbol_options()
+        assert "AAPL" in opts            # universe symbol still present
+        assert "VRT" in opts             # held-but-departed symbol now present
+        # Sorted, no duplicates.
+        assert opts == sorted(set(opts))
+
+    def test_held_symbol_in_universe_not_duplicated(self, mem_engine):
+        """A symbol that is BOTH active-universe and held appears exactly
+        once — the union must dedupe."""
+        from data.ui_queries import query_symbol_options
+
+        _seed_universe(mem_engine, ["AAPL"], active=True)
+        _seed_fill(mem_engine, symbol="AAPL", side="BUY", shares=10, exec_id="a1")
+
+        opts = query_symbol_options()
+        assert opts.count("AAPL") == 1
+
+    def test_picker_unions_held_onto_watchlist_fallback(self, mem_engine, monkeypatch):
+        """When universe_assets is empty, options fall back to the watchlist —
+        and held symbols are still unioned on top of that fallback."""
+        from data.ui_queries import query_symbol_options
+        from config.settings import config
+
+        monkeypatch.setattr(config.data, "watchlist", ["MSFT"])
+        _seed_fill(mem_engine, symbol="VRT", side="BUY", shares=120, exec_id="v1")
+
+        opts = query_symbol_options()
+        assert set(opts) == {"MSFT", "VRT"}

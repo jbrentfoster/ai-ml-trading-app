@@ -336,17 +336,50 @@ def query_universe_run_log(limit: int = 100) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=300)
+def query_held_symbols() -> list[str]:
+    """
+    Symbols currently held net-long per the live `fill_log` — the same audit
+    trail Phase B reconciliation (and the one-time Flex backfill) populates.
+
+    A symbol is "held" when SUM(BUY shares) - SUM(SELL shares) > 0 across all
+    its recorded fills.  This is a DB-only proxy (no IBKR call), so it's safe
+    to fan out from shared sidebar pickers used on every page.  It surfaces
+    positions that have been rotated out of the active universe — exactly the
+    case `signal_runner._fetch_held_long_symbols` unions into the daily run so
+    orphan holds keep getting evaluated (e.g. VRT, dropped 2026-05-24 but still
+    held).  Returns [] when `fill_log` is empty (pre-Phase-B databases).
+    """
+    from sqlalchemy import text
+    engine = get_engine()
+    with engine.connect() as conn:
+        rows = conn.execute(text(
+            """
+            SELECT symbol
+            FROM fill_log
+            GROUP BY symbol
+            HAVING SUM(CASE WHEN side = 'BUY' THEN shares ELSE -shares END) > 0
+            """
+        )).fetchall()
+    return sorted({str(r[0]).upper() for r in rows if r[0]})
+
+
+@st.cache_data(ttl=300)
 def query_symbol_options() -> list[str]:
     """
-    Return sorted list of active Stage 3 universe symbols for sidebar pickers.
-    Falls back to `config.data.watchlist` when universe_assets is empty (e.g.
-    universe selector has never been run).
+    Return sorted symbols for sidebar pickers: the active Stage 3 universe
+    UNION any currently-held positions (so orphan holds rotated out of the
+    universe — e.g. VRT — remain selectable).  Falls back to
+    `config.data.watchlist` when universe_assets is empty (e.g. the universe
+    selector has never been run); held symbols are still unioned on top.
     """
     df = get_universe_assets(active_only=True)
     if df.empty or "symbol" not in df.columns:
         from config.settings import config
-        return sorted({s.upper() for s in config.data.watchlist if s})
-    return sorted(df["symbol"].dropna().astype(str).str.upper().unique().tolist())
+        base = {s.upper() for s in config.data.watchlist if s}
+    else:
+        base = set(df["symbol"].dropna().astype(str).str.upper().unique().tolist())
+    base |= set(query_held_symbols())
+    return sorted(base)
 
 
 _NAME_SUFFIXES_TO_STRIP = (
