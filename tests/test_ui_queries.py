@@ -40,6 +40,7 @@ def mem_engine(monkeypatch):
     from data.database import Base
     from data.ui_queries import (
         query_benchmark_returns,
+        query_capital_weighted_roi,
         query_distinct_trade_log_run_ids,
         query_held_symbols,
         query_symbol_options,
@@ -56,7 +57,8 @@ def mem_engine(monkeypatch):
 
     for fn in (query_trade_log, query_trade_summary, query_tax_breakdown,
                query_trade_log_filter_options, query_distinct_trade_log_run_ids,
-               query_benchmark_returns, query_held_symbols, query_symbol_options):
+               query_benchmark_returns, query_capital_weighted_roi,
+               query_held_symbols, query_symbol_options):
         try:
             fn.clear()
         except Exception:
@@ -626,3 +628,135 @@ class TestHeldSymbolPicker:
 
         opts = query_symbol_options()
         assert set(opts) == {"MSFT", "VRT"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# query_capital_weighted_roi — Page 10 "Capital-Weighted ROI vs benchmark"
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _seed_live_trade(
+    engine,
+    *,
+    symbol: str = "AAPL",
+    entry_px: float = 100.0,
+    shares: float = 10.0,
+    pnl_pct: float = 0.05,
+    benchmark_return_pct: float | None = 0.02,
+    source: str = "live",
+    run_id: str = "live-run",
+    exit_reason: str = "tp",
+) -> None:
+    """Insert one trade_log row with an explicit benchmark return.
+
+    ``net_pnl`` (== trade_log.pnl) is stored as ``pnl_pct × entry_px × shares``
+    — the WF/Phase-B net-dollar convention.  Used by the capital-weighted ROI
+    tests, which the shared ``_seed_trade`` helper can't cover (it has no
+    benchmark_return_pct parameter).
+    """
+    from data.database import TradeLog
+
+    entry_ts = _now()
+    exit_ts  = entry_ts + timedelta(days=3)
+    exit_px  = entry_px * (1.0 + pnl_pct)
+
+    with Session(engine) as session:
+        session.add(TradeLog(
+            source=source, run_id=run_id, fold_index=0,
+            symbol=symbol, signal="BUY",
+            entry_ts=entry_ts, entry_px=entry_px,
+            exit_ts=exit_ts, exit_px=exit_px,
+            exit_reason=exit_reason, shares=shares,
+            pnl=pnl_pct * entry_px * shares,
+            pnl_pct=pnl_pct,
+            costs_charged=0.0,
+            benchmark_return_pct=benchmark_return_pct,
+            recorded_at=entry_ts,
+        ))
+        session.commit()
+
+
+class TestCapitalWeightedROI:
+
+    def test_empty_when_no_live_rows(self, mem_engine):
+        """All-zero dict when trade_log has no live rows."""
+        from data.ui_queries import query_capital_weighted_roi
+
+        _seed_trade(mem_engine, symbol="AAPL", source="walk_forward")
+        roi = query_capital_weighted_roi(active_universe_only=False)
+        assert roi["n_trades"] == 0
+        assert roi["strategy_roi"] == 0.0
+        assert roi["benchmark_roi"] == 0.0
+
+    def test_excludes_walk_forward_even_when_present(self, mem_engine):
+        """WF rows are ignored even though they sit in the same table —
+        the section is forced to source='live'."""
+        from data.ui_queries import query_capital_weighted_roi
+
+        _seed_trade(mem_engine, symbol="AAPL", source="walk_forward")
+        _seed_live_trade(mem_engine, symbol="MSFT", entry_px=100.0, shares=10.0,
+                         pnl_pct=0.05, benchmark_return_pct=0.02)
+
+        roi = query_capital_weighted_roi(active_universe_only=False)
+        assert roi["n_trades"] == 1  # only the live MSFT row
+
+    def test_capital_weighting_math(self, mem_engine):
+        """Big position dominates the ROI; both sides share the same base.
+
+        Trade A: $100 × 100sh = $10,000 capital, +5% net  → +$500 strategy,
+                 benchmark +1% → +$100.
+        Trade B: $100 ×   1sh = $100 capital,    -10% net → -$10 strategy,
+                 benchmark +1% → +$1.
+
+        Σ capital      = 10,100
+        Σ strategy_pnl = 490
+        Σ benchmark    = 101
+        strategy_roi   = 490 / 10100  ≈ 0.0485
+        benchmark_roi  = 101 / 10100  ≈ 0.0100
+        dollar_diff    = 490 − 101 = 389
+        """
+        from data.ui_queries import query_capital_weighted_roi
+
+        _seed_live_trade(mem_engine, symbol="AAA", entry_px=100.0, shares=100.0,
+                         pnl_pct=0.05, benchmark_return_pct=0.01)
+        _seed_live_trade(mem_engine, symbol="BBB", entry_px=100.0, shares=1.0,
+                         pnl_pct=-0.10, benchmark_return_pct=0.01)
+
+        roi = query_capital_weighted_roi(active_universe_only=False)
+        assert roi["n_trades"] == 2
+        assert roi["capital_deployed"] == pytest.approx(10_100.0)
+        assert roi["strategy_pnl"] == pytest.approx(490.0)
+        assert roi["benchmark_pnl"] == pytest.approx(101.0)
+        assert roi["strategy_roi"] == pytest.approx(490.0 / 10_100.0)
+        assert roi["benchmark_roi"] == pytest.approx(101.0 / 10_100.0)
+        assert roi["dollar_diff"] == pytest.approx(389.0)
+        assert roi["roi_diff_pct"] == pytest.approx(
+            490.0 / 10_100.0 - 101.0 / 10_100.0
+        )
+
+    def test_null_benchmark_rows_excluded_from_both_sides(self, mem_engine):
+        """A live row missing benchmark_return_pct must not enter the capital
+        base — otherwise the benchmark side would understate ROI on a base it
+        didn't contribute to."""
+        from data.ui_queries import query_capital_weighted_roi
+
+        _seed_live_trade(mem_engine, symbol="AAA", entry_px=100.0, shares=10.0,
+                         pnl_pct=0.05, benchmark_return_pct=0.02)
+        _seed_live_trade(mem_engine, symbol="BBB", entry_px=999.0, shares=50.0,
+                         pnl_pct=0.05, benchmark_return_pct=None)
+
+        roi = query_capital_weighted_roi(active_universe_only=False)
+        assert roi["n_trades"] == 1                       # BBB excluded
+        assert roi["capital_deployed"] == pytest.approx(1_000.0)  # only AAA's 100×10
+
+    def test_strategy_side_is_net_not_double_counted(self, mem_engine):
+        """strategy_pnl must equal stored net pnl, NOT pnl − costs_charged
+        (the double-count footgun)."""
+        from data.ui_queries import query_capital_weighted_roi
+
+        # pnl_pct net = +0.05 on $1,000 capital → +$50 net.  costs already baked in.
+        _seed_live_trade(mem_engine, symbol="AAA", entry_px=100.0, shares=10.0,
+                         pnl_pct=0.05, benchmark_return_pct=0.0)
+        roi = query_capital_weighted_roi(active_universe_only=False)
+        assert roi["strategy_pnl"] == pytest.approx(50.0)
+        # benchmark 0% → strategy_roi is the full edge
+        assert roi["dollar_diff"] == pytest.approx(50.0)

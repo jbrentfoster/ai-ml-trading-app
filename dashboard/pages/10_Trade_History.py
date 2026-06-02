@@ -23,6 +23,7 @@ import streamlit as st
 
 from data.ui_queries import (
     query_benchmark_returns,
+    query_capital_weighted_roi,
     query_distinct_trade_log_run_ids,
     query_tax_breakdown,
     query_trade_log,
@@ -227,6 +228,7 @@ with st.sidebar:
         query_trade_log_filter_options.clear()
         query_distinct_trade_log_run_ids.clear()
         query_benchmark_returns.clear()
+        query_capital_weighted_roi.clear()
         st.rerun()
 
 
@@ -307,6 +309,93 @@ st.caption(
     "**Win rate** counts a trade as a win only if `net_pnl > 0` — fees count "
     "against you.  A trade that nets to exactly zero after fees is treated as a loss."
 )
+
+# ── 1a. Capital-Weighted ROI vs benchmark (live fills only) ───────────────────
+#
+# Answers "did the money I actually deployed beat just holding the benchmark?"
+# Forced to source='live' regardless of the sidebar Source radio — walk_forward
+# rows are Kelly-sized synthetic trades against an assumed equity base, so their
+# notional is not real capital and summing it produces a meaningless ROI base.
+#
+# Capital-weighted (Σ pnl / Σ shares×entry_px) deliberately differs from the
+# unweighted per-trade percentage view in section 1b below: a $50k position and
+# a $500 position count by their dollars here, equally there.  Strategy side is
+# NET of fees; benchmark side is RAW — the retail-alpha frame (a buy-and-hold
+# benchmark pays no commissions).  See ui_queries.query_capital_weighted_roi.
+
+_bench_sym = _app_config.data.benchmark_symbol
+
+st.markdown("---")
+st.subheader(f"Capital-Weighted ROI vs {_bench_sym} (live fills)")
+
+roi = query_capital_weighted_roi(
+    symbols=tuple(selected_symbols) if selected_symbols else None,
+    start_date=start_date,
+    end_date=end_date,
+    exit_reasons=tuple(selected_reasons) if selected_reasons else None,
+    run_id=run_id_filter,
+    dedup_to_latest_run=dedup_to_latest,
+    active_universe_only=active_universe_only,
+)
+
+if roi["n_trades"] == 0:
+    st.info(
+        f"No live trades with {_bench_sym} benchmark data in the current filter.  "
+        "This section is scoped to `source='live'` rows only (real broker fills) "
+        "regardless of the **Source** radio in the sidebar — walk-forward "
+        "simulated trades are excluded because their notional isn't real "
+        "capital.  Populated by Phase B fill reconciliation + the Flex backfill; "
+        "rows missing `benchmark_return_pct` are excluded (run "
+        "`python scripts/backfill_benchmark_returns.py` to fill them in)."
+    )
+elif roi["capital_deployed"] <= 0:
+    st.warning(
+        f"{roi['n_trades']:,} live trade(s) found, but total deployed capital is "
+        f"${roi['capital_deployed']:,.2f} — can't form an ROI denominator.  "
+        f"Dollar edge vs {_bench_sym}: ${roi['dollar_diff']:+,.2f}."
+    )
+else:
+    rc1, rc2, rc3 = st.columns(3)
+    rc1.metric(
+        "Strategy ROI (net)",
+        f"{roi['strategy_roi']:+.2%}",
+        delta=(
+            f"${roi['strategy_pnl']:+,.0f} on ${roi['capital_deployed']:,.0f} "
+            f"deployed · {roi['n_trades']:,} trades"
+        ),
+        delta_color="off",
+    )
+    rc2.metric(
+        f"{_bench_sym} ROI (same capital)",
+        f"{roi['benchmark_roi']:+.2%}",
+        delta=(
+            f"${roi['benchmark_pnl']:+,.0f} hypothetical buy & hold "
+            f"on the same dollars"
+        ),
+        delta_color="off",
+    )
+    rc3.metric(
+        f"Edge vs {_bench_sym}",
+        f"${roi['dollar_diff']:+,.2f}",
+        delta=f"{roi['roi_diff_pct']:+.2%} ROI",
+        delta_color="normal",  # green when strategy beat the benchmark, red when it lagged
+    )
+
+    lead = "beat" if roi["dollar_diff"] >= 0 else "lagged"
+    st.caption(
+        f"**Did my money beat {_bench_sym}?**  For every dollar actually "
+        f"deployed across {roi['n_trades']:,} live fill(s), the strategy "
+        f"returned **{roi['strategy_roi']:+.2%} net of fees**; the same capital "
+        f"held in {_bench_sym} over each trade's holding period would have "
+        f"returned **{roi['benchmark_roi']:+.2%}** (raw, no fees).  The strategy "
+        f"**{lead}** the benchmark by **${roi['dollar_diff']:+,.2f}** "
+        f"({roi['roi_diff_pct']:+.2%}).  Each trade's benchmark counterfactual "
+        f"uses *its own* deployed capital (`shares × entry_px`), so big "
+        f"positions move this number more than small ones — unlike the unweighted "
+        f"per-trade percentage view in the section below.  Strategy P&L is net of "
+        f"commissions; the {_bench_sym} side is raw because a buy-and-hold "
+        f"position pays no trading fees (the honest retail-alpha frame)."
+    )
 
 # ── 1b. Benchmark-Relative Performance ────────────────────────────────────────
 #

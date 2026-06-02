@@ -1153,6 +1153,112 @@ def query_benchmark_returns(
     return df.reset_index(drop=True)
 
 
+@st.cache_data(ttl=300)
+def query_capital_weighted_roi(
+    symbols: tuple[str, ...] | None = None,
+    start_date=None,
+    end_date=None,
+    exit_reasons: tuple[str, ...] | None = None,
+    run_id: str = "",
+    dedup_to_latest_run: bool = True,
+    active_universe_only: bool = True,
+) -> dict:
+    """Capital-weighted ROI of live fills vs a hypothetical benchmark position
+    that deployed the SAME dollars over each trade's holding period.
+
+    **Scoped to ``source='live'`` only** — this answers "did the money I
+    actually put at risk beat just holding the benchmark?", which is only
+    meaningful for real broker fills.  ``walk_forward`` rows are Kelly-sized
+    synthetic trades against an *assumed* equity base, not real capital, so
+    summing their notional would produce a meaningless ROI denominator.  The
+    source is forced here regardless of the page's Source radio.
+
+    Per trade::
+
+        capital_i       = shares × entry_px                  (dollars deployed)
+        strategy_pnl_i  = net_pnl (== trade_log.pnl)         (NET of commissions)
+        benchmark_pnl_i = capital_i × benchmark_return_pct   (RAW benchmark return)
+
+    Capital-weighted aggregates::
+
+        strategy_roi  = Σ strategy_pnl  / Σ capital
+        benchmark_roi = Σ benchmark_pnl / Σ capital
+        dollar_diff   = Σ strategy_pnl − Σ benchmark_pnl
+
+    The strategy side is NET of fees; the benchmark side is RAW — a buy-and-hold
+    benchmark position pays no trading commissions, so "my P&L net of friction
+    vs a frictionless benchmark" is exactly the retail-alpha frame.  This is the
+    same deliberate asymmetry the per-trade ``excess_pct`` metric uses — see the
+    CLAUDE.md note "Benchmark-relative tracking uses raw SPY return vs net trade
+    P&L".  Do NOT subtract ``costs_charged`` from the strategy side: ``pnl`` is
+    already net (double-count footgun, same as ``query_trade_log``).
+
+    Rows with NULL ``benchmark_return_pct`` are excluded (no benchmark bar on
+    entry or exit) so both sides share an identical capital base.
+
+    Returns a dict::
+
+        n_trades, capital_deployed, strategy_pnl, benchmark_pnl,
+        strategy_roi, benchmark_roi, roi_diff_pct, dollar_diff
+
+    All-zero dict when no eligible live rows exist.  ``strategy_roi`` /
+    ``benchmark_roi`` / ``roi_diff_pct`` are fractions (0.05 == 5%).
+    """
+    empty = {
+        "n_trades": 0, "capital_deployed": 0.0,
+        "strategy_pnl": 0.0, "benchmark_pnl": 0.0,
+        "strategy_roi": 0.0, "benchmark_roi": 0.0,
+        "roi_diff_pct": 0.0, "dollar_diff": 0.0,
+    }
+
+    df = query_trade_log(
+        source="live",
+        symbols=symbols,
+        start_date=start_date,
+        end_date=end_date,
+        exit_reasons=exit_reasons,
+        run_id=run_id,
+        dedup_to_latest_run=dedup_to_latest_run,
+        active_universe_only=active_universe_only,
+    )
+    if df.empty or "benchmark_return_pct" not in df.columns:
+        return empty
+    df = df[df["benchmark_return_pct"].notna()].copy()
+    if df.empty:
+        return empty
+
+    capital = df["shares"].fillna(0.0) * df["entry_px"].fillna(0.0)
+    total_capital = float(capital.sum())
+    strategy_pnl  = float(df["net_pnl"].sum())
+    benchmark_pnl = float((capital * df["benchmark_return_pct"]).sum())
+
+    if total_capital <= 0:
+        # Degenerate capital base (no positive notional) — can't form an ROI
+        # denominator.  Report the dollar figures so the section isn't blank,
+        # but leave the ratios at 0 rather than dividing by ~0.
+        return {
+            **empty,
+            "n_trades":         int(len(df)),
+            "capital_deployed": total_capital,
+            "strategy_pnl":     strategy_pnl,
+            "benchmark_pnl":    benchmark_pnl,
+            "dollar_diff":      strategy_pnl - benchmark_pnl,
+        }
+
+    strategy_roi  = strategy_pnl / total_capital
+    benchmark_roi = benchmark_pnl / total_capital
+    return {
+        "n_trades":         int(len(df)),
+        "capital_deployed": total_capital,
+        "strategy_pnl":     strategy_pnl,
+        "benchmark_pnl":    benchmark_pnl,
+        "strategy_roi":     strategy_roi,
+        "benchmark_roi":    benchmark_roi,
+        "roi_diff_pct":     strategy_roi - benchmark_roi,
+        "dollar_diff":      strategy_pnl - benchmark_pnl,
+    }
+
+
 @st.cache_data(ttl=60)
 def query_distinct_trade_log_run_ids(limit: int = 20) -> list[dict]:
     """
