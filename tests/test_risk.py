@@ -623,6 +623,39 @@ class TestCircuitBreaker:
         assert "last_event" in status
         assert "triggered_at" in status
 
+    # check_loss_limits sign semantics — daily/weekly args are SIGNED returns
+    # (negative=loss, positive=gain).  Regression guard for the 2026-06-02 bug
+    # where abs() tripped the loss breaker on a +3.46% gain and halted trading.
+
+    def test_gain_does_not_trigger(self, mem_engine):
+        """A large positive return (gain) must NOT trip the loss breaker."""
+        cb = self._cb()
+        triggered = cb.check_loss_limits(0.0346, 0.0184)   # +3.46% day, +1.84% week
+        assert triggered is False
+        assert cb.is_halted()[0] is False
+
+    def test_daily_loss_triggers(self, mem_engine):
+        """A daily loss past the 3% limit trips the breaker with a magnitude message."""
+        cb = self._cb()
+        triggered = cb.check_loss_limits(-0.035, 0.0)
+        assert triggered is True
+        halted, reason = cb.is_halted()
+        assert halted is True
+        assert "Daily loss 3.5% >= limit 3.0%" in reason
+
+    def test_weekly_loss_triggers(self, mem_engine):
+        cb = self._cb()
+        triggered = cb.check_loss_limits(0.0, -0.08)
+        assert triggered is True
+        assert cb.is_halted()[0] is True
+
+    def test_small_loss_within_limits_no_trigger(self, mem_engine):
+        """A loss smaller than the limit must not trip the breaker."""
+        cb = self._cb()
+        triggered = cb.check_loss_limits(-0.02, -0.02)
+        assert triggered is False
+        assert cb.is_halted()[0] is False
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # OrderManager

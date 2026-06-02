@@ -119,16 +119,24 @@ def _infer_exit_reason(symbol: str, exit_px: float, exit_ts: datetime,
     if has_converted_trailing_before(symbol, exit_ts):
         return "trailing", "trailing_log"
 
-    # 3. order_decisions_price_match — match exit_px to the recorded bracket.
+    # 3. order_decisions_price_match — match exit_px to the recorded bracket,
+    #    DIRECTIONALLY and gap-aware (long-only live case).  A long's TP (sell
+    #    LMT) fills at-or-ABOVE the TP level — on a gap-up open it fills well
+    #    above it (MRVL 2026-06-02: TP $244.89, gap-up fill $255.90).  A long's
+    #    stop (sell STP) fills at-or-BELOW the stop level — on a gap-down it
+    #    fills well below.  A symmetric tight band (the prior abs(exit-level)<=tol)
+    #    missed BOTH gap-through cases — exactly the off-session scenario Phase B
+    #    exists to capture — so match by side, not by proximity.  Prices that land
+    #    between stop and TP match neither and fall through to the default branch.
     bracket = get_latest_approved_bracket(symbol, exit_ts)
     if bracket:
         tol = max(0.05, exit_px * 0.001)
         stop = bracket.get("stop_price")
         tp   = bracket.get("take_profit_price")
-        if stop is not None and abs(exit_px - stop) <= tol:
-            return "stop", "order_decisions_price_match"
-        if tp is not None and abs(exit_px - tp) <= tol:
+        if tp is not None and exit_px >= tp - tol:
             return "tp", "order_decisions_price_match"
+        if stop is not None and exit_px <= stop + tol:
+            return "stop", "order_decisions_price_match"
 
     # 4. default — MKT with a nearby CLOSED_LONG is a signal flip, else manual.
     if closing_order_type == "MKT" and has_closed_long_near(symbol, exit_ts):

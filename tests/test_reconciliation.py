@@ -337,6 +337,70 @@ class TestPriceMatchToleranceRegimes:
         assert row["exit_reason"] == "stop"
 
 
+class TestGapThroughExitReason:
+    """Directional gap-aware price-match (2026-06-02 MRVL fix).
+
+    A long's TP (sell LMT) fills at-or-above the TP on a gap-up open; a long's
+    stop fills at-or-below the stop on a gap-down.  Before the fix, the symmetric
+    tight band classified these as manual_close — losing the exit reason on
+    exactly the off-session fills Phase B exists to capture.
+    """
+
+    def _seed_bracket(self, symbol, stop, tp, decided_at):
+        from data.database import log_order_decision
+        log_order_decision({
+            "run_id": "r1", "symbol": symbol, "signal": "BUY",
+            "decision": "APPROVED", "shares": 10, "entry_price": (stop + tp) / 2,
+            "stop_price": stop, "take_profit_price": tp, "position_value": 1000.0,
+            "reject_reason": None, "decided_at": decided_at,
+        })
+
+    def test_gap_up_fill_above_tp_classified_tp(self, mem_engine):
+        """MRVL case: exit $255.90 gapped through TP $244.89 → tp, not manual_close."""
+        from execution.reconciliation import reconcile_fills
+
+        t0 = _now() - timedelta(days=2)
+        self._seed_bracket("MRVL", stop=183.74, tp=244.89,
+                           decided_at=t0 - timedelta(hours=1))
+        execs = [
+            _exec("EB", "MRVL", "BUY",  10, 205.09, t=t0, order_type=None),
+            _exec("ES", "MRVL", "SELL", 10, 255.90, t=t0 + timedelta(hours=1),
+                  order_type=None),
+        ]
+        reconcile_fills(_fetcher(execs))
+        assert _trades("MRVL").iloc[0]["exit_reason"] == "tp"
+
+    def test_gap_down_fill_below_stop_classified_stop(self, mem_engine):
+        """A gap-down exit well below the recorded stop → stop, not manual_close."""
+        from execution.reconciliation import reconcile_fills
+
+        t0 = _now() - timedelta(days=2)
+        self._seed_bracket("GAP", stop=90.00, tp=130.00,
+                           decided_at=t0 - timedelta(hours=1))
+        execs = [
+            _exec("EB", "GAP", "BUY",  10, 100.0, t=t0, order_type=None),
+            _exec("ES", "GAP", "SELL", 10, 82.50, t=t0 + timedelta(hours=1),
+                  order_type=None),
+        ]
+        reconcile_fills(_fetcher(execs))
+        assert _trades("GAP").iloc[0]["exit_reason"] == "stop"
+
+    def test_mid_bracket_price_falls_through_to_default(self, mem_engine):
+        """A price between stop and TP matches neither side → default (manual_close)."""
+        from execution.reconciliation import reconcile_fills
+
+        t0 = _now() - timedelta(days=2)
+        self._seed_bracket("MID", stop=90.00, tp=130.00,
+                           decided_at=t0 - timedelta(hours=1))
+        execs = [
+            _exec("EB", "MID", "BUY",  10, 100.0, t=t0, order_type="MKT"),
+            _exec("ES", "MID", "SELL", 10, 110.0, t=t0 + timedelta(hours=1),
+                  order_type="MKT"),
+        ]
+        reconcile_fills(_fetcher(execs))
+        assert _trades("MID").iloc[0]["exit_reason"] == "manual_close"
+
+
 class TestToNaiveUtc:
 
     def test_tz_aware_utc_coerced(self):

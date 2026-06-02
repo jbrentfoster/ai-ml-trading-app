@@ -128,15 +128,19 @@ class CircuitBreaker:
         triggered = False
         reasons = []
 
-        if abs(daily_loss_pct) >= self._cfg.circuit_breaker_daily_loss_pct:
+        # daily_loss_pct / weekly_loss_pct are SIGNED returns ((nlv-base)/base):
+        # negative on a loss, positive on a gain.  Trigger only on the loss side —
+        # a prior abs() here fired the breaker on large *gains* too (e.g. a +3.46%
+        # day on 2026-06-02 tripped the 3% "loss" limit and halted trading).
+        if daily_loss_pct <= -self._cfg.circuit_breaker_daily_loss_pct:
             reasons.append(
-                f"Daily loss {daily_loss_pct:.1%} >= limit {self._cfg.circuit_breaker_daily_loss_pct:.1%}"
+                f"Daily loss {-daily_loss_pct:.1%} >= limit {self._cfg.circuit_breaker_daily_loss_pct:.1%}"
             )
             triggered = True
 
-        if abs(weekly_loss_pct) >= self._cfg.circuit_breaker_weekly_loss_pct:
+        if weekly_loss_pct <= -self._cfg.circuit_breaker_weekly_loss_pct:
             reasons.append(
-                f"Weekly loss {weekly_loss_pct:.1%} >= limit {self._cfg.circuit_breaker_weekly_loss_pct:.1%}"
+                f"Weekly loss {-weekly_loss_pct:.1%} >= limit {self._cfg.circuit_breaker_weekly_loss_pct:.1%}"
             )
             triggered = True
 
