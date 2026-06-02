@@ -388,6 +388,25 @@ class LoggingConfig:
 
 
 @dataclass
+class LLMConfig:
+    """
+    Local-LLM news analyst (shadow workflow — NOT consumed by signal_runner).
+
+    Runs full-article sentiment extraction via Ollama against stage-3 universe
+    news.  Scores are stored in ``llm_news_analysis`` and surfaced on the
+    dashboard only; nothing in the trading path reads them yet.
+    """
+    enabled:              bool  = False                 # opt-in (mirrors other shadow features)
+    model:                str   = "llama3.1:8b"         # Ollama model tag
+    ollama_url:           str   = "http://localhost:11434/api/generate"
+    num_predict:          int   = 300                   # max output tokens per article
+    request_timeout_s:    int   = 1200                  # per-article hard cap
+    min_body_chars:       int   = 800                   # skip stubs below this (matches spike 'full' floor)
+    lookback_days:        int   = 3                     # body-ingest / scoring window
+    novelty_discount_floor: float = 0.5                 # composite score: novelty multiplier floor in [floor, 1.0]
+
+
+@dataclass
 class AppConfig:
     """Top-level app config — compose all sub-configs here."""
     ibkr:     IBKRConfig     = field(default_factory=IBKRConfig)
@@ -398,6 +417,7 @@ class AppConfig:
     universe: UniverseConfig = field(default_factory=UniverseConfig)
     risk:     RiskConfig     = field(default_factory=RiskConfig)
     logging:  LoggingConfig  = field(default_factory=LoggingConfig)
+    llm:      LLMConfig      = field(default_factory=LLMConfig)
 
 
 # ── Singleton instance ────────────────────────────────────────────────────────
@@ -417,6 +437,7 @@ _SECTION_MAP = {
     "universe": lambda: config.universe,
     "risk":     lambda: config.risk,
     "logging":  lambda: config.logging,
+    "llm":      lambda: config.llm,
 }
 
 # Fields that should never be written to YAML (live in env vars only)

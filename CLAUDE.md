@@ -140,6 +140,13 @@ trading_app/
 │                              TradingApp\IntradayLateAfternoon) point at the same batch file.
 │                              Ratchet-only by default; opt-in mid-day TP→TRAIL conversions via
 │                              RiskConfig.intraday_trail_conversion_enabled.
+├── run_llm_news.bat         — LLM news analyst (shadow workflow): Step 1 ingest_news_bodies.py
+│                              (needs Gateway) → Step 2 score_news_llm.py (needs Ollama, slow).
+│                              Both no-op unless config.llm.enabled=True.  Logs to
+│                              logs/llm/llm_news_YYYYMMDD.log.  NOT yet wired into Task Scheduler
+│                              (see "LLM news analyst" Enhancements entry).  Kept off the pre-market
+│                              critical path on purpose — Step 2 can take ~2h and must never delay
+│                              signal_runner.
 │
 ├── scripts/                 — all user-invokable CLI entry points (importable as the `scripts` package).
 │   │                          Run any of them from the project root with `python scripts/<name>.py`.
@@ -214,6 +221,20 @@ trading_app/
 │   ├── open_positions.py    — Ops CLI: list held IBKR positions (default, read-only); add
 │   │                          --close plus --symbol / --all (+ optional --qty N for a single
 │   │                          symbol) to flatten with market sells
+│   ├── ingest_news_bodies.py — LLM analyst Phase 1: back-fill news_cache.body with full article
+│   │                          text (IBKR reqNewsArticle) for stage-3 universe articles whose body
+│   │                          is NULL.  Needs Gateway; fast (~sec/article).  Idempotent.
+│   │                          No-op unless config.llm.enabled (or --force).  --symbols/--days/--limit
+│   ├── score_news_llm.py    — LLM analyst Phase 2: score un-scored bodies via Ollama →
+│   │                          llm_news_analysis.  No Gateway (reads bodies from SQLite); slow
+│   │                          (~80s/article, 8B).  Idempotent on (symbol, article_id, model).
+│   │                          No-op unless config.llm.enabled (or --force).  --model/--symbols/--limit
+│   ├── spike_body_availability.py — THROWAWAY research: measures what fraction of universe news
+│   │                          yields a usable FULL body per provider (2026-06-02 verdict: DJ-N
+│   │                          ~94% full, premise holds).  --from-universe / --alpaca
+│   ├── bench_llm_extraction.py — THROWAWAY research: measures Ollama extraction throughput on this
+│   │                          machine (--fetch caches real bodies, --run MODEL benchmarks).  8B
+│   │                          measured ~80s/article, 3B ~37s on the dev i5-1334U
 │   ├── verify_pipeline.py   — End-to-end smoke test for Step 2 (data + indicators)
 │   ├── verify_signals.py    — End-to-end smoke test for Step 3 (ML signal generation)
 │   ├── verify_universe.py   — End-to-end smoke test for universe selection (needs Alpaca keys)
@@ -252,9 +273,15 @@ trading_app/
 │   │                          XGBoost/market-cap S3); UniverseRunResult; fixtures always included
 │   ├── walk_forward.py      — WalkForwardSplit, WalkForwardValidator, compute_metrics
 │   │                          (model-agnostic framework; used by models/walk_forward.py)
+│   ├── news_dedup.py        — LLM analyst: read-time event clustering.  Groups scored articles by
+│   │                          (resolved ticker, day) into events; event score = MEAN of all member
+│   │                          reads (re-reports merged); picks a representative for display.  Pure
+│   │                          functions (cluster_news_events / jaccard / _tokens), no DB
 │   └── ui_queries.py        — @st.cache_data query functions for all dashboard pages;
 │                              query_data_status() (ttl=60) aggregates bar counts, news totals,
-│                              fundamentals flag, and model checkpoint status per symbol
+│                              fundamentals flag, and model checkpoint status per symbol;
+│                              query_llm_news_analysis() (ttl=120) resolves attribution + clusters
+│                              events at read time for Page 11
 │
 ├── models/
 │   ├── base_model.py        — ABC: train / predict / evaluate / save / load + _returns_metrics()
@@ -271,8 +298,12 @@ trading_app/
 │   ├── ensemble.py          — Weighted combination; dynamic rebalancing after each WF fold;
 │   │                          predict(suppress_finbert=, as_of=) for lookahead prevention
 │   ├── signal_gate.py       — SignalResult dataclass; 3-filter gate (see Gate Logic section)
-│   └── walk_forward.py      — MLWalkForwardOrchestrator: trains ensemble per fold, bar-by-bar
-│                              test window, cost model, finbert_coverage tracking, DB persist
+│   ├── walk_forward.py      — MLWalkForwardOrchestrator: trains ensemble per fold, bar-by-bar
+│   │                          test window, cost model, finbert_coverage tracking, DB persist
+│   └── llm_analyst.py       — LLM news analyst (shadow): Ollama client (JSON mode) + extraction
+│                              prompt + compute_composite_score (sign × magnitude × novelty-discount)
+│                              + attribution resolver (primary_entity → ticker via universe names).
+│                              NOT consumed by signal_runner.  Pure scoring/parsing fns unit-tested
 │
 ├── risk/
 │   ├── __init__.py          — exports CircuitBreaker, OrderDecision, OrderManager,
@@ -312,12 +343,20 @@ trading_app/
 │       │                              with computed "initial stop at activation" readout),
 │       │                              CB event log; sidebar: trigger/reset/run controls
 │       ├── 9_Account.py              — Account page: live IBKR account + signal history
-│       └── 10_Trade_History.py       — Page 10: closed trades from trade_log (WF-simulated +
-│                                      live fills once Phase B lands); summary cards,
-│                                      indicative tax-impact view (ST vs LT, configurable
-│                                      rates in session_state), color-coded trades table,
-│                                      cumulative net-P&L curve + exit-reason donut,
-│                                      per-symbol breakdown
+│       ├── 10_Trade_History.py       — Page 10: closed trades from trade_log (WF-simulated +
+│       │                              live fills once Phase B lands); summary cards,
+│       │                              indicative tax-impact view (ST vs LT, configurable
+│       │                              rates in session_state), color-coded trades table,
+│       │                              cumulative net-P&L curve + exit-reason donut,
+│       │                              per-symbol breakdown
+│       └── 11_LLM_News_Analysis.py    — Page 11: LLM news analyst (shadow workflow — NOT read by
+│                                      signal_runner).  Event-centric/table-first: summary cards,
+│                                      sortable+filterable Events table (one row per de-duplicated
+│                                      event; mean score; Ticker[resolved] vs Feed[tag] columns;
+│                                      mismatch/score/magnitude filters), symbol drill-down (daily
+│                                      sentiment time series + per-event detail showing the
+│                                      underlying article reads), collapsed Research expander
+│                                      (distribution, composite-vs-direct scatter, telemetry)
 │
 ├── tests/
 │   ├── test_data_pipeline.py   — mocked unit tests: fetcher + indicators (patches yfinance + db)
@@ -329,9 +368,14 @@ trading_app/
 │   │                              CircuitBreaker (5), OrderManager (4)
 │   ├── test_signal_runner.py   — 6 tests: EQUIVALENT_PAIRS symmetry, within-session
 │   │                               deduplication (no-dup, GOOG→GOOGL, GOOGL→GOOG, rejected blocks equiv)
-│   └── test_trailing_stop.py   — 8 tests: TrailingStopManager (disabled, idempotent,
-│                                   below/above activation, missing ATR, manual position,
-│                                   short positions skipped, FAILED path)
+│   ├── test_trailing_stop.py   — 8 tests: TrailingStopManager (disabled, idempotent,
+│   │                               below/above activation, missing ATR, manual position,
+│   │                               short positions skipped, FAILED path)
+│   ├── test_llm_analyst.py     — 31 tests: composite-score formula, JSON parsing (fences/garbage),
+│   │                               build_result coercion, attribution resolver (name→ticker,
+│   │                               mismatch detection, untracked→None)
+│   └── test_news_dedup.py      — 15 tests: jaccard/_tokens, event clustering (Marvell 4→1,
+│                                   entity+day key, representative pick, event_score=mean of reads)
 │
 ├── docs/                    — tutorial markdown documents (11 files)
 │   ├── README.md            — index with reading order
@@ -377,14 +421,14 @@ FundamentalsClient.get()     → upsert_fundamentals() → SQLite (fundamental_d
 
 ## Database Schema
 
-18 tables in `db/trading.db`. All timestamps are UTC-naive datetimes.
+19 tables in `db/trading.db`. All timestamps are UTC-naive datetimes.
 
 | Table | Key columns | Notes |
 |-------|-------------|-------|
 | `ohlcv_bars` | symbol, interval, timestamp, OHLCV | unique on (symbol, interval, timestamp); also stores ^VIX |
 | `indicator_snapshots` | symbol, interval, timestamp, rsi_14, macd, bb_*, ema_*, atr_14, volume_sma_20 | recomputed from bars by IndicatorEngine |
 | `fundamental_data` | symbol, fetched_at, pe_ratio, forward_pe, price_to_book, ev_to_ebitda, revenue_growth, earnings_growth, profit_margin, roe, debt_to_equity, current_ratio, free_cashflow, analyst_target | append-only history (no UNIQUE on symbol — multiple rows per symbol over time); 24h cache in `FundamentalsClient.get` prevents same-day duplicate inserts; readers use `get_fundamentals` (latest row by `fetched_at DESC`) or `get_fundamentals_history` (full series) |
-| `news_cache` | symbol, article_id, published_at, headline, sentiment_score | upsert updates score only when stored score is None |
+| `news_cache` | symbol, article_id, published_at, headline, sentiment_score, body | upsert updates score only when stored score is None. `body` (added 2026-06-02, LLM news analyst) is the full HTML-stripped article text; NULL until back-filled by `scripts/ingest_news_bodies.py` (IBKR `reqNewsArticle`); `set_news_body` only fills it when currently NULL (never overwrites) |
 | `signal_log` | symbol, generated_at, bar_timestamp, lstm_score, xgb_score, finbert_score, ensemble_score, regime, signal, passed_gate, gate_reason | written by MLWalkForwardOrchestrator.predict() |
 | `ensemble_weight_history` | lstm, xgb, finbert, trigger, recorded_at, symbol, run_id | written after each rebalance; `symbol`/`run_id` added 2026-05-14, pre-migration rows NULL |
 | `walk_forward_results` | run_id, symbol, fold_index, train/test dates, sharpe_ratio, max_drawdown, win_rate, n_signals, sentiment_note, universe_policy | sentiment_note + universe_policy added via migration; universe_policy ∈ {`dynamic`, `static`, NULL (pre-2026-05-12)} |
@@ -399,6 +443,7 @@ FundamentalsClient.get()     → upsert_fundamentals() → SQLite (fundamental_d
 | `intraday_run_log` | run_id PK, run_timestamp, mode ('intraday'), status ('completed' \| 'gateway_down' \| 'cb_tripped' \| 'error'), daily_loss_pct, weekly_loss_pct, cb_tripped, positions_flattened, trailing_evaluated, trailing_ratcheted, trailing_converted, duration_seconds, error_message | one row per `scripts/intraday_check.py` invocation (12:00 ET + 15:30 ET on weekdays). Separate from `signal_runner_log` because cadence (multiple per day) and scope (Phase 1 CB + Phase 3.5 only — never writes to `signal_log` and never regenerates signals) differ. `status='gateway_down'` rows have NULL loss_pct fields and are written even when IBKR is unreachable so missed slots are visible on Page 8.  `trailing_ratcheted` counts positions where IBKR has moved `Order.trailStopPrice` up since the last `trailing_stop_log` entry for that symbol (intraday-runner observability — see new `RATCHETED` action value). |
 | `fill_log` | exec_id (UNIQUE), order_id, perm_id, parent_order_id, account, symbol, conid, side ('BUY'\|'SELL'), order_type, shares, price, commission, realized_pnl, exec_time, recorded_at | raw IBKR executions ingested by Phase B reconciliation (shipped 2026-05-29) — the audit trail from which `trade_log` `source='live'` rows are aggregated. `exec_id` is the sole idempotency key; only `commission`/`realized_pnl` are ever mutated after insert (commissionReport can arrive on a later fetch than the Execution — `upsert_fill` refreshes them when previously NULL). Written by `execution/reconciliation.py`; populated via `IBKRConnection.get_executions()`. |
 | `reconciliation_state` | source, account, last_reconciled_ts, last_run_ts, last_n_fills, notes; UNIQUE(source, account) | Phase B reconciliation watermark (one row per source/account). `last_reconciled_ts` = newest exec_time persisted so far; seeds the next run's window display (NULL first run → now − 7d). Note: IBKR's effective retention is shorter than the 7-day nominal (see arch-decision note) so the watermark is advisory — ingestion takes IBKR's full returned set regardless. |
+| `llm_news_analysis` | symbol, article_id, model, provider, published_at, headline, event_type, direction, magnitude, time_horizon, novelty, confidence, entities (JSON), primary_entity, attributed_symbol, summary, rationale, composite_score, llm_direct_score, raw_response, prompt_tokens, output_tokens, duration_ms, parse_ok, scored_at, recorded_at; UNIQUE(symbol, article_id, model) | **LLM news analyst — shadow workflow, NOT read by signal_runner** (added 2026-06-02). One row per (feed symbol, article, model): the 8B's structured extraction from the article body + the deterministic `composite_score` derived from it (`sign × magnitude × novelty-discount` — see `models/llm_analyst.py:compute_composite_score`). `symbol` is the IBKR feed tag; `primary_entity`/`attributed_symbol` is the company the article is *actually about* (frequently a different ticker — resolved at READ time, the stored `attributed_symbol` is advisory). `llm_direct_score` is the model's own [-1,1] guess, kept as a shadow cross-check only. `parse_ok=False` rows are kept for visibility. Written by `scripts/score_news_llm.py` via Ollama; idempotent on the unique key. Event-level aggregation (mean score of de-duplicated re-reports) happens at read time in `data/news_dedup.py` — not stored. |
 
 **Schema migrations:** `_migrate()` in `data/database.py` runs at every engine init. When adding a new ORM column, add an `if "column_name" not in cols: ALTER TABLE` block there — never rely on `create_all()` to add columns to existing tables.
 
@@ -455,6 +500,14 @@ Key configurable fields:
 | `RiskConfig.intraday_conversion_buffer_atr` | 0.5 | Additional buffer above `trailing_stop_activation_atr` required for intraday conversions: `current >= entry + (activation_atr + intraday_conversion_buffer_atr) × ATR`.  Keeps mid-day conversions to genuinely-strong moves only |
 | `RiskConfig.hold_timeout_enabled` | False | When True + paper_orders_enabled, flatten held longs whose most recent passed-gate BUY in `signal_log` is older than `max_hold_days` |
 | `RiskConfig.max_hold_days` | 30 | Calendar-day threshold for the hold-timeout rule (Phase 3.6). 0 disables defensively |
+| `LLMConfig.enabled` | False | Opt-in master switch for the LLM news analyst (shadow workflow). When False, `ingest_news_bodies.py` / `score_news_llm.py` no-op unless `--force` is passed |
+| `LLMConfig.model` | `"llama3.1:8b"` | Ollama model tag used for extraction. Measured ~80s/article on the dev i5-1334U; `llama3.2:3b` is ~37s if speed matters more than quality |
+| `LLMConfig.ollama_url` | `http://localhost:11434/api/generate` | Local Ollama HTTP endpoint (JSON mode) |
+| `LLMConfig.num_predict` | 300 | Max output tokens/article (real extractions emit ~100) |
+| `LLMConfig.request_timeout_s` | 1200 | Per-article hard cap |
+| `LLMConfig.min_body_chars` | 800 | Skip stub bodies below this (matches the body-availability spike's 'full' floor) |
+| `LLMConfig.lookback_days` | 3 | Body-ingest / scoring window |
+| `LLMConfig.novelty_discount_floor` | 0.5 | Composite-score novelty multiplier floor: `nov_mult ∈ [floor, 1.0]` (already-known news discounted toward `floor`) |
 
 ## ML Model Details
 
@@ -628,6 +681,13 @@ This is the correct retail-alpha frame: the counterfactual is "would I have done
 
 **`get_executions` requests IBKR's full retention and bounds client-side — no server-side time filter** (`execution/ibkr_connection.py:get_executions`).  `ExecutionFilter.time` is too brittle to rely on: a bare `'yyyymmdd HH:MM:SS'` string triggers IBKR **warning 2174** ("submitted request without explicit time zone … implied time zone functionality will be removed") and applies an *implied* timezone that silently shifts the window; the `'yyyymmdd-hh:mm:ss UTC'` form IBKR's own warning *recommends* was observed (2026-05-29, this Gateway build) to **silently return zero rows**.  So `get_executions` passes an **empty `ExecutionFilter()`** — IBKR caps retention at ~7 days regardless (see the note above) — and the reconciler bounds/aggregates client-side on the normalised UTC `exec_time`.  **Do not "optimize" this by re-adding a server-side `time` filter** to reduce payload size: the payload is tiny (a handful of fills), and the filter's failure modes are silent (wrong window or zero rows) rather than loud.  `_to_naive_utc` (in `execution/reconciliation.py`) asserts/coerces UTC before stripping tzinfo so the watermark comparison stays correct.
 
+**LLM news analyst is a shadow workflow, deliberately decoupled into ingest vs score** (`scripts/ingest_news_bodies.py`, `scripts/score_news_llm.py`, `models/llm_analyst.py`, `data/news_dedup.py`, Page 11 — added 2026-06-02).  A local 8B model (Ollama) reads *full article bodies* (which FinBERT never sees — `news_cache` was headline-only) and produces structured extraction + a sentiment score.  **Nothing in `signal_runner` reads it** — it's a parallel research signal surfaced only on Page 11.  Five deliberate design choices, each driven by what the build verified:
+- **Batch, not daemon.**  Matches the "batch files over persistent scheduler" decision.  Two *separate* steps: body ingestion (needs Gateway, fast — piggybacks the morning window) and LLM scoring (no Gateway — reads bodies from SQLite, slow at ~80s/article).  Decoupling means the expensive scoring step never depends on Gateway uptime and can run anytime, off the pre-market critical path.
+- **The body-availability premise was measured first** (`scripts/spike_body_availability.py`, 2026-06-02): IBKR `reqNewsArticle` returns a usable full body for **~94%** of universe news, and — contrary to expectation — Dow Jones (`DJ-N`) bodies come through full (median ~3,400 chars), not as paywall stubs.  The throughput was measured too (`scripts/bench_llm_extraction.py`): 8B ~80s/article, 3B ~37s on the dev i5-1334U (a 15W ultrabook), via Ollama's exact prefill/decode token counts.  ~100 output tokens/article (terse JSON), so a typical news day fits an overnight window.
+- **Score = deterministic composite from structured fields, NOT an LLM-emitted number** (`compute_composite_score`): the LLM classifies direction/magnitude/novelty (what it's good at); we compute `sign × (magnitude/5) × novelty_discount` ourselves.  This is transparent (the dashboard shows the decomposition), tunable, and stable.  `llm_direct_score` (the model's own [-1,1] guess) is stored only as a shadow cross-check.
+- **Attribution: `primary_entity` (company name) → ticker, resolved at READ time** (`resolve_attribution` + `build_company_name_map`).  IBKR symbol-tagged news is *frequently about a different company* — verified live: 7 of 8 NVDA/AAPL-tagged test articles were actually about Marvell/Broadcom/Dell/HPE.  The resolver maps names→tickers via `universe_assets.name` (Marvell→MRVL, Broadcom→AVGO), labels untracked names (HPE→None), and flags mismatches — the headline value-add the current FinBERT path misses.  Read-time resolution means the heuristic can improve without re-running the 8B.  The matcher is deliberately conservative (exact ticker, or token-set match against real company names; bare-ticker variants never fuzzy-match) after a substring version false-matched "Nvi**dia**"→DIA.
+- **Event de-duplication groups by (resolved ticker, day), NOT text similarity** (`data/news_dedup.py`).  The same event is re-reported many times and the 8B scores near-duplicates inconsistently (observed: four "Marvell surges" articles scored +0.00/+0.90/+0.00/+0.90).  Text-similarity clustering was tried and **abandoned on real data**: intra-event Jaccard ran as low as 0.14 while a *different*-event pair (Marvell-vs-Broadcom) hit 0.19 — short reworded headlines share generic chip-sector vocabulary, so no threshold separates them.  The resolved ticker is the reliable signal.  **Event score = MEAN of all member reads** (every read counts — MRVL → +0.45, not the +0.00 a single representative gave); a representative article is picked (highest confidence) only to choose which headline/summary to *display*.  Known trade-off: two genuinely different same-day stories about one company merge — far less harmful than re-report inflation, and `event_size` + the score spread keep it visible.
+
 **Distributional patterns observed across many trades** — patterns that don't fit case studies (no single-trade narrative), Outstanding bugs (no fix in flight), Enhancements (no forward-looking direction), or followups (not a single-run gate) — are tracked under `docs/findings/`. See `docs/findings/README.md` for the scope rule, document structure, and lifecycle. Current findings: `stop_bleed.md` (2026-05-19, observed/hypothesized), `tp_concentration.md` (2026-05-19, observed/hypothesized).
 
 ## Logging conventions
@@ -743,6 +803,17 @@ symbols held in the last 14 days, current universe). Overwriting on upsert is al
 size. **Status:** implemented as `scripts/refresh_recent_bars.py` + a new `run_eod.bat` scheduler wrapper. The spec's "overwriting on upsert is already the behavior" turned out to be wrong — `upsert_bars` / `upsert_indicators` both skipped existing rows. Two additions: (a) new `overwrite: bool = False` parameter on both helpers in `data/database.py` (default preserves existing skip-existing semantics for the incremental-fetch path); (b) new `DataFetcher.refresh_recent(symbol, interval='1d', days_back=5)` that calls yfinance and upserts with `overwrite=True`. The script builds its symbol union from three sources: (1) `get_universe_assets(active_only=True)` or `config.data.watchlist`, (2) `order_decisions` with `decision in ('APPROVED', 'DRY_RUN', 'CLOSED_LONG')` and `decided_at > now − 14d` (as a Phase-A proxy for "recently-held" until Phase B lands `source='live'` rows in `trade_log`), (3) currently-held IBKR positions (optional — `--no-ibkr` flag, also degrades cleanly to empty set when Gateway is unreachable). For each symbol it overwrites recent bars then recomputes and overwrites the derived indicators. `run_eod.bat` lives separately from `run_daily.bat` because the daily run fires pre-market at 09:40 ET; EOD wrapper logs to `logs/eod/eod_run_YYYYMMDD.log` and must be scheduled separately via Windows Task Scheduler at 16:30 ET. Test coverage added: 5 new in `tests/test_data_pipeline.py` (`TestUpsertBarsOverwrite` × 3: default skips, overwrite updates in place with the low-overwrite canary, mixed batch handles INSERT+UPDATE in one call; `TestUpsertIndicatorsOverwrite` × 2). Full suite: **223 passed + 1 skipped**. Verification pending: (a) the Phase B `source='live'` lookup in `_recently_acted_symbols` should be switched from `order_decisions` to `trade_log` once Phase B accumulates rows; (b) needs a real EOD cron run to confirm yfinance returns finalised post-close bars at 16:30 ET (yfinance typically updates ~15-20 min after close) and that the held-positions union actually catches the rotated-out symbols that motivated this fix; (c) repeat the TMUS / UAL / TEL spot-check from the original observation against the DB after one EOD run completes — DB Low values should match yfinance Low values to within a cent.
 
 ### Enhancements (open)
+- **LLM news analyst — shadow workflow (Page 11)** *(core shipped 2026-06-02 — awaiting first scheduled run + iteration)* (`scripts/ingest_news_bodies.py`, `scripts/score_news_llm.py`, `models/llm_analyst.py`, `data/news_dedup.py`, `dashboard/pages/11_LLM_News_Analysis.py`; see the "LLM news analyst is a shadow workflow" architectural-decision note above for the design + rationale).  A local 8B model reads full article bodies and produces a transparent composite sentiment score + article attribution, surfaced only on Page 11 — **not consumed by signal_runner**.  Built and tested end-to-end (46 new tests: `test_llm_analyst.py` 31, `test_news_dedup.py` 15); verified on real data (the Marvell/Broadcom/Dell attribution + event-mean fix).  **Open items, roughly in priority order:**
+    1. **Schedule `run_llm_news.bat`** into Windows Task Scheduler.  Deferred pending the operational call: run it right after `run_daily.bat` (Gateway still up, signal_runner done, ~2h scoring during market hours) vs. split Step 2 (scoring) to an overnight slot — the latter depends on the dev laptop staying awake overnight (the same Gateway-uptime-class risk that motivated IBC adoption).  Until scheduled, the feature only runs on manual `--force` invocation.  `config.llm.enabled` is the master switch (default False).
+    2. **Graduate the event score from MEAN → "strongest corroborated read"** once enough events have been eyeballed.  Mean is the transparent starting point (every read counts) but under-weights genuine material events when a wire story is reprinted many times neutral; "direction by confidence-weighted vote, score from the max-magnitude read in that direction" better captures materiality.  Trigger: after ~1-2 weeks of real volume, if the mean is visibly washing out material moves.  The combine logic lives in `data/news_dedup.py:cluster_news_events` (currently `event_score = mean`).
+    3. **Sharpen the extraction prompt** to score the PRIMARY company's move specifically, not the broader tape.  The +0.00/+0.90 inconsistency on the Marvell event came partly from some articles framing Marvell's surge against a down market — the model scored the market, not Marvell.  Cheap to try (prompt-only change in `models/llm_analyst.py:EXTRACTION_PROMPT`); would reduce per-event disagreement at the source.  Re-scoring is cheap at current volume.
+    4. **`mentioned_tickers`** — resolve the full `entities` list to tickers (not just `primary_entity`) and store as secondary-relevance metadata.  The Marvell articles also mention NVDA (the endorser); a story can be material to several tracked names.  Cheap (entities already extracted); secondary to the above.
+    5. **LLM-emitted `primary_ticker`** for untracked names — the name-map resolver already nails in-universe tickers (the cases worth trading); this mainly adds tier-3 untracked names (HPE→HPE), so it's low priority.  Add a prompt field + validate against the universe.
+    6. **Representative-selection rule** — currently highest-confidence (used only for *display* now, so lower stakes).  Confidence may be poorly calibrated; revisit (magnitude? completeness?) once more events are visible.
+    7. **Body-level similarity for finer dedup** — the abandoned headline/summary Jaccard failed because headlines are short + generic; a similarity pass over full *bodies* could split the "two different same-day stories merge" trade-off.  `jaccard`/`_tokens` are retained in `data/news_dedup.py` for this.  Only worth it if over-merging proves common at scale.
+    8. **Switch `_recently_acted_symbols`-style universe source** — `ingest_news_bodies.py` / `score_news_llm.py` use `get_universe_assets(active_only=True)` when `config.universe.enabled`, else the watchlist.  Fine as-is; noted for parity with other scripts.
+  **Day-1 spot-check when first scheduled:** confirm `llm_news_analysis` fills (one row per article/model), Page 11 renders the Events table, the dedup ratio (`n_articles → n_events`) is >1 on a busy news day, and attribution mismatches surface tradeable re-attributions (NVDA-tagged → MRVL/AVGO).  **Throwaway research scripts** (`spike_body_availability.py`, `bench_llm_extraction.py`) can be deleted once the feature is stable — they're kept for now as the source of the 94%-body-availability and throughput numbers.
+
 - **Benchmark-relative performance tracking on Page 10** *(code complete 2026-05-19 — awaiting live verification across next weekly retrain)* (originated from 2026-05-19 chat review): Page 10 previously showed absolute P&L, win rate, and a cumulative net-P&L curve — but a +5 % return when SPY did +6 % is a negative-alpha system that looked like a winner on the dashboard.  **Status:** SPY OHLCV ingestion mirrored on the `^VIX` pattern so it does not depend on universe mode (new `DataConfig.benchmark_symbol`, fetched explicitly in `run_pipeline.py` + `refresh_recent_bars.py` union).  New `trade_log.benchmark_return_pct` column populated by `scripts/backfill_benchmark_returns.py` (idempotent — operates only on `WHERE benchmark_return_pct IS NULL`).  Backfill auto-wired into `run_weekly.bat` after `train_models.py --force` and `run_daily.bat` after `train_models.py`, with a NULL-count verification echo in both.  Page 10 has a new "Benchmark-Relative Performance" section: 3 metric cards, cumulative excess chart, per-exit-reason excess table, per-trade audit expander with opt-in fold_end toggle (default OFF — the headline metrics exclude fold_end backtest artifacts; the toggle affects only the per-trade table).  See the "Fold-end closures are backtest artifacts" and "Dedup vs raw views are honest answers to different questions" architectural-decision notes above for the diagnoses landed during this work.  Test coverage added: 7 new tests across `tests/test_ui_queries.py` (excess-return regression guard, NULL-row filtering, empty-state) and `tests/test_trade_log.py` (backfill correctness, missing-bar NULL handling, idempotency, two 2026-05-19 baseline-pin canaries against the production DB).  Verification pending: (a) next Sunday `--force` weekly retrain will exercise the auto-backfill chain end-to-end and re-pin the baseline numbers — the two `test_benchmark_aggregates_*_baseline_2026_05_19` tests will fail loudly and need updating, that's the canary firing as designed; (b) operator should spot-check Page 10's headline 3-card numbers against the per-exit-reason table totals to confirm the fold_end exclusion is honest.
 
 - **Trailing stop is structurally crowded out by the bracket TP on fast moves** (`risk/trailing_stop.py`, `config/settings.py` RiskConfig): with current defaults (`trailing_stop_activation_atr=2.0`, `trailing_stop_trail_atr=2.0`, `atr_take_profit_multiplier=3.0`), the activation level sits only **1× ATR below** the bracket TP. The trailing manager evaluates **once per day** in Phase 3.5 reading daily-bar closes from `ohlcv_bars`; intraday excursions above activation are invisible to it. On any fast move that gaps through both activation and TP between two consecutive daily evaluations, the bracket TP wins by construction — the trailing stop cannot engage. **Observed case: AXTI 2026-04-29 → 2026-05-04** (full write-up: `docs/case_studies/axti_2026-04.md`); **counter-case where the trail DID convert: SNOW 2026-04-30 → ongoing** (`docs/case_studies/snow_2026-04.md`). The pair refines the framing from "the trail can't engage on fast moves" to "the trail's success depends on whether the move from below-activation to above-TP happens **overnight** (TP wins — AXTI) or **intraday** while the once-per-day manager is running (trail wins — SNOW). The intervention ranking flips: SNOW's data argues **intraday evaluation > widen activation→TP gap > lower activation_atr**." Entry $72.96; 2026-05-01 close $88.32 sat $3.57 *below* activation $91.89 (intraday high $96.00 would have qualified but daily-bar evaluation missed it); 2026-05-04 opened $97.44 and TP $101.19 filled in the first ~10 minutes of trading before the 09:40 ET trailing-manager evaluation. Realised +38.7% in 3 trading days vs subsequent post-exit peak of $134.00 on 2026-05-13 (~46% of peak move captured). Sample size = 1 today; **do not retune defaults until ≥2 more fast-move winners exit and the pattern is confirmed in aggregate** (gated on Phase B `source='live'` rows so realised P&L drives the analysis instead of a single observation). Interventions ranked by reversibility when the time comes: (1) lower `trailing_stop_activation_atr` to 1.0 — cheap config change, would have activated AXTI's trail on 2026-05-01, risk is over-activation on weaker moves that then retrace; (2) raise `atr_take_profit_multiplier` to ~5.0 — gives the trail room to engage, larger drawdown risk on positions that hit the trail and reverse; (3) intraday trailing-stop evaluation (second `signal_runner` invocation at e.g. 15:30 ET, or a live data stream) — would have caught AXTI's 2026-05-01 intraday $96.00 print, larger code surface; (4) "TP becomes trailing once first-target is hit" rule — conceptually cleanest, largest code change. Trigger to revisit: ≥3 trades total with `exit_reason='tp'` AND post-exit peak >1.5× the TP price within 10 bars (i.e. the system locked in a small win and left a big tail behind). The query that surfaces these once Phase B lands is straightforward against `trade_log` joined to `ohlcv_bars`.

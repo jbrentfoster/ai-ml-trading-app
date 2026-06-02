@@ -1293,3 +1293,64 @@ def query_distinct_trade_log_run_ids(limit: int = 20) -> list[dict]:
             "n_trades": int(r[3]),
         })
     return out
+
+
+# ── LLM news analysis (shadow workflow — Page 11) ─────────────────────────────
+
+@st.cache_data(ttl=120)
+def query_llm_news_analysis(
+    symbols: tuple | None = None,
+    days: int = 14,
+    model: str | None = None,
+    attributed: bool = False,
+) -> pd.DataFrame:
+    """LLM news-analysis rows for the dashboard (newest first), event times in
+    local wall-clock.  ``attributed=True`` filters/keys on the ticker the
+    article is *about* rather than the IBKR feed tag."""
+    from data.database import get_llm_analysis
+    since = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=days)
+    syms = list(symbols) if symbols else None
+    df = get_llm_analysis(symbols=syms, since=since, model=model, attributed=attributed)
+    if df.empty:
+        return df
+    df["published_at"] = _to_local_series(df["published_at"])
+    if "scored_at" in df.columns:
+        df["scored_at"] = _to_local_series(df["scored_at"])
+
+    # Resolve attribution at READ time from the stored primary_entity, so the
+    # heuristic can improve without re-running the 8B over every article.
+    from data.database import build_company_name_map
+    from models.llm_analyst import resolve_attribution
+    name_map = build_company_name_map()
+    resolved = df.apply(
+        lambda r: resolve_attribution(r["primary_entity"], r["symbol"], name_map),
+        axis=1)
+    df["attributed_symbol"] = [a for a, _ in resolved]
+    df["attribution_mismatch"] = [m for _, m in resolved]
+
+    # Cluster near-duplicate articles into events (read-time — see
+    # data/news_dedup.py).  Adds event_id / event_size / is_representative, plus
+    # the per-event composite-score spread so model inconsistency stays visible.
+    from data.news_dedup import cluster_news_events
+    clustered = cluster_news_events(df.to_dict("records"))
+    df = pd.DataFrame(clustered)
+    if not df.empty:
+        df = df.sort_values("published_at", ascending=False).reset_index(drop=True)
+        grp = df.groupby("event_id")["composite_score"]
+        df["event_score_min"] = df["event_id"].map(grp.min())
+        df["event_score_max"] = df["event_id"].map(grp.max())
+    return df
+
+
+@st.cache_data(ttl=120)
+def query_llm_analysis_options(days: int = 30) -> dict:
+    """Distinct models + symbols present in llm_news_analysis (for filters)."""
+    from data.database import get_llm_analysis
+    since = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=days)
+    df = get_llm_analysis(since=since)
+    if df.empty:
+        return {"models": [], "symbols": []}
+    return {
+        "models":  sorted(df["model"].dropna().unique().tolist()),
+        "symbols": sorted(df["symbol"].dropna().unique().tolist()),
+    }

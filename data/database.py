@@ -155,7 +155,9 @@ class NewsCache(Base):
     article_id   = Column(String(64), nullable=False)   # Alpaca article ID
     published_at = Column(DateTime,   nullable=False)
     headline     = Column(Text,       nullable=False)
-    sentiment_score = Column(Float)    # [-1, 1]; positive = bullish
+    sentiment_score = Column(Float)    # [-1, 1]; positive = bullish (FinBERT, headline-only)
+    body         = Column(Text)        # full article text (HTML-stripped); NULL until ingested
+                                       # by scripts/ingest_news_bodies.py (IBKR reqNewsArticle)
 
     __table_args__ = (
         UniqueConstraint("symbol", "article_id", name="uq_news"),
@@ -495,6 +497,68 @@ class ReconciliationState(Base):
     )
 
 
+class LLMNewsAnalysis(Base):
+    """
+    Local-LLM full-article news analysis (shadow workflow — NOT read by
+    signal_runner).  One row per (symbol, article_id, model): the structured
+    extraction an 8B model produced from the article body, plus the
+    deterministic composite sentiment score derived from those fields.
+
+    ``symbol`` is the IBKR feed tag the article was fetched under.
+    ``primary_entity`` / ``attributed_symbol`` is the company the LLM judged the
+    article to be *actually about* — frequently a different ticker (IBKR
+    symbol-tagged news regularly mentions a name in passing).  Aggregation and
+    the dashboard attribute the score to ``attributed_symbol``, not ``symbol``;
+    mismatches are the most interesting rows (the current FinBERT path
+    misattributes them).
+
+    ``composite_score`` is the score of record (sign x magnitude x novelty —
+    explainable, tunable, computed by models/llm_analyst.py:compute_composite_score).
+    ``llm_direct_score`` is the model's own [-1,1] guess, stored only as a
+    shadow cross-check.  Idempotency key: (symbol, article_id, model).
+    """
+    __tablename__ = "llm_news_analysis"
+
+    id              = Column(Integer, primary_key=True, autoincrement=True)
+    symbol          = Column(String(10), nullable=False)   # IBKR feed-tag symbol
+    article_id      = Column(String(64), nullable=False)
+    model           = Column(String(40), nullable=False)   # e.g. 'llama3.1:8b'
+    provider        = Column(String(20))
+    published_at    = Column(DateTime)
+    headline        = Column(Text)
+
+    # ── structured extraction (what the LLM is good at) ──
+    event_type      = Column(String(20))   # earnings|guidance|mgmt_change|mna|litigation|regulatory|product|analyst|macro|other
+    direction       = Column(String(10))   # bullish | bearish | neutral
+    magnitude       = Column(Integer)      # 1-5 materiality
+    time_horizon    = Column(String(12))   # immediate | days | quarter | longterm
+    novelty         = Column(Integer)      # 1-5 how new/surprising
+    confidence      = Column(Integer)      # 1-5 model's self-rated confidence
+    entities        = Column(Text)         # JSON list of names mentioned
+    primary_entity  = Column(String(80))   # the name the article is *about*
+    attributed_symbol = Column(String(10)) # ticker resolved from primary_entity (may differ from symbol)
+    summary         = Column(Text)         # one-sentence LLM summary
+    rationale       = Column(Text)         # short "why this score" explanation for the dashboard
+
+    # ── scores ──
+    composite_score = Column(Float)        # [-1,1] derived deterministically — score of record
+    llm_direct_score = Column(Float)       # [-1,1] model's own guess — shadow cross-check only
+
+    # ── telemetry (for the dashboard + cost tracking) ──
+    raw_response    = Column(Text)         # full model JSON (audit / re-parse)
+    prompt_tokens   = Column(Integer)
+    output_tokens   = Column(Integer)
+    duration_ms     = Column(Integer)
+    parse_ok        = Column(Boolean, default=True)  # False = JSON parse failed; row kept for visibility
+
+    scored_at       = Column(DateTime, nullable=False)
+    recorded_at     = Column(DateTime, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("symbol", "article_id", "model", name="uq_llm_news_analysis"),
+    )
+
+
 # ── Engine (lazy singleton) ───────────────────────────────────────────────────
 
 _engine = None
@@ -650,6 +714,16 @@ def _migrate(engine) -> None:
                 "ON trade_log(exit_exec_id) WHERE source='live'"
             ))
             conn.commit()
+
+        # news_cache.body  (LLM news analyst — full article text, HTML-stripped,
+        # ingested by scripts/ingest_news_bodies.py).  NULL until ingested; the
+        # scoring pass only touches rows where body IS NOT NULL.
+        if "news_cache" in insp.get_table_names():
+            nc_cols = {c["name"] for c in insp.get_columns("news_cache")}
+            if "body" not in nc_cols:
+                conn.execute(text("ALTER TABLE news_cache ADD COLUMN body TEXT"))
+                conn.commit()
+                log.info("Migration applied: news_cache.body")
 
         # fundamental_data: drop UNIQUE(symbol) so the table can hold append-only
         # snapshot history (needed for derived features like analyst-target
@@ -998,6 +1072,193 @@ def get_recent_news(symbol: str, since: datetime) -> list[dict]:
         }
         for r in rows
     ]
+
+
+# ── LLM news analyst helpers (shadow workflow) ────────────────────────────────
+
+def set_news_body(symbol: str, article_id: str, body: str) -> bool:
+    """Fill ``news_cache.body`` for one article when currently NULL.
+
+    Returns True if a body was written, False if the row is missing or already
+    has a body (idempotent — re-running ingestion never overwrites)."""
+    engine = get_engine()
+    with Session(engine) as session:
+        row = session.query(NewsCache).filter_by(
+            symbol=symbol, article_id=article_id
+        ).first()
+        if row is None:
+            return False
+        if row.body is None and body:
+            row.body = body
+            session.commit()
+            return True
+    return False
+
+
+def get_news_needing_body(symbols: list[str] | None, since: datetime) -> list[dict]:
+    """News rows (optionally restricted to ``symbols``) since ``since`` whose
+    body is still NULL — the work list for scripts/ingest_news_bodies.py."""
+    engine = get_engine()
+    with Session(engine) as session:
+        q = session.query(NewsCache).filter(
+            NewsCache.published_at >= since,
+            NewsCache.body.is_(None),
+        )
+        if symbols:
+            q = q.filter(NewsCache.symbol.in_(symbols))
+        rows = q.order_by(desc(NewsCache.published_at)).all()
+    return [
+        {
+            "symbol":       r.symbol,
+            "article_id":   r.article_id,
+            "headline":     r.headline,
+            "published_at": r.published_at,
+        }
+        for r in rows
+    ]
+
+
+def get_news_for_scoring(
+    symbols: list[str] | None,
+    since: datetime,
+    model: str,
+    min_chars: int = 0,
+) -> list[dict]:
+    """Articles with a stored body that have NOT yet been scored by ``model``.
+
+    Idempotency: filtered against ``llm_news_analysis`` on
+    (symbol, article_id, model), so re-running the scorer only picks up new
+    articles.  ``min_chars`` drops sub-threshold stub bodies."""
+    engine = get_engine()
+    with Session(engine) as session:
+        already = session.query(LLMNewsAnalysis.id).filter(
+            LLMNewsAnalysis.symbol == NewsCache.symbol,
+            LLMNewsAnalysis.article_id == NewsCache.article_id,
+            LLMNewsAnalysis.model == model,
+        )
+        q = session.query(NewsCache).filter(
+            NewsCache.published_at >= since,
+            NewsCache.body.isnot(None),
+            ~already.exists(),
+        )
+        if symbols:
+            q = q.filter(NewsCache.symbol.in_(symbols))
+        rows = q.order_by(desc(NewsCache.published_at)).all()
+
+    result = []
+    for r in rows:
+        if min_chars and (not r.body or len(r.body) < min_chars):
+            continue
+        provider = r.article_id.split("$", 1)[0] if "$" in r.article_id else None
+        result.append({
+            "symbol":       r.symbol,
+            "article_id":   r.article_id,
+            "provider":     provider,
+            "headline":     r.headline,
+            "published_at": r.published_at,
+            "body":         r.body,
+        })
+    return result
+
+
+def upsert_llm_analysis(record: dict) -> bool:
+    """Insert one LLM analysis row, keyed (symbol, article_id, model).
+
+    Returns True on insert, False if a row for that key already exists
+    (idempotent — re-scoring the same article with the same model is a no-op).
+    ``entities`` is expected pre-serialised to a JSON string by the caller."""
+    engine = get_engine()
+    now = datetime.utcnow()
+    with Session(engine) as session:
+        exists_row = session.query(LLMNewsAnalysis).filter_by(
+            symbol=record["symbol"],
+            article_id=record["article_id"],
+            model=record["model"],
+        ).first()
+        if exists_row is not None:
+            return False
+        rec = dict(record)
+        rec.setdefault("scored_at", now)
+        rec.setdefault("recorded_at", now)
+        session.add(LLMNewsAnalysis(**rec))
+        session.commit()
+    return True
+
+
+def get_llm_analysis(
+    symbols: list[str] | None = None,
+    since: datetime | None = None,
+    model: str | None = None,
+    attributed: bool = False,
+    limit: int | None = None,
+) -> pd.DataFrame:
+    """Read llm_news_analysis as a DataFrame (newest first) for the dashboard.
+
+    ``attributed=True`` filters on ``attributed_symbol`` (the ticker the article
+    is *about*) instead of the feed-tag ``symbol`` — the honest per-ticker view."""
+    engine = get_engine()
+    with Session(engine) as session:
+        q = session.query(LLMNewsAnalysis)
+        if since is not None:
+            q = q.filter(LLMNewsAnalysis.published_at >= since)
+        if model:
+            q = q.filter(LLMNewsAnalysis.model == model)
+        if symbols:
+            col = LLMNewsAnalysis.attributed_symbol if attributed else LLMNewsAnalysis.symbol
+            q = q.filter(col.in_(symbols))
+        q = q.order_by(desc(LLMNewsAnalysis.published_at))
+        if limit:
+            q = q.limit(limit)
+        rows = q.all()
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame([{
+        "symbol":            r.symbol,
+        "attributed_symbol": r.attributed_symbol,
+        "primary_entity":    r.primary_entity,
+        "article_id":        r.article_id,
+        "model":             r.model,
+        "provider":          r.provider,
+        "published_at":      r.published_at,
+        "headline":          r.headline,
+        "event_type":        r.event_type,
+        "direction":         r.direction,
+        "magnitude":         r.magnitude,
+        "time_horizon":      r.time_horizon,
+        "novelty":           r.novelty,
+        "confidence":        r.confidence,
+        "entities":          r.entities,
+        "summary":           r.summary,
+        "rationale":         r.rationale,
+        "composite_score":   r.composite_score,
+        "llm_direct_score":  r.llm_direct_score,
+        "parse_ok":          r.parse_ok,
+        "prompt_tokens":     r.prompt_tokens,
+        "output_tokens":     r.output_tokens,
+        "duration_ms":       r.duration_ms,
+        "scored_at":         r.scored_at,
+    } for r in rows])
+
+
+def build_company_name_map() -> dict:
+    """{TICKER: [name variants]} from universe_assets.name + watchlist tickers.
+
+    Used by the LLM analyst's attribution resolver to map a primary_entity
+    (company name) back to a ticker.  Each ticker is always a variant of itself
+    (so a bare-ticker primary_entity resolves)."""
+    engine = get_engine()
+    out: dict = {}
+    with Session(engine) as session:
+        for sym, name in session.query(UniverseAsset.symbol, UniverseAsset.name).all():
+            if not sym:
+                continue
+            variants = [sym]
+            if name:
+                variants.append(name)
+            out[sym.upper()] = variants
+    for s in config.data.watchlist:
+        out.setdefault(s.upper(), [s])
+    return out
 
 
 def get_earliest_news_date(symbol: str | None = None) -> datetime | None:
