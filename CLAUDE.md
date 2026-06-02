@@ -24,6 +24,11 @@ AI-driven algorithmic trading system connecting to Interactive Brokers (IBKR) vi
 ### Reference Disambiguation
 - When the user references numbered items (e.g., '#1 and #2'), confirm whether they mean items from CLAUDE.md, the current conversation, or a planning doc before acting.
 
+### Commit messages (Windows / PowerShell)
+- **Do not pass multi-line commit messages with `git commit -m @'...'@` here-strings.** This setup runs Windows PowerShell 5.1, where here-strings passed to a native exe are fragile: embedded double quotes (e.g. `"Outstanding bugs"`) and other tokens routinely break argument parsing, and PowerShell scatters the message body across `git` as bogus pathspecs (`error: pathspec '...' did not match any file(s)`). This has recurred across many sessions.
+- **Robust pattern — write the message to a file and use `git commit -F`:** create a temp message file with the Write tool (e.g. `.git/COMMIT_EDITMSG_CC.txt`, which is inside `.git/` so it's never accidentally staged), commit with `git commit -F .git/COMMIT_EDITMSG_CC.txt`, then `Remove-Item` it. This sidesteps all PowerShell quoting entirely and is the expected way to make any commit with a body, special characters, or quotes.
+- Single-line trivial commits with `git commit -m "short message"` (no embedded quotes) are fine.
+
 ## Setup
 
 ```bash
