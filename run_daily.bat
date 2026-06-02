@@ -3,7 +3,9 @@
 :: Step 1 — refresh OHLCV, indicators, news, and FinBERT scores
 :: Step 2 — re-score universe (Stage 3) so new members are active before training
 :: Step 3 — train models for any symbols missing checkpoints (skips existing)
-:: Step 4 — signal runner dry-run
+:: Step 3b — backfill SPY-relative returns for fresh walk-forward trade_log rows
+:: Step 4 — signal runner (--no-dry-run); Phase 1 reconciles off-cycle live fills
+:: Step 4b — backfill again so today's live-reconciled rows aren't NULL until tomorrow
 
 cd /d "%~dp0"
 
@@ -60,5 +62,20 @@ if errorlevel 1 (
     echo [%date% %time%] ERROR: signal_runner.py failed >> "%LOG%"
     exit /b 1
 )
+
+:: signal_runner Phase 1 reconciles off-cycle live IBKR fills into trade_log
+:: (source='live' rows) AFTER Step 3b ran -- so any round trip closed since the
+:: last run lands here with a NULL benchmark_return_pct.  Re-run the backfill so
+:: Page 10's benchmark-relative view picks up today's live exits same-day instead
+:: of lagging a full day until tomorrow's Step 3b.  Idempotent (WHERE ... IS NULL).
+echo [%date% %time%] Step 4b: scripts\backfill_benchmark_returns.py (live rows from Phase 1) >> "%LOG%"
+.venv\Scripts\python.exe scripts\backfill_benchmark_returns.py >> "%LOG%" 2>&1
+if errorlevel 1 (
+    echo [%date% %time%] WARNING: post-runner backfill_benchmark_returns.py failed -- live rows reconciled today will have NULL benchmark_return_pct until tomorrow >> "%LOG%"
+)
+
+:: Verify — a noisy log line beats a silent data gap.
+echo [%date% %time%] Step 4b verify: NULL benchmark_return_pct count >> "%LOG%"
+.venv\Scripts\python.exe -c "from data.database import get_engine; from sqlalchemy import text; e=get_engine(); n=e.connect().execute(text('SELECT COUNT(*) FROM trade_log WHERE benchmark_return_pct IS NULL')).scalar(); print(f'NULL benchmark_return_pct after post-runner backfill: {n}')" >> "%LOG%" 2>&1
 
 echo [%date% %time%] === Daily run complete === >> "%LOG%"

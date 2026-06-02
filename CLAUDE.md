@@ -109,10 +109,19 @@ trading_app/
 ├── requirements.txt
 ├── run_daily.bat            — Mon–Fri scheduler: run_pipeline.py → universe_scheduler.py --rescore-now
 │                              --no-signal-run → train_models.py (skip-existing) →
-│                              backfill_benchmark_returns.py → signal_runner.py --no-dry-run;
-│                              logs to logs/daily/daily_run_YYYYMMDD.log.  Backfill is positioned
-│                              before the runner so Page 10's benchmark-relative view never lags the
-│                              latest trade_log rows by a full day.
+│                              backfill_benchmark_returns.py (Step 3b) → signal_runner.py --no-dry-run →
+│                              backfill_benchmark_returns.py (Step 4b);
+│                              logs to logs/daily/daily_run_YYYYMMDD.log.  Backfill runs TWICE,
+│                              bracketing the runner.  Step 3b populates the walk-forward rows that
+│                              train_models.py just wrote (and survives even if the runner later fails).
+│                              Step 4b (added 2026-06-02) re-runs AFTER the runner because signal_runner
+│                              Phase 1 reconciles off-cycle live IBKR fills into trade_log as source='live'
+│                              rows — those land *after* Step 3b, so without a second pass today's live
+│                              exits show NULL benchmark_return_pct and silently drop out of Page 10's
+│                              benchmark-relative section until tomorrow's Step 3b.  (Bug found 2026-06-02:
+│                              the MRVL TP exit reconciled that morning was missing from the SPY-relative
+│                              view for exactly this reason.)  Both passes are idempotent (WHERE
+│                              benchmark_return_pct IS NULL).
 ├── run_weekly.bat           — Sunday scheduler: universe_scheduler.py --run-now → run_pipeline.py →
 │                              train_models.py --force → backfill_benchmark_returns.py;
 │                              logs to logs/weekly/weekly_run_YYYYMMDD.log.  Universe refresh runs
