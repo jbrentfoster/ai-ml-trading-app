@@ -81,7 +81,23 @@ async def _run(args, symbols, since, min_chars):
 
     print(f"Symbols: {len(symbols)} | articles needing body (last {args.days}d): {len(rows)}")
     if not rows:
-        print("Nothing to ingest.")
+        # Diagnose WHY, so ad-hoc symbol testing isn't a guessing game.  The
+        # common case: a non-universe symbol whose cached news is stale (no
+        # fresh fetch since it rotated out) and falls outside the --days window.
+        all_needing = [r for r in get_news_needing_body(symbols, datetime(2000, 1, 1))
+                       if "$" in r["article_id"]]
+        if all_needing:
+            now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+            newest = max(r["published_at"] for r in all_needing)
+            age = (now_naive - newest).days
+            print(f"  -> 0 in the last {args.days}d, but {len(all_needing)} cached IBKR "
+                  f"article(s) need a body (newest {newest:%Y-%m-%d}, ~{age}d old). "
+                  f"These symbols look stale (likely rotated out of the universe). "
+                  f"Widen the window: --days {age + 1}")
+        else:
+            print("  -> No cached IBKR news needing a body for these symbols. Fetch "
+                  "news first -- run_pipeline.py only fetches news for ACTIVE-universe "
+                  "symbols, so a non-universe symbol won't have headlines cached.")
         return
 
     from ib_insync import IB, util

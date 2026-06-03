@@ -1095,6 +1095,16 @@ def set_news_body(symbol: str, article_id: str, body: str) -> bool:
     return False
 
 
+def get_news_body(symbol: str, article_id: str) -> str | None:
+    """Return the stored full article text for one article, or None."""
+    engine = get_engine()
+    with Session(engine) as session:
+        row = session.query(NewsCache.body).filter_by(
+            symbol=symbol, article_id=article_id
+        ).first()
+    return row[0] if row else None
+
+
 def get_news_needing_body(symbols: list[str] | None, since: datetime) -> list[dict]:
     """News rows (optionally restricted to ``symbols``) since ``since`` whose
     body is still NULL — the work list for scripts/ingest_news_bodies.py."""

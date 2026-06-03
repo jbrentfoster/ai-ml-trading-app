@@ -26,7 +26,11 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from config.settings import config
-from data.ui_queries import query_llm_news_analysis, query_llm_analysis_options
+from data.ui_queries import (
+    query_llm_news_analysis,
+    query_llm_analysis_options,
+    query_news_body,
+)
 
 TEAL = "#26a69a"
 RED = "#ef5350"
@@ -39,6 +43,41 @@ st.caption(
     "engine** — a research signal. Each *event* score is the mean of every "
     "article read about that event; re-reports of one story are merged."
 )
+
+with st.expander("ℹ️ How to read this page — columns & scoring"):
+    st.markdown(
+        """
+**Columns**
+- **Ticker** — the company the article is *about* (resolved from the text).
+  **Feed** — the IBKR symbol tag it arrived under. **Mism** ✓ = they differ
+  (these are misattributed by the headline-only FinBERT path).
+- **Bias** — bullish / bearish / neutral (the sign of the score).
+- **Score** — composite sentiment, −1…+1 (formula below).
+- **Mag** = **Magnitude** (1–5): how *material* the news is to the stock.
+- **Nov** = **Novelty** (1–5): how *new / surprising* it is vs already-known.
+- **Conf** = **Confidence** (1–5): the model's self-rated confidence it
+  understood the article.
+- **Arts** — how many articles were merged into this event (re-reports of one
+  story collapse into a single event).
+
+**How the score is computed** — deterministic: the LLM supplies the fields,
+we do the arithmetic (so it's transparent and tunable):
+
+```
+sign      = +1 bullish / −1 bearish / 0 neutral
+intensity = Magnitude / 5                     ← Mag drives the size
+nov_mult  = 0.5 + 0.5 × (Novelty / 5)         ← already-known news discounted
+score     = sign × intensity × nov_mult       (clamped to −1…+1)
+```
+
+- **Mag and Nov are inputs to the score.** e.g. bearish, Mag 4, Nov 3 →
+  −1 × 0.80 × 0.80 = **−0.64**.
+- **Conf is *not* in the score** — it's used only to pick which article's
+  headline/summary to *display* as an event's representative.
+- An **event's** score is the **mean** of all its articles' composite scores.
+- The novelty floor (0.5) is `config.llm.novelty_discount_floor`.
+"""
+    )
 
 
 def _sign_label(score) -> str:
@@ -68,12 +107,16 @@ if df.empty:
     st.stop()
 
 # ── Build the event-level frame (one row per event) ───────────────────────────
-events = df[df["is_representative"]].copy()
-events["ticker"] = events["attributed_symbol"].fillna(events["symbol"])
-events["score"] = events["event_score"]          # mean of all reads (score of record)
-events["bias"] = events["score"].map(_sign_label)
+events_all = df[df["is_representative"]].copy()
+events_all["ticker"] = events_all["attributed_symbol"].fillna(events_all["symbol"])
+events_all["score"] = events_all["event_score"]   # mean of all reads (score of record)
+events_all["bias"] = events_all["score"].map(_sign_label)
 
+# Events whose every read failed to parse have no score — exclude them from the
+# table/aggregates (they'd render as nan) but keep the count visible.
 n_articles = len(df)
+n_unscored = int(events_all["score"].isna().sum())
+events = events_all[events_all["score"].notna()].copy()
 n_events = len(events)
 
 # Remaining sidebar filters (built from what's present)
@@ -116,11 +159,16 @@ if mismatch_only:
 filt = filt[filt["score"].abs() >= min_abs]
 filt = filt[filt["magnitude"].fillna(0) >= min_mag]
 
+_unscored_note = (
+    f" · {n_unscored} event(s) excluded — the model's output didn't parse "
+    "(usually a truncated entities list on a multi-company digest; see Research → "
+    "Parse failures)." if n_unscored else ""
+)
 st.caption(
     f"{len(filt)} of {n_events} events after filters. Sort by clicking a column "
     "header. **Ticker** = the company the article is *about* (resolved); "
     "**Feed** = the IBKR tag it arrived under — when they differ, the current "
-    "system misattributes it."
+    f"system misattributes it.{_unscored_note}"
 )
 
 table = filt[[
@@ -173,7 +221,7 @@ if sel:
     for _, ev in sub.sort_values("published_at", ascending=False).iterrows():
         sc = ev["score"]
         badge = "🟢" if sc > 0.05 else ("🔴" if sc < -0.05 else "⚪")
-        mism = " · 🎯 about " + str(ev["primary_entity"]) if ev["attribution_mismatch"] else ""
+        mism = " · ↪️ actually about " + str(ev["primary_entity"]) if ev["attribution_mismatch"] else ""
         n = int(ev["event_size"])
         title = f"{badge} {sc:+.2f}{mism} · {ev['published_at']:%m-%d} · {ev['headline'][:80]}"
         with st.expander(title):
@@ -205,6 +253,24 @@ if sel:
                     "Published": st.column_config.DatetimeColumn(format="MM-DD HH:mm", width="small"),
                     "Score": st.column_config.NumberColumn(format="%+.2f", width="small"),
                 })
+
+            # Full article text (lazy — fetched on demand, bodies are large)
+            st.markdown("**Full article text** — the source the model scored:")
+            opt_map = {
+                f"{pd.to_datetime(r['published_at']):%m-%d %H:%M} · {(r['headline'] or '')[:75]}":
+                    (r["symbol"], r["article_id"])
+                for _, r in members.iterrows()
+            }
+            pick = st.selectbox("Article", list(opt_map.keys()),
+                                key=f"bodysel_{ev['event_id']}",
+                                label_visibility="collapsed")
+            bsym, baid = opt_map[pick]
+            body = query_news_body(bsym, baid)
+            st.text_area(
+                "body", body or "(full body not stored for this article — "
+                "only IBKR-sourced articles with ≥800 chars are ingested)",
+                height=300, key=f"bodytxt_{ev['event_id']}",
+                label_visibility="collapsed")
 
 st.divider()
 

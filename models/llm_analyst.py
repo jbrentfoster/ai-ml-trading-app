@@ -50,7 +50,7 @@ EXTRACTION_PROMPT = """You are a financial news analyst. Read the article and re
 - novelty: integer 1-5 — how new/surprising this is vs already-known (5 = genuinely new information)
 - confidence: integer 1-5 — your confidence that you understood the article correctly
 - primary_entity: the single company the article is MOST about (the one whose stock is most affected)
-- entities: list of all company/person names mentioned
+- entities: list of up to 6 of the MOST relevant company names (do NOT enumerate long digests/insider lists)
 - direct_score: number between -1.0 and 1.0 — your own overall sentiment estimate for the primary company
 - summary: one sentence, max 25 words
 - rationale: one short phrase explaining the direction/magnitude call
@@ -119,6 +119,11 @@ def resolve_ticker(primary_entity: str | None, name_map: dict) -> str | None:
     direct = primary_entity.strip().upper()
     if direct in name_map:
         return direct
+    # The LLM often appends the ticker in parentheses, e.g.
+    # "T-Mobile US Inc (TMUS)".  Trust it only when it's a ticker we track.
+    paren = re.search(r"\(([A-Za-z]{1,6})\)", primary_entity)
+    if paren and paren.group(1).upper() in name_map:
+        return paren.group(1).upper()
     pe_tokens = set(normalize_company_name(primary_entity).split())
     if not pe_tokens:
         return None

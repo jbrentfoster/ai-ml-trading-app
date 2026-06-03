@@ -43,6 +43,15 @@ class TestAttribution:
         assert resolve_ticker("Broadcom", _NAME_MAP) == "AVGO"
         assert resolve_ticker("NVIDIA Corporation", _NAME_MAP) == "NVDA"
 
+    def test_resolve_parenthetical_ticker(self):
+        # LLM appended the ticker in parentheses; it's tracked -> use it
+        nm = {**_NAME_MAP, "TMUS": ["TMUS", "T-Mobile US, Inc. Common Stock"]}
+        assert resolve_ticker("T-Mobile US Inc (TMUS)", nm) == "TMUS"
+
+    def test_parenthetical_ticker_untracked_falls_through(self):
+        # parenthetical ticker we don't track -> not returned (stays None here)
+        assert resolve_ticker("Obscure Co (ZZZZ)", _NAME_MAP) is None
+
     def test_resolve_unknown_company(self):
         assert resolve_ticker("Some Private Startup", _NAME_MAP) is None
 

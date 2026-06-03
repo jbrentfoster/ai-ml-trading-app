@@ -1342,6 +1342,14 @@ def query_llm_news_analysis(
     return df
 
 
+@st.cache_data(ttl=600)
+def query_news_body(symbol: str, article_id: str) -> str | None:
+    """Full article text for one article (lazy — bodies are large, so they're
+    fetched on demand from the drill-down rather than loaded into the frame)."""
+    from data.database import get_news_body
+    return get_news_body(symbol, article_id)
+
+
 @st.cache_data(ttl=120)
 def query_llm_analysis_options(days: int = 30) -> dict:
     """Distinct models + symbols present in llm_news_analysis (for filters)."""
