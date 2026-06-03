@@ -38,7 +38,7 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import datetime
 
-from models.llm_analyst import normalize_company_name
+from models.llm_analyst import ATTR_DIGEST, normalize_company_name
 
 # light stopword set so "surges ON x" vs "surges AFTER x" don't drag similarity down
 _STOP = {
@@ -87,8 +87,11 @@ def _rep_sortkey(a: dict):
 
 
 def _event_key(a: dict) -> str:
-    """The strong grouping signal: resolved ticker, else normalized company
-    name, else the feed symbol."""
+    """The strong grouping signal: digests cluster by headline (they have no
+    single subject — keep them out of any ticker's bucket); otherwise resolved
+    ticker, else normalized company name, else the feed symbol."""
+    if a.get("is_digest") or a.get("attribution_status") == ATTR_DIGEST:
+        return "digest:" + (normalize_company_name(a.get("headline")) or "na")
     att = a.get("attributed_symbol")
     if att:
         return str(att).upper()

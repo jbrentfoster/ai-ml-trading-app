@@ -33,7 +33,9 @@ from data.database import (                   # noqa: E402
     get_universe_assets,
     upsert_llm_analysis,
 )
-from models.llm_analyst import LLMNewsAnalyst, resolve_attribution  # noqa: E402
+from models.llm_analyst import (  # noqa: E402
+    LLMNewsAnalyst, resolve_attribution_status, status_is_mismatch, ATTR_DIGEST,
+)
 
 log = get_logger("scripts.score_news_llm")
 
@@ -90,12 +92,18 @@ def main():
         return
 
     scored = parse_failures = 0
-    reattributed = 0
+    reattributed = digests = 0
     for i, r in enumerate(rows):
         res = analyst.analyse(r["body"])
-        attributed, mismatch = resolve_attribution(res.primary_entity, r["symbol"], name_map)
+        # Headline-aware so multi-company digests aren't counted/flagged as
+        # re-attributions (attributed_symbol is advisory — read path re-resolves).
+        attributed, status = resolve_attribution_status(
+            res.primary_entity, r["symbol"], name_map, headline=r["headline"])
+        mismatch = status_is_mismatch(status)
         if mismatch:
             reattributed += 1
+        if status == ATTR_DIGEST:
+            digests += 1
 
         upsert_llm_analysis({
             "symbol":            r["symbol"],
@@ -134,9 +142,10 @@ def main():
               f"{res.direction or '?':7s} mag={res.magnitude} nov={res.novelty} "
               f"| {res.duration_ms/1000:4.1f}s | {(res.summary or '')[:60]}")
 
-    print(f"\nScored {scored} | parse failures {parse_failures} | re-attributed {reattributed} (of {len(rows)})")
-    log.info("LLM scoring: scored=%d parse_failures=%d reattributed=%d model=%s",
-             scored, parse_failures, reattributed, model)
+    print(f"\nScored {scored} | parse failures {parse_failures} | "
+          f"re-attributed {reattributed} | digests {digests} (of {len(rows)})")
+    log.info("LLM scoring: scored=%d parse_failures=%d reattributed=%d digests=%d model=%s",
+             scored, parse_failures, reattributed, digests, model)
 
 
 if __name__ == "__main__":

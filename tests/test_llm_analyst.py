@@ -18,6 +18,13 @@ from models.llm_analyst import (
     normalize_company_name,
     resolve_ticker,
     resolve_attribution,
+    resolve_attribution_status,
+    status_is_mismatch,
+    is_digest,
+    ATTR_MATCHED,
+    ATTR_REATTRIBUTED,
+    ATTR_UNTRACKED,
+    ATTR_DIGEST,
 )
 
 
@@ -79,6 +86,77 @@ class TestAttribution:
         attributed, mismatch = resolve_attribution(None, "NVDA", _NAME_MAP)
         assert attributed == "NVDA"
         assert mismatch is False
+
+
+class TestDigestDetection:
+    @pytest.mark.parametrize("headline", [
+        "Substantial Insider Sales: Morning Report",
+        "Substantial Insider Sales: Morning Report -2-",
+        "Substantial Insider Purchases: Morning Report",
+        "Comex Gold Delivery Intentions Breakdown - Jun 3",
+        "HPE, Marvell, Oracle, Google, and More Stocks That Explain Today's Market -- Barrons.com",
+    ])
+    def test_known_digest_headlines(self, headline):
+        assert is_digest(headline) is True
+
+    @pytest.mark.parametrize("headline", [
+        "VP Jensen Sells 1,746 Of NXP Semiconductors NV >NXPI",
+        "NVIDIA Reports Record Quarterly Revenue",
+        "Apple Unveils New iPhone",
+        "",
+        None,
+    ])
+    def test_non_digest_headlines(self, headline):
+        assert is_digest(headline) is False
+
+
+class TestAttributionStatus:
+    def test_matched_when_about_feed_company(self):
+        # the genuine single-company NXPI insider-sale case (the user's report)
+        att, status = resolve_attribution_status(
+            "NVIDIA Corporation", "NVDA", _NAME_MAP,
+            headline="NVIDIA Reports Record Revenue")
+        assert att == "NVDA"
+        assert status == ATTR_MATCHED
+        assert status_is_mismatch(status) is False
+
+    def test_reattributed_to_other_tracked_ticker(self):
+        att, status = resolve_attribution_status(
+            "Broadcom", "NVDA", _NAME_MAP, headline="Broadcom soars on AI demand")
+        assert att == "AVGO"
+        assert status == ATTR_REATTRIBUTED
+        assert status_is_mismatch(status) is True
+
+    def test_untracked_company(self):
+        att, status = resolve_attribution_status(
+            "Private Startup LLC", "NVDA", _NAME_MAP, headline="Startup raises Series A")
+        assert att is None
+        assert status == ATTR_UNTRACKED
+        assert status_is_mismatch(status) is True
+
+    def test_digest_overrides_primary_entity(self):
+        # The NXPI bug: a roundup whose primary_entity is ACEL, tagged NXPI.
+        # Must be a digest (not a mismatch), with no ticker pinned.
+        att, status = resolve_attribution_status(
+            "ACEL", "NXPI", _NAME_MAP,
+            headline="Substantial Insider Sales: Morning Report")
+        assert att is None
+        assert status == ATTR_DIGEST
+        assert status_is_mismatch(status) is False
+
+    def test_no_primary_entity_is_match(self):
+        att, status = resolve_attribution_status(None, "NVDA", _NAME_MAP)
+        assert att == "NVDA"
+        assert status == ATTR_MATCHED
+
+    def test_back_compat_wrapper_matches_status(self):
+        # resolve_attribution() must agree with the status function (no headline)
+        for pe, feed in [("Broadcom", "NVDA"), ("NVIDIA Corporation", "NVDA"),
+                         ("Private Startup LLC", "NVDA"), (None, "NVDA")]:
+            att_w, mism_w = resolve_attribution(pe, feed, _NAME_MAP)
+            att_s, status = resolve_attribution_status(pe, feed, _NAME_MAP)
+            assert att_w == att_s
+            assert mism_w == status_is_mismatch(status)
 
 
 # ── compute_composite_score ───────────────────────────────────────────────────

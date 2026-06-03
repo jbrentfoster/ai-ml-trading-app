@@ -104,6 +104,48 @@ class TestEventClustering:
         out = cluster_news_events(batch)
         assert len({a["event_id"] for a in out}) == 2
 
+    def test_digests_cluster_by_headline_not_feed_symbol(self):
+        # Same "Morning Report" digest broadcast under two different feed tags
+        # (NXPI and AMD) must collapse into ONE event keyed on the digest, not
+        # split per feed symbol nor merge into a real ticker's bucket.
+        def _digest(feed):
+            return {
+                "article_id": f"dig-{feed}", "symbol": feed,
+                "primary_entity": "ACEL", "attributed_symbol": None,
+                "attribution_status": "digest", "is_digest": True,
+                "published_at": datetime.fromisoformat("2026-06-03T08:44:00"),
+                "headline": "Substantial Insider Sales: Morning Report",
+                "summary": "", "confidence": 5, "prompt_tokens": 700,
+                "composite_score": -0.5,
+            }
+        out = cluster_news_events([_digest("NXPI"), _digest("AMD")])
+        assert len({a["event_id"] for a in out}) == 1
+        assert all(a["event_id"].startswith("digest:") for a in out)
+        assert all(a["event_size"] == 2 for a in out)
+
+    def test_digest_does_not_merge_with_real_ticker_event(self):
+        # A digest whose primary_entity is "ACEL" must NOT merge with a genuine
+        # story about a company that resolves to the same name token.
+        digest = {
+            "article_id": "dig1", "symbol": "NXPI", "primary_entity": "Accel",
+            "attributed_symbol": None, "attribution_status": "digest",
+            "is_digest": True,
+            "published_at": datetime.fromisoformat("2026-06-03T08:00:00"),
+            "headline": "Substantial Insider Sales: Morning Report",
+            "summary": "", "confidence": 5, "prompt_tokens": 700,
+            "composite_score": -0.5,
+        }
+        real = {
+            "article_id": "real1", "symbol": "ACEL", "primary_entity": "Accel",
+            "attributed_symbol": "ACEL", "attribution_status": "matched",
+            "is_digest": False,
+            "published_at": datetime.fromisoformat("2026-06-03T09:00:00"),
+            "headline": "Accel beats earnings", "summary": "",
+            "confidence": 4, "prompt_tokens": 700, "composite_score": 0.6,
+        }
+        out = cluster_news_events([digest, real])
+        assert len({a["event_id"] for a in out}) == 2
+
     def test_same_company_same_day_merges_known_tradeoff(self):
         # KNOWN TRADE-OFF: two genuinely different same-day stories about one
         # company merge into one event.  Accepted because text similarity proved

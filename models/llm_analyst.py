@@ -143,26 +143,97 @@ def resolve_ticker(primary_entity: str | None, name_map: dict) -> str | None:
     return None
 
 
-def resolve_attribution(primary_entity: str | None, feed_symbol: str,
-                        name_map: dict) -> tuple[str | None, bool]:
-    """Return (attributed_symbol, mismatch) for one article.
+# Attribution status — read-time classification of one article relative to its
+# IBKR feed tag.  Replaces the old mismatch boolean with a richer signal so the
+# valuable re-attributions (a story tagged NVDA that's really about MRVL) aren't
+# lumped together with multi-company digests that merely *mention* the feed tag.
+ATTR_MATCHED = "matched"            # the article is about the feed symbol
+ATTR_REATTRIBUTED = "reattributed"  # about a DIFFERENT tracked ticker (the value-add)
+ATTR_UNTRACKED = "untracked"        # about one company we don't track
+ATTR_DIGEST = "digest"              # multi-company roundup — no single subject
+
+# A "mismatch" in the headline-only-path-got-it-wrong sense is only the first
+# two of those.  A digest is NOT a mismatch: the feed symbol legitimately
+# appears in it, alongside dozens of others.
+_MISMATCH_STATUSES = frozenset({ATTR_REATTRIBUTED, ATTR_UNTRACKED})
+
+# Recurring multi-company digest / tabular market-data headlines (mostly Dow
+# Jones).  These enumerate dozens of companies, so the LLM's single
+# ``primary_entity`` pick is arbitrary and the per-company sentiment is noise.
+# The same digest is broadcast under many feed tags, so a headline-based check
+# reclassifies every copy in one read-time pass.  Deliberately conservative
+# (high precision over recall) — extend as new recurring formats surface.
+_DIGEST_HEADLINE_PATTERNS = (
+    re.compile(r"\bsubstantial insider (sales|purchases)\b", re.I),
+    re.compile(r"\binsider (sales|purchases):\s*morning report", re.I),
+    re.compile(r"\bdelivery intentions\b", re.I),          # "Comex Gold Delivery Intentions Breakdown"
+    re.compile(r"\bstocks that explain (today'?s|the) market", re.I),  # Barron's market wrap
+    re.compile(r",\s*and more stocks\b", re.I),            # "HPE, Marvell, ... and More Stocks ..."
+)
+
+
+def is_digest(headline: str | None) -> bool:
+    """True when an article is a multi-company digest / tabular market-data
+    roundup (e.g. 'Substantial Insider Sales: Morning Report', 'Comex Gold
+    Delivery Intentions') rather than a story about one company.
+
+    Such articles list many tickers; the feed symbol legitimately appears among
+    them, so they must NOT be scored as that symbol's sentiment nor flagged as an
+    attribution mismatch.  Detection is headline-based (high precision; the body
+    isn't in the dashboard read frame) and conservative — extend
+    ``_DIGEST_HEADLINE_PATTERNS`` as new recurring formats appear."""
+    h = (headline or "").strip()
+    return any(p.search(h) for p in _DIGEST_HEADLINE_PATTERNS)
+
+
+def status_is_mismatch(status: str | None) -> bool:
+    """Whether an attribution status counts as a feed-tag mismatch — i.e. the
+    article is about a *different* tracked ticker (re-attributed) or an untracked
+    company.  Matches and digests are NOT mismatches."""
+    return status in _MISMATCH_STATUSES
+
+
+def resolve_attribution_status(
+    primary_entity: str | None,
+    feed_symbol: str,
+    name_map: dict,
+    headline: str | None = None,
+) -> tuple[str | None, str]:
+    """Return ``(attributed_symbol, status)`` for one article, where ``status``
+    is one of ATTR_MATCHED / ATTR_REATTRIBUTED / ATTR_UNTRACKED / ATTR_DIGEST.
 
     * attributed_symbol = the ticker the article is *about* (the company whose
-      stock the sentiment should attach to), or None when it's some company we
-      don't track.
-    * mismatch = True when the article is clearly NOT about its feed-tag symbol
-      (a different known ticker, or an untracked company that isn't the feed
-      company).  These are the rows the headline-only path misattributes."""
-    if not primary_entity:
-        return feed_symbol, False
+      stock the sentiment should attach to), or None for digests and untracked
+      companies — neither should pin sentiment onto the feed symbol.
+    * Digests are detected first (no single subject); they never resolve to a
+      ticker.  Only ATTR_REATTRIBUTED / ATTR_UNTRACKED are "mismatches"
+      (``status_is_mismatch``) — a digest is not, since the feed symbol is
+      genuinely one of the many companies it covers."""
+    if is_digest(headline):
+        return None, ATTR_DIGEST
     feed = feed_symbol.upper()
+    if not primary_entity:
+        return feed_symbol, ATTR_MATCHED
     resolved = resolve_ticker(primary_entity, name_map)
     if resolved is not None:
-        return resolved, (resolved != feed)
+        return resolved, (ATTR_MATCHED if resolved == feed else ATTR_REATTRIBUTED)
     # Unresolved company: is it at least the feed company under a name we have?
     feed_variants = name_map.get(feed, [feed_symbol])
     matches_feed = resolve_ticker(primary_entity, {feed: feed_variants}) is not None
-    return (feed if matches_feed else None), (not matches_feed)
+    if matches_feed:
+        return feed, ATTR_MATCHED
+    return None, ATTR_UNTRACKED
+
+
+def resolve_attribution(primary_entity: str | None, feed_symbol: str,
+                        name_map: dict) -> tuple[str | None, bool]:
+    """Back-compat wrapper returning ``(attributed_symbol, mismatch)``.
+
+    Does NOT detect digests (no headline is passed) — callers wanting digest
+    handling should use ``resolve_attribution_status``.  Retained for existing
+    callers/tests; the dashboard read path uses the richer status function."""
+    attributed, status = resolve_attribution_status(primary_entity, feed_symbol, name_map)
+    return attributed, status_is_mismatch(status)
 
 
 # ── scoring (pure, unit-tested) ───────────────────────────────────────────────

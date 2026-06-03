@@ -1320,13 +1320,20 @@ def query_llm_news_analysis(
     # Resolve attribution at READ time from the stored primary_entity, so the
     # heuristic can improve without re-running the 8B over every article.
     from data.database import build_company_name_map
-    from models.llm_analyst import resolve_attribution
+    from models.llm_analyst import (
+        resolve_attribution_status, status_is_mismatch, ATTR_DIGEST,
+    )
     name_map = build_company_name_map()
     resolved = df.apply(
-        lambda r: resolve_attribution(r["primary_entity"], r["symbol"], name_map),
+        lambda r: resolve_attribution_status(
+            r["primary_entity"], r["symbol"], name_map, headline=r.get("headline")),
         axis=1)
     df["attributed_symbol"] = [a for a, _ in resolved]
-    df["attribution_mismatch"] = [m for _, m in resolved]
+    df["attribution_status"] = [s for _, s in resolved]
+    # Boolean kept for back-compat; digests are NOT mismatches (the feed symbol
+    # legitimately appears among the many companies a roundup covers).
+    df["attribution_mismatch"] = df["attribution_status"].map(status_is_mismatch)
+    df["is_digest"] = df["attribution_status"] == ATTR_DIGEST
 
     # Cluster near-duplicate articles into events (read-time — see
     # data/news_dedup.py).  Adds event_id / event_size / is_representative, plus
