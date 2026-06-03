@@ -77,10 +77,27 @@ def main():
     name_map = build_company_name_map()
 
     rows = get_news_for_scoring(symbols, since, model, min_chars=min_chars)
-    if args.limit:
-        rows = rows[: args.limit]
 
-    print(f"Model: {model} | symbols: {len(symbols)} | unscored articles (last {days}d): {len(rows)}")
+    # The same article is broadcast under many feed symbols (identical
+    # article_id + body): e.g. a DJ insider-sales digest tagged to 14 tickers.
+    # The body is byte-identical, so the 8B extraction is too — score each
+    # distinct article ONCE (the expensive call) and fan the result out to every
+    # feed-symbol row.  Attribution is still computed per feed row (cheap, no
+    # LLM) since it depends on the feed tag.  This is lossless; the read path
+    # re-resolves attribution anyway.  --limit caps distinct articles (= LLM
+    # calls), so group first then truncate (never split a group across runs).
+    groups: dict[str, list[dict]] = {}
+    for r in rows:
+        groups.setdefault(r["article_id"], []).append(r)
+    article_ids = list(groups)
+    if args.limit:
+        article_ids = article_ids[: args.limit]
+
+    n_calls = len(article_ids)
+    n_rows = sum(len(groups[a]) for a in article_ids)
+    print(f"Model: {model} | symbols: {len(symbols)} | unscored rows (last {days}d): "
+          f"{len(rows)} | distinct articles to score: {n_calls} "
+          f"(de-duped {len(rows) - len(groups)} broadcast copies)")
     if not rows:
         print("Nothing to score.")
         return
@@ -92,60 +109,71 @@ def main():
         return
 
     scored = parse_failures = 0
-    reattributed = digests = 0
-    for i, r in enumerate(rows):
-        res = analyst.analyse(r["body"])
-        # Headline-aware so multi-company digests aren't counted/flagged as
-        # re-attributions (attributed_symbol is advisory — read path re-resolves).
-        attributed, status = resolve_attribution_status(
-            res.primary_entity, r["symbol"], name_map, headline=r["headline"])
-        mismatch = status_is_mismatch(status)
-        if mismatch:
-            reattributed += 1
-        if status == ATTR_DIGEST:
-            digests += 1
+    reattributed = digests = fanned = 0
+    for i, aid in enumerate(article_ids):
+        members = groups[aid]
+        # Bodies should be identical across feed tags; pick the longest
+        # defensively in case one feed's ingestion truncated.
+        rep = max(members, key=lambda m: len(m["body"] or ""))
+        res = analyst.analyse(rep["body"])  # the single expensive call per article
 
-        upsert_llm_analysis({
-            "symbol":            r["symbol"],
-            "article_id":        r["article_id"],
-            "model":             model,
-            "provider":          r["provider"],
-            "published_at":      r["published_at"],
-            "headline":          r["headline"],
-            "event_type":        res.event_type,
-            "direction":         res.direction,
-            "magnitude":         res.magnitude,
-            "time_horizon":      res.time_horizon,
-            "novelty":           res.novelty,
-            "confidence":        res.confidence,
-            "entities":          json.dumps(res.entities, ensure_ascii=False),
-            "primary_entity":    res.primary_entity,
-            "attributed_symbol": attributed,
-            "summary":           res.summary,
-            "rationale":         res.rationale,
-            "composite_score":   res.composite_score,
-            "llm_direct_score":  res.llm_direct_score,
-            "raw_response":      res.raw_response,
-            "prompt_tokens":     res.prompt_tokens,
-            "output_tokens":     res.output_tokens,
-            "duration_ms":       res.duration_ms,
-            "parse_ok":          res.parse_ok,
-        })
+        for r in members:
+            # Headline-aware so multi-company digests aren't counted/flagged as
+            # re-attributions (attributed_symbol is advisory — read path
+            # re-resolves).  Per feed row because status depends on the feed tag.
+            attributed, status = resolve_attribution_status(
+                res.primary_entity, r["symbol"], name_map, headline=r["headline"])
+            mismatch = status_is_mismatch(status)
+            if mismatch:
+                reattributed += 1
+            if status == ATTR_DIGEST:
+                digests += 1
 
-        if res.parse_ok:
-            scored += 1
-        else:
-            parse_failures += 1
-        flag = f" ~{(res.primary_entity or '?')[:10]}" if mismatch else ""
+            upsert_llm_analysis({
+                "symbol":            r["symbol"],
+                "article_id":        r["article_id"],
+                "model":             model,
+                "provider":          r["provider"],
+                "published_at":      r["published_at"],
+                "headline":          r["headline"],
+                "event_type":        res.event_type,
+                "direction":         res.direction,
+                "magnitude":         res.magnitude,
+                "time_horizon":      res.time_horizon,
+                "novelty":           res.novelty,
+                "confidence":        res.confidence,
+                "entities":          json.dumps(res.entities, ensure_ascii=False),
+                "primary_entity":    res.primary_entity,
+                "attributed_symbol": attributed,
+                "summary":           res.summary,
+                "rationale":         res.rationale,
+                "composite_score":   res.composite_score,
+                "llm_direct_score":  res.llm_direct_score,
+                "raw_response":      res.raw_response,
+                "prompt_tokens":     res.prompt_tokens,
+                "output_tokens":     res.output_tokens,
+                "duration_ms":       res.duration_ms,
+                "parse_ok":          res.parse_ok,
+            })
+
+            if res.parse_ok:
+                scored += 1
+            else:
+                parse_failures += 1
+        fanned += len(members) - 1
+
+        fan = f" ×{len(members)}" if len(members) > 1 else "   "
         score_s = f"{res.composite_score:+.2f}" if res.composite_score is not None else "  n/a"
-        print(f"  [{i+1:3d}/{len(rows)}] {r['symbol']:5s}{flag:8s} {score_s} "
+        print(f"  [{i+1:3d}/{n_calls}] {rep['symbol']:5s}{fan} {score_s} "
               f"{res.direction or '?':7s} mag={res.magnitude} nov={res.novelty} "
-              f"| {res.duration_ms/1000:4.1f}s | {(res.summary or '')[:60]}")
+              f"| {res.duration_ms/1000:4.1f}s | {(rep['headline'] or '')[:60]}")
 
-    print(f"\nScored {scored} | parse failures {parse_failures} | "
-          f"re-attributed {reattributed} | digests {digests} (of {len(rows)})")
-    log.info("LLM scoring: scored=%d parse_failures=%d reattributed=%d digests=%d model=%s",
-             scored, parse_failures, reattributed, digests, model)
+    print(f"\nScored {scored} row(s) from {n_calls} LLM call(s) "
+          f"({fanned} fanned out from broadcast copies) | "
+          f"parse failures {parse_failures} | re-attributed {reattributed} | digests {digests}")
+    log.info("LLM scoring: rows=%d llm_calls=%d fanned=%d parse_failures=%d "
+             "reattributed=%d digests=%d model=%s",
+             scored, n_calls, fanned, parse_failures, reattributed, digests, model)
 
 
 if __name__ == "__main__":
