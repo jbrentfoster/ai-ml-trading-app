@@ -718,10 +718,13 @@ if st.session_state.ibkr_data:
         unknown_note = ""
         if not unknown_held.empty:
             unknown_note = (
-                f"  \n⚠ **Unmapped symbols (Sector = 'Unknown'):** "
-                f"{unknown_held.iloc[0]}.  PortfolioGuard's sector check "
-                "passes these through silently — add to `_SECTOR_MAP` in "
-                "`risk/portfolio_guard.py` to bring them under the cap."
+                f"  \n⚠ **Unclassified symbols (Sector = 'Unknown'):** "
+                f"{unknown_held.iloc[0]}.  Sector resolves from the hardcoded "
+                "`_SECTOR_MAP` (ETFs/fixtures) then the yfinance sector stored "
+                "in `fundamental_data` — 'Unknown' means a symbol has no "
+                "fundamentals row yet (run `scripts/run_pipeline.py` or "
+                "`scripts/backfill_sectors.py`).  PortfolioGuard's sector check "
+                "passes these through silently until then."
             )
 
         st.caption(

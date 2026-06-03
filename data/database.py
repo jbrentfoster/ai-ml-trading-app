@@ -145,6 +145,12 @@ class FundamentalData(Base):
     # Price targets
     analyst_target  = Column(Float)
 
+    # Classification — raw yfinance GICS sector label (e.g. "Technology",
+    # "Financial Services").  Normalised to the project's simplified scheme at
+    # read time in risk/portfolio_guard.py:get_sector.  NULL until the next
+    # fundamentals fetch back-fills it.
+    sector          = Column(String(40))
+
 
 class NewsCache(Base):
     """Alpaca news article with FinBERT sentiment score."""
@@ -778,6 +784,23 @@ def _migrate(engine) -> None:
                 ))
                 conn.commit()
 
+            # fundamental_data.sector  (data-driven sector classification —
+            # raw yfinance GICS label captured at fetch time; normalised to the
+            # project scheme at read time in risk/portfolio_guard.py:get_sector
+            # so the weekly-rotating universe no longer calcifies the hardcoded
+            # _SECTOR_MAP).  NULL until the next fundamentals fetch back-fills it.
+            fd_cols = {
+                row[1] for row in conn.execute(
+                    text("PRAGMA table_info('fundamental_data')")
+                ).fetchall()
+            }
+            if "sector" not in fd_cols:
+                conn.execute(text(
+                    "ALTER TABLE fundamental_data ADD COLUMN sector VARCHAR(40)"
+                ))
+                conn.commit()
+                log.info("Migration applied: fundamental_data.sector")
+
 
 # ── OHLCV helpers ─────────────────────────────────────────────────────────────
 
@@ -1000,6 +1023,26 @@ def get_fundamentals(symbol: str) -> dict | None:
     if not row:
         return None
     return {c.name: getattr(row, c.name) for c in FundamentalData.__table__.columns}
+
+
+def get_latest_sector(symbol: str) -> str | None:
+    """Return the latest non-NULL raw yfinance sector label for `symbol`, or None.
+
+    Reads from the append-only fundamental_data history (newest first).  The
+    raw GICS label is normalised to the project's simplified scheme by the
+    caller (risk/portfolio_guard.py:get_sector).  Returns None when the symbol
+    has no fundamentals row yet, or every row predates the sector back-fill.
+    """
+    engine = get_engine()
+    with Session(engine) as session:
+        row = (
+            session.query(FundamentalData.sector)
+            .filter(FundamentalData.symbol == symbol)
+            .filter(FundamentalData.sector.isnot(None))
+            .order_by(FundamentalData.fetched_at.desc())
+            .first()
+        )
+    return row[0] if row else None
 
 
 def get_fundamentals_history(symbol: str, limit: int | None = None) -> list[dict]:

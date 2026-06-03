@@ -82,6 +82,11 @@ class FundamentalsClient:
             "current_ratio":   _safe_float(info.get("currentRatio")),
             "free_cashflow":   _safe_float(info.get("freeCashflow")),
             "analyst_target":  _safe_float(info.get("targetMeanPrice")),
+            # Raw yfinance GICS sector label (e.g. "Technology", "Financial
+            # Services").  Normalised to the project scheme at read time in
+            # risk/portfolio_guard.py:get_sector.  None when yfinance omits it
+            # (common for ETFs — those stay covered by the hardcoded _SECTOR_MAP).
+            "sector":          (info.get("sector") or None),
         }
 
         upsert_fundamentals(symbol, data)

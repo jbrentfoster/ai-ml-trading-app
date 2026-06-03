@@ -537,35 +537,112 @@ class TestPortfolioGuard:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# _SECTOR_MAP coverage of the active universe
+# Data-driven sector classification (map → yfinance-fundamentals fallback)
 # ─────────────────────────────────────────────────────────────────────────────
 
-class TestSectorMapCoverage:
-    """Regression guard for sector-map coverage.
+class TestGetSector:
+    """get_sector() two-tier lookup: hardcoded _SECTOR_MAP → fundamental_data."""
 
-    The 2026-05-12 expansion mapped the entire active universe to a sector.
-    Future universe additions must extend `_SECTOR_MAP` too — otherwise the
-    30%-per-sector cap silently passes those symbols.  This test makes the
-    gap loud.  When a new symbol is added to `universe_assets` but not the
-    map, this test names it.
-    """
+    def _seed_sector(self, engine, symbol: str, sector: str | None):
+        from data.database import FundamentalData
+        with Session(engine) as session:
+            session.add(FundamentalData(
+                symbol=symbol, fetched_at=_now(), sector=sector,
+            ))
+            session.commit()
 
-    def test_every_active_universe_symbol_is_mapped(self, mem_engine):
-        from sqlalchemy import text
-        from risk.portfolio_guard import _SECTOR_MAP
-        rows = mem_engine.connect().execute(
-            text("SELECT symbol FROM universe_assets WHERE active = 1")
-        ).fetchall()
-        active = [r[0] for r in rows]
-        # When the in-memory DB is empty (typical for this fixture), the test
-        # is a no-op — the production DB coverage check is what we care about.
-        if not active:
-            pytest.skip("no active universe rows in test DB — coverage check is a no-op")
-        unmapped = sorted(s for s in active if s.upper() not in _SECTOR_MAP)
-        assert not unmapped, (
-            f"{len(unmapped)} active-universe symbols missing from _SECTOR_MAP: "
-            f"{unmapped}. Add them to risk/portfolio_guard.py."
+    def test_normalize_maps_gics_labels(self):
+        from risk.portfolio_guard import _normalize_yf_sector
+        assert _normalize_yf_sector("Financial Services") == "Financials"
+        assert _normalize_yf_sector("Consumer Cyclical") == "Consumer Disc"
+        assert _normalize_yf_sector("Communication Services") == "Telecom"
+        assert _normalize_yf_sector("Basic Materials") == "Materials"
+        assert _normalize_yf_sector("Technology") == "Technology"
+        # Unknown label passes through verbatim (not silently dropped).
+        assert _normalize_yf_sector("Spaceships") == "Spaceships"
+        assert _normalize_yf_sector(None) is None
+        assert _normalize_yf_sector("") is None
+
+    def test_hardcoded_map_takes_precedence(self, mem_engine):
+        """An ETF/fixture in _SECTOR_MAP resolves from the map, never the DB."""
+        from risk.portfolio_guard import get_sector
+        # Even with a contradictory DB row, the map wins for mapped symbols.
+        self._seed_sector(mem_engine, "AAPL", "Financial Services")
+        assert get_sector("SPY") == "Broad Market"
+        assert get_sector("AAPL") == "Technology"  # map, not the seeded DB value
+
+    def test_db_fallback_resolves_unmapped_symbol(self, mem_engine):
+        """A symbol absent from the map resolves via fundamental_data.sector."""
+        from risk.portfolio_guard import get_sector
+        # MRVL is NOT in _SECTOR_MAP (it's a recent-rotation semi name).
+        self._seed_sector(mem_engine, "MRVL", "Technology")
+        self._seed_sector(mem_engine, "MS", "Financial Services")
+        assert get_sector("MRVL") == "Technology"
+        assert get_sector("MS") == "Financials"
+
+    def test_db_fallback_uses_latest_non_null_row(self, mem_engine):
+        """The newest non-NULL sector row wins; NULL rows are ignored."""
+        from data.database import FundamentalData
+        from risk.portfolio_guard import get_sector
+        old = _now() - timedelta(days=2)
+        new = _now()
+        with Session(mem_engine) as session:
+            session.add(FundamentalData(symbol="NXPI", fetched_at=old, sector="Technology"))
+            # A newer row with NULL sector must not mask the older real value.
+            session.add(FundamentalData(symbol="NXPI", fetched_at=new, sector=None))
+            session.commit()
+        assert get_sector("NXPI") == "Technology"
+
+    def test_unknown_when_neither_tier_resolves(self, mem_engine):
+        """No map entry and no fundamentals row → 'Unknown'."""
+        from risk.portfolio_guard import get_sector
+        assert get_sector("ZZZZ") == "Unknown"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PortfolioGuard sector check now honours the data-driven fallback
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestSectorCheckDataDriven:
+    """The 30%-per-sector cap must fire for unmapped symbols once their sector
+    is known via fundamental_data — previously these slipped through silently."""
+
+    def _guard(self, engine):
+        from risk.circuit_breaker import CircuitBreaker
+        from risk.portfolio_guard import PortfolioGuard
+        return PortfolioGuard(circuit_breaker=CircuitBreaker())
+
+    def _pos_size(self, value: float):
+        from risk.position_sizer import PositionSize
+        return PositionSize(
+            symbol="MRVL", signal="BUY", shares=int(value / 100),
+            entry_price=100.0, stop_price=95.0, take_profit_price=110.0,
+            position_value=value, position_pct=value / 100_000,
+            kelly_fraction_used=0.05, method="fixed",
         )
+
+    def _seed_sector(self, engine, symbol: str, sector: str):
+        from data.database import FundamentalData
+        with Session(engine) as session:
+            session.add(FundamentalData(symbol=symbol, fetched_at=_now(), sector=sector))
+            session.commit()
+
+    def test_unmapped_symbols_block_when_over_cap_via_db(self, mem_engine):
+        guard = self._guard(mem_engine)
+        # AMD + MRVL are both unmapped semis; resolve both to Technology via DB.
+        self._seed_sector(mem_engine, "AMD", "Technology")
+        self._seed_sector(mem_engine, "MRVL", "Technology")
+        positions = {
+            "AMD": {"shares": 140, "entry_price": 200, "current_price": 200},  # $28k Tech
+        }
+        result = guard.check(
+            symbol="MRVL", signal="BUY",
+            position_size=self._pos_size(value=5_000),  # +5% Tech → 33%
+            equity=100_000, positions=positions, daily_pnl_pct=0.0,
+        )
+        assert not result.passed
+        assert result.checks.get("sector_exposure") is False
+        assert "Technology" in result.reason
 
 
 # ─────────────────────────────────────────────────────────────────────────────
