@@ -760,3 +760,169 @@ class TestCapitalWeightedROI:
         assert roi["strategy_pnl"] == pytest.approx(50.0)
         # benchmark 0% → strategy_roi is the full edge
         assert roi["dollar_diff"] == pytest.approx(50.0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Trade Forensics helpers (Page 10 drill-down)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _seed_signal(engine, *, symbol="AAA", bar_ts, signal="BUY",
+                 passed_gate=True, ensemble=0.45, lstm=0.5, xgb=0.4,
+                 finbert=0.2, regime="MEAN_REVERTING", gate_reason="pass"):
+    from data.database import SignalLog
+    with Session(engine) as session:
+        session.add(SignalLog(
+            symbol=symbol, generated_at=bar_ts, bar_timestamp=bar_ts,
+            lstm_score=lstm, xgb_score=xgb, finbert_score=finbert,
+            ensemble_score=ensemble, regime=regime, signal=signal,
+            passed_gate=passed_gate, gate_reason=gate_reason,
+        ))
+        session.commit()
+
+
+def _seed_indicator(engine, *, symbol="AAA", ts, rsi=55.0, macd=0.3,
+                    bb_upper=110.0, bb_lower=90.0, atr=2.0):
+    from data.database import IndicatorSnapshot
+    with Session(engine) as session:
+        session.add(IndicatorSnapshot(
+            symbol=symbol, interval="1d", timestamp=ts,
+            rsi_14=rsi, macd=macd, macd_signal=0.1, macd_hist=0.2,
+            bb_upper=bb_upper, bb_middle=100.0, bb_lower=bb_lower,
+            ema_9=100.0, ema_21=100.0, ema_50=100.0,
+            atr_14=atr, volume_sma_20=1e6,
+        ))
+        session.commit()
+
+
+class TestForensicsHelpers:
+
+    def _clear(self):
+        from data.ui_queries import query_indicator_history
+        try:
+            query_indicator_history.clear()
+        except Exception:
+            pass
+
+    def test_indicator_history_clips_and_empty(self, mem_engine):
+        from data.ui_queries import query_indicator_history
+        self._clear()
+        base = datetime(2026, 5, 1)
+        for d in range(5):
+            _seed_indicator(mem_engine, ts=base + timedelta(days=d), rsi=50 + d)
+        df = query_indicator_history("AAA", "1d",
+                                     start_date=base + timedelta(days=1),
+                                     end_date=base + timedelta(days=3))
+        assert not df.empty
+        assert df.index.min() >= pd.Timestamp(base + timedelta(days=1))
+        assert df.index.max() <= pd.Timestamp(base + timedelta(days=3, hours=23))
+        self._clear()
+        assert query_indicator_history("NOPE", "1d").empty
+
+    def test_entry_signal_row_picks_latest_passed_before_entry(self, mem_engine):
+        from data.ui_queries import query_entry_signal_row
+        # Two passed BUYs before entry; the later one (day 3) should win.
+        _seed_signal(mem_engine, bar_ts=datetime(2026, 5, 1), ensemble=0.40)
+        _seed_signal(mem_engine, bar_ts=datetime(2026, 5, 3), ensemble=0.55)
+        # A later one AFTER entry must be ignored.
+        _seed_signal(mem_engine, bar_ts=datetime(2026, 5, 9), ensemble=0.99)
+        row = query_entry_signal_row("AAA", "BUY", datetime(2026, 5, 5))
+        assert row is not None
+        assert row["ensemble_score"] == pytest.approx(0.55)
+
+    def test_entry_signal_row_respects_direction_and_gate(self, mem_engine):
+        from data.ui_queries import query_entry_signal_row
+        # A SELL and a failed BUY before entry — neither should match a BUY query.
+        _seed_signal(mem_engine, bar_ts=datetime(2026, 5, 2), signal="SELL")
+        _seed_signal(mem_engine, bar_ts=datetime(2026, 5, 3), signal="BUY",
+                     passed_gate=False)
+        assert query_entry_signal_row("AAA", "BUY", datetime(2026, 5, 5)) is None
+
+    def test_entry_signal_row_none_when_empty(self, mem_engine):
+        from data.ui_queries import query_entry_signal_row
+        assert query_entry_signal_row("AAA", "BUY", datetime(2026, 5, 5)) is None
+
+    def test_forensics_assembles_all_keys(self, mem_engine):
+        from data.ui_queries import query_trade_forensics
+        self._clear()
+        entry = datetime(2026, 5, 5)
+        exit_ = datetime(2026, 5, 12)
+        _seed_signal(mem_engine, bar_ts=datetime(2026, 5, 4), ensemble=0.5)
+        _seed_indicator(mem_engine, ts=datetime(2026, 5, 4))
+        out = query_trade_forensics("AAA", "BUY", entry, exit_)
+        for k in ("price", "signals", "indicators", "entry_signal", "entry_ind",
+                  "bracket", "post_exit", "benchmark", "benchmark_symbol"):
+            assert k in out
+        assert out["entry_signal"] is not None
+        assert out["entry_ind"] is not None
+        assert out["bracket"] is None          # no order_decisions seeded
+
+    def test_forensics_include_exit_bar_toggle(self, mem_engine):
+        from data.database import OHLCVBar
+        from data.ui_queries import query_bars, query_trade_forensics
+        try:
+            query_bars.clear()
+        except Exception:
+            pass
+        # Exit on 5/12; exit-day bar high is the tallest in the window.
+        exit_day = datetime(2026, 5, 12)
+        with Session(mem_engine) as s:
+            for d, hi in [(11, 105.0), (12, 130.0), (13, 120.0), (14, 118.0)]:
+                ts = datetime(2026, 5, d)
+                s.add(OHLCVBar(symbol="AAA", interval="1d", timestamp=ts,
+                               open=100, high=hi, low=99, close=hi - 1, volume=1e6))
+            s.commit()
+
+        # Excluding the exit bar: peak is from 5/13+ → 120, not the 5/12 high 130.
+        out_excl = query_trade_forensics("AAA", "BUY", datetime(2026, 5, 5),
+                                         exit_day, include_exit_bar=False)
+        assert not out_excl["post_exit"].empty
+        assert float(out_excl["post_exit"]["High"].max()) == pytest.approx(120.0)
+
+        try:
+            query_bars.clear()
+        except Exception:
+            pass
+        # Including the exit bar: peak now picks up the 5/12 high 130.
+        out_incl = query_trade_forensics("AAA", "BUY", datetime(2026, 5, 5),
+                                         exit_day, include_exit_bar=True)
+        assert float(out_incl["post_exit"]["High"].max()) == pytest.approx(130.0)
+
+    def test_forensics_through_today_widens_window(self, mem_engine):
+        from data.database import OHLCVBar
+        from data.ui_queries import query_bars, query_trade_forensics
+        # Old trade: exit 2026-03-01, default window ends ~3 weeks later.  A bar
+        # at 2026-05-01 is past the default window but before today → only
+        # through_today=True should surface it.
+        exit_ = datetime(2026, 3, 1)
+        with Session(mem_engine) as s:
+            for ts in (datetime(2026, 3, 3), datetime(2026, 5, 1)):
+                s.add(OHLCVBar(symbol="OLD", interval="1d", timestamp=ts,
+                               open=10, high=11, low=9, close=10, volume=1e6))
+            s.commit()
+
+        try:
+            query_bars.clear()
+        except Exception:
+            pass
+        out_def = query_trade_forensics("OLD", "BUY", datetime(2026, 2, 20),
+                                        exit_, through_today=False)
+        assert out_def["price"].index.max() < pd.Timestamp("2026-05-01")
+
+        try:
+            query_bars.clear()
+        except Exception:
+            pass
+        out_ext = query_trade_forensics("OLD", "BUY", datetime(2026, 2, 20),
+                                        exit_, through_today=True)
+        assert out_ext["price"].index.max() == pd.Timestamp("2026-05-01")
+
+    def test_forensics_degrades_without_data(self, mem_engine):
+        from data.ui_queries import query_trade_forensics
+        self._clear()
+        out = query_trade_forensics("GHOST", "BUY",
+                                    datetime(2026, 5, 5), datetime(2026, 5, 12))
+        assert out["price"].empty
+        assert out["signals"].empty
+        assert out["entry_signal"] is None
+        assert out["entry_ind"] is None
+        assert out["post_exit"].empty

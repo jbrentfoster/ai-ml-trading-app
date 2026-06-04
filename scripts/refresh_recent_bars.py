@@ -14,9 +14,19 @@ What this script does:
     Re-fetches the last ~5 trading days of bars for the union of:
       1. Current universe (or static watchlist if universe.enabled=False)
       2. Recently-acted symbols (order_decisions APPROVED/DRY_RUN in last 14 days)
-      3. Currently-held IBKR positions (optional — degrades cleanly if Gateway down)
+      3. Recently-exited live positions (trade_log source='live' exit in last 14 days)
+      4. Currently-held IBKR positions (optional — degrades cleanly if Gateway down)
     For each symbol it overwrites OHLCV rows in place (upsert_bars overwrite=True)
     and recomputes the derived indicator snapshots for those same dates.
+
+    Why (3) is separate from (2): bracket fills (TP / stop / trailing) reconcile
+    straight into trade_log as source='live' with NO order_decisions row, so the
+    order_decisions-based union in (2) misses them.  A symbol that exits via a
+    trailing stop drops out of both the universe and the held set immediately and
+    stops getting bars fetched — observed on SNOW (exit 2026-05-21, last cached
+    bar 2026-05-20).  Keeping recently-exited names in the union for a window
+    lets post-exit bars keep flowing day by day (the rolling 5-day refresh on
+    each EOD run overlaps to cover exit → exit+14d).
 
 Scheduling:
     Designed to run at ~16:30 ET on weekdays via Windows Task Scheduler,
@@ -41,6 +51,7 @@ from config.settings import config
 from core.logger import get_logger
 from data.database import (
     get_order_decisions,
+    get_trade_log,
     get_universe_assets,
     upsert_indicators,
 )
@@ -73,6 +84,23 @@ def _recently_acted_symbols(days: int = 14) -> set[str]:
         & (df["decision"].isin(["APPROVED", "DRY_RUN", "CLOSED_LONG"]))
     ]
     return set(recent["symbol"].tolist())
+
+
+def _recently_exited_symbols(days: int = 14) -> set[str]:
+    """Symbols whose *live* positions exited within the last `days` days.
+
+    Sourced from trade_log (source='live'), NOT order_decisions: bracket exits
+    (TP / stop / trailing) reconcile into trade_log with no order_decisions row,
+    so `_recently_acted_symbols` can't see them.  This keeps a just-exited
+    symbol in the refresh union long enough for its post-exit bars to be
+    captured before it falls out of tracking entirely.
+    """
+    df = get_trade_log(source="live")
+    if df.empty or "exit_ts" not in df.columns:
+        return set()
+    cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=days)
+    recent = df[df["exit_ts"] >= cutoff]
+    return set(recent["symbol"].dropna().tolist())
 
 
 def _ibkr_position_symbols() -> set[str]:
@@ -124,6 +152,7 @@ def main(days_back: int = 5, use_ibkr: bool = True, interval: str = "1d") -> Non
 
     universe = _universe_symbols()
     recent   = _recently_acted_symbols(days=14)
+    exited   = _recently_exited_symbols(days=14)
     held     = _ibkr_position_symbols() if use_ibkr else set()
     # Benchmark (config.data.benchmark_symbol — SPY by default) is included
     # unconditionally so Page 10's relative-performance tracking always has
@@ -131,10 +160,10 @@ def main(days_back: int = 5, use_ibkr: bool = True, interval: str = "1d") -> Non
     # benchmark out of permanent_fixtures.
     benchmark = {config.data.benchmark_symbol}
 
-    symbols = sorted(universe | recent | held | benchmark)
+    symbols = sorted(universe | recent | exited | held | benchmark)
     print(f"Universe: {len(universe)} | Recent (14d): {len(recent)} | "
-          f"Held: {len(held)} | Benchmark: {sorted(benchmark)} | "
-          f"Union: {len(symbols)}")
+          f"Exited (14d): {len(exited)} | Held: {len(held)} | "
+          f"Benchmark: {sorted(benchmark)} | Union: {len(symbols)}")
     print()
 
     if not symbols:

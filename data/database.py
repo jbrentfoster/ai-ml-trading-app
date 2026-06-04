@@ -991,6 +991,63 @@ def get_latest_indicators(symbol: str, interval: str) -> dict | None:
     }
 
 
+def get_indicators_history(
+    symbol: str,
+    interval: str,
+    start=None,
+    end=None,
+    limit: int = 1000,
+) -> pd.DataFrame:
+    """
+    Return a time series of IndicatorSnapshot rows for (symbol, interval) as a
+    DataFrame with a UTC-naive DatetimeIndex named 'timestamp' (ascending).
+
+    The historical analogue of :func:`get_latest_indicators` — used by the
+    Trade Forensics panel to overlay MACD/RSI/BB across a trade's holding
+    window.  Fetches the most recent `limit` rows, then trims to [start, end]
+    in-memory (same pattern as :func:`get_bars` / ui_queries.query_bars).
+    Returns an empty DataFrame when nothing is stored.
+    """
+    engine = get_engine()
+    with Session(engine) as session:
+        rows = (
+            session.query(IndicatorSnapshot)
+            .filter_by(symbol=symbol, interval=interval)
+            .order_by(desc(IndicatorSnapshot.timestamp))
+            .limit(limit)
+            .all()
+        )
+
+    if not rows:
+        return pd.DataFrame()
+
+    data = [
+        {
+            "timestamp":    r.timestamp,
+            "rsi_14":       r.rsi_14,
+            "macd":         r.macd,
+            "macd_signal":  r.macd_signal,
+            "macd_hist":    r.macd_hist,
+            "bb_upper":     r.bb_upper,
+            "bb_middle":    r.bb_middle,
+            "bb_lower":     r.bb_lower,
+            "ema_9":        r.ema_9,
+            "ema_21":       r.ema_21,
+            "ema_50":       r.ema_50,
+            "atr_14":       r.atr_14,
+            "volume_sma_20": r.volume_sma_20,
+        }
+        for r in reversed(rows)   # ascending chronological order
+    ]
+    df = pd.DataFrame(data).set_index("timestamp")
+    df.index = pd.DatetimeIndex(df.index)
+    if start is not None:
+        df = df[df.index >= pd.Timestamp(start)]
+    if end is not None:
+        df = df[df.index < pd.Timestamp(end) + pd.Timedelta(days=1)]
+    return df
+
+
 # ── Fundamental helpers ───────────────────────────────────────────────────────
 
 def upsert_fundamentals(symbol: str, data: dict) -> None:

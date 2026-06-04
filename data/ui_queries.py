@@ -50,6 +50,7 @@ from data.database import (
     get_circuit_breaker_log,
     get_engine,
     get_fundamentals,
+    get_indicators_history,
     get_intraday_run_log,
     get_latest_circuit_breaker_event,
     get_latest_indicators,
@@ -61,6 +62,7 @@ from data.database import (
     get_universe_assets,
     get_universe_run_log,
     EnsembleWeightHistory,
+    OrderDecisionRecord,
     SignalLog,
     WalkForwardResult,
 )
@@ -1105,6 +1107,188 @@ def query_trade_log_filter_options(
         "symbols":      sorted(df["symbol"].dropna().unique().tolist()),
         "exit_reasons": sorted(df["exit_reason"].dropna().unique().tolist()),
         "sources":      sorted(df["source"].dropna().unique().tolist()),
+    }
+
+
+# ── Trade Forensics (Page 10 drill-down) ───────────────────────────────────────
+#
+# These power the per-trade forensics panel: reconstruct the decision context
+# around a single closed trade.  Entry-side data (scores, indicators) is solid;
+# bracket-fired exits (stop/tp/trailing) have NO signal_log row at the off-cycle
+# fill instant, and walk_forward trades have no order_decisions row — callers
+# degrade gracefully rather than render blanks (see CLAUDE.md Page 10 notes).
+
+@st.cache_data(ttl=300)
+def query_indicator_history(symbol: str, interval: str,
+                            start_date=None, end_date=None) -> pd.DataFrame:
+    """Indicator snapshots (RSI / MACD / BB / ATR …) as a clipped time series.
+
+    Thin cached wrapper over ``get_indicators_history`` for the forensics
+    chart's lower-panel overlays and the entry-context pattern flags.  Index is
+    UTC-naive 'timestamp' (a market boundary — intentionally left in UTC, like
+    bars).  Empty DataFrame when nothing is cached for the window.
+    """
+    return get_indicators_history(symbol, interval, start=start_date, end=end_date)
+
+
+@st.cache_data(ttl=300)
+def query_order_decision_for_trade(symbol: str, entry_ts, run_id: str = "") -> dict | None:
+    """Authoritative bracket levels for a *live* trade's entry, if recorded.
+
+    Returns the most recent APPROVED/DRY_RUN/CLOSED_LONG ``order_decisions`` row
+    for ``symbol`` decided on or before ``entry_ts`` (optionally scoped to
+    ``run_id``) as ``{entry_price, stop_price, take_profit_price, signal,
+    decided_at}`` — or ``None`` when no decision exists (every walk_forward
+    trade, and any live row whose decision aged out).  The page falls back to
+    reconstructing stop/TP from entry_px ± ATR×config when this is None.
+    """
+    entry_ts = pd.Timestamp(entry_ts)
+    engine = get_engine()
+    with Session(engine) as session:
+        q = session.query(OrderDecisionRecord).filter(
+            OrderDecisionRecord.symbol == symbol,
+            OrderDecisionRecord.decision.in_(["APPROVED", "DRY_RUN", "CLOSED_LONG"]),
+            OrderDecisionRecord.decided_at <= entry_ts.to_pydatetime(),
+        )
+        if run_id:
+            q = q.filter(OrderDecisionRecord.run_id == run_id)
+        row = q.order_by(desc(OrderDecisionRecord.decided_at)).first()
+    if row is None:
+        return None
+    return {
+        "entry_price":       row.entry_price,
+        "stop_price":        row.stop_price,
+        "take_profit_price": row.take_profit_price,
+        "signal":            row.signal,
+        "decided_at":        row.decided_at,
+    }
+
+
+def query_entry_signal_row(symbol: str, signal: str, entry_ts) -> dict | None:
+    """The signal_log row that drove a trade's entry (fuzzy, by timestamp).
+
+    Matching is fuzzy by construction: a signal generated on bar ``t`` close
+    enters at ``t+1`` open, so we take the most recent *passed-gate* signal of
+    the trade's direction with ``bar_timestamp <= entry_ts``.  Returns the row
+    as a dict (component scores, regime, gate_reason, bar_timestamp) or ``None``
+    when no such row exists — e.g. pre-logging walk_forward runs, or live rows
+    backfilled from a Flex export with no contemporaneous daily run.
+
+    Not cached: cheap single-row lookup, and entry_ts varies per trade.
+    """
+    entry_ts = pd.Timestamp(entry_ts)
+    engine = get_engine()
+    with Session(engine) as session:
+        row = (
+            session.query(SignalLog)
+            .filter(
+                SignalLog.symbol == symbol,
+                SignalLog.signal == signal,
+                SignalLog.passed_gate.is_(True),
+                SignalLog.bar_timestamp <= entry_ts.to_pydatetime(),
+            )
+            .order_by(desc(SignalLog.bar_timestamp))
+            .first()
+        )
+    if row is None:
+        return None
+    return {
+        "bar_timestamp":  row.bar_timestamp,
+        "generated_at":   row.generated_at,
+        "lstm_score":     row.lstm_score,
+        "xgb_score":      row.xgb_score,
+        "finbert_score":  row.finbert_score,
+        "ensemble_score": row.ensemble_score,
+        "regime":         row.regime,
+        "signal":         row.signal,
+        "gate_reason":    row.gate_reason,
+    }
+
+
+def query_trade_forensics(symbol: str, signal: str, entry_ts, exit_ts,
+                          run_id: str = "", interval: str = "1d",
+                          pre_bars: int = 5, post_bars: int = 10,
+                          include_exit_bar: bool = False,
+                          through_today: bool = False) -> dict:
+    """Assemble everything the Trade Forensics panel needs for one trade.
+
+    Returns a dict (keys always present; values may be empty/None on missing
+    data so the page degrades gracefully):
+      - ``price``        : OHLCV bars over [entry−pre_bars, exit+post_bars]
+      - ``signals``      : signal_log series clipped to the hold window
+      - ``indicators``   : indicator_snapshots series over the same window
+      - ``entry_signal`` : the entry-anchored signal_log row (or None)
+      - ``entry_ind``    : indicator snapshot at/just-before entry (or None)
+      - ``bracket``      : authoritative order_decisions levels (or None → reconstruct)
+      - ``post_exit``    : OHLCV slice for the post_bars after exit (counterfactual)
+      - ``benchmark``    : benchmark OHLCV over the window (or empty)
+      - ``benchmark_symbol`` : the configured benchmark ticker
+
+    ``entry_ts`` / ``exit_ts`` are accepted as anything pd.Timestamp parses.
+    Window padding is in *bars* but applied as calendar days here (a cheap
+    over-fetch — query_bars trims by date), which is fine for daily bars.
+
+    ``include_exit_bar`` controls the ``post_exit`` counterfactual window:
+    when False (default) it counts bars strictly *after* the exit instant
+    ("was there more if I'd held longer?"); when True it starts at the exit
+    *calendar day*, so a gap-up-open TP's same-day tail (or a mid-day stop's
+    same-bar bounce) is included — matching the same-day capture frame used in
+    the case-study write-ups.
+
+    ``through_today`` widens the chart's right edge to today (instead of the
+    default ~post_bars-padded window) for studying how a symbol trended long
+    after exit.  It only *displays* bars already in the DB — rotated-out symbols
+    stop getting bars fetched, so the dashboard pairs this with a yfinance
+    backfill button.
+    """
+    entry_ts = pd.Timestamp(entry_ts)
+    exit_ts  = pd.Timestamp(exit_ts)
+
+    # Pad generously in calendar days (weekends/holidays) so we actually capture
+    # `pre_bars`/`post_bars` trading bars; the chart trims visually anyway.
+    win_start = (entry_ts - pd.Timedelta(days=pre_bars * 2 + 4)).normalize()
+    win_end   = (exit_ts + pd.Timedelta(days=post_bars * 2 + 4)).normalize()
+    if through_today:
+        win_end = max(win_end, pd.Timestamp.now().normalize())
+
+    price      = query_bars(symbol, interval, start_date=win_start, end_date=win_end)
+    signals    = query_signal_log(symbol, start_date=win_start, end_date=win_end, limit=500)
+    indicators = query_indicator_history(symbol, interval, start_date=win_start, end_date=win_end)
+
+    entry_signal = query_entry_signal_row(symbol, signal, entry_ts)
+    bracket      = query_order_decision_for_trade(symbol, entry_ts, run_id=run_id)
+
+    # Indicator snapshot at/just-before the entry bar (for pattern flags).
+    entry_ind = None
+    if not indicators.empty:
+        on_or_before = indicators[indicators.index <= entry_ts]
+        src = on_or_before if not on_or_before.empty else indicators
+        entry_ind = src.iloc[-1].to_dict()
+
+    # Post-exit slice for the "left on the table" counterfactual.  include_exit_bar
+    # starts the window at the exit calendar day (captures a gap-up-open TP tail /
+    # same-bar stop bounce); otherwise count strictly after the exit instant.
+    if price.empty:
+        post_exit = price
+    elif include_exit_bar:
+        post_exit = price[price.index.normalize() >= exit_ts.normalize()].iloc[:post_bars]
+    else:
+        post_exit = price[price.index > exit_ts].iloc[:post_bars]
+
+    from config.settings import config
+    bench_sym = config.data.benchmark_symbol
+    benchmark = query_bars(bench_sym, interval, start_date=win_start, end_date=win_end)
+
+    return {
+        "price":            price,
+        "signals":          signals,
+        "indicators":       indicators,
+        "entry_signal":     entry_signal,
+        "entry_ind":        entry_ind,
+        "bracket":          bracket,
+        "post_exit":        post_exit,
+        "benchmark":        benchmark,
+        "benchmark_symbol": bench_sym,
     }
 
 
