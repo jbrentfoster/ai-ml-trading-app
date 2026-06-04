@@ -23,9 +23,9 @@ set LOG=logs\llm\llm_news_%dt%.log
 echo [%date% %time%] === LLM news analyst starting === >> "%LOG%"
 
 echo [%date% %time%] Step 1: scripts\ingest_news_bodies.py >> "%LOG%"
-.venv\Scripts\python.exe scripts\ingest_news_bodies.py >> "%LOG%" 2>&1
+.venv\Scripts\python.exe scripts\ingest_news_bodies.py --days 1 >> "%LOG%" 2>&1
 
 echo [%date% %time%] Step 2: scripts\score_news_llm.py >> "%LOG%"
-.venv\Scripts\python.exe scripts\score_news_llm.py >> "%LOG%" 2>&1
+.venv\Scripts\python.exe scripts\score_news_llm.py --days 1 >> "%LOG%" 2>&1
 
 echo [%date% %time%] === LLM news analyst complete === >> "%LOG%"
