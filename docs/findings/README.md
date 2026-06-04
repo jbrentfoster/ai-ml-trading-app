@@ -80,3 +80,4 @@ Findings are **not auto-created by the skills**. This is the load-bearing differ
 | [`stop_bleed.md`](stop_bleed.md) | observed, hypothesized | 2026-05-19 |
 | [`tp_concentration.md`](tp_concentration.md) | observed, hypothesized | 2026-05-19 |
 | [`wf_vs_live_correlation.md`](wf_vs_live_correlation.md) | observed, hypothesized | 2026-06-01 |
+| [`news_attribution_misallocation.md`](news_attribution_misallocation.md) | observed, hypothesized | 2026-06-04 |
