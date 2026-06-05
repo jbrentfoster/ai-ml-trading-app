@@ -165,7 +165,7 @@ walk_forward bracket simulator        ← during model training
 
 ## The database (SQLite)
 
-Sixteen tables in `db/trading.db`. You never need to interact with it directly — the dashboard reads from it, and all writes go through the ORM helper functions in `data/database.py`.
+Nineteen tables in `db/trading.db`. You never need to interact with it directly — the dashboard reads from it, and all writes go through the ORM helper functions in `data/database.py`.
 
 The most important tables:
 
@@ -182,4 +182,8 @@ The most important tables:
 | `trailing_stop_log` | TrailingStopManager | Dashboard page 8 |
 | `signal_runner_log` | signal_runner.py | Dashboard page 8 |
 
-Schema migrations are handled by `_migrate()` in `data/database.py` — it runs at every engine init and adds new columns with idempotent `ALTER TABLE` statements. See [CLAUDE.md](../CLAUDE.md) for the full 16-table schema reference (the two not shown above are `equity_snapshots`, used as the circuit-breaker baseline, and `intraday_run_log`, one row per `intraday_check.py` invocation).
+Schema migrations are handled by `_migrate()` in `data/database.py` — it runs at every engine init and adds new columns with idempotent `ALTER TABLE` statements. See [CLAUDE.md](../CLAUDE.md) for the full 19-table schema reference. The tables not shown above: `equity_snapshots` (circuit-breaker baseline), `intraday_run_log` (one row per `intraday_check.py` invocation), `ensemble_weight_history` / `walk_forward_results` / `universe_assets` / `universe_run_log` / `circuit_breaker_log` / `fundamental_data`, and `llm_news_analysis` (the LLM news analyst's per-article extractions — see below).
+
+### A parallel research lane — the LLM news analyst
+
+Separate from the seven-phase trading path, a **shadow workflow** reads full news article bodies through a local LLM and writes structured sentiment to `llm_news_analysis`. **Nothing in `signal_runner.py` reads it** — it is surfaced only on dashboard Page 11. It runs on its own batch cadence (`run_llm_news.bat`), off the pre-market critical path, and is gated behind `config.llm.enabled` (default off). See [LLM News Analyst](11-llm-news-analyst.md) for the full design.

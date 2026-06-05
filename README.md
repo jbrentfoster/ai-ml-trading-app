@@ -146,7 +146,8 @@ streamlit run dashboard/1_Market_Data.py
 | **7 — Universe** | Funnel overview, active candidates, size history, manual refresh controls |
 | **8 — Risk & Portfolio** | Circuit breaker, signal runner log, order decisions, trailing-stop log, risk config |
 | **9 — Account** | Live IBKR account summary, positions, orders (requires active IB Gateway) |
-| **10 — Trade History** | Closed trades from `trade_log` (WF-simulated + live fills): net P&L, indicative ST/LT tax view, exit-reason breakdown, per-symbol stats. Sidebar "Dedupe to latest run per symbol" toggle (default ON) hides stale rows from prior weekly retrains by sourcing the latest `run_id` from `walk_forward_results` |
+| **10 — Trade History** | Closed trades from `trade_log` (WF-simulated + live fills): net P&L, indicative ST/LT tax view, benchmark-relative + capital-weighted-ROI sections, exit-reason breakdown, per-symbol stats, and a **Trade Forensics drill-down** (per-trade hold-trajectory chart, entry-decision card with bucketed pattern flags, exit attribution, post-exit "left on the table" counterfactual). Sidebar "Dedupe to latest run per symbol" toggle (default ON) hides stale rows from prior weekly retrains by sourcing the latest `run_id` from `walk_forward_results` |
+| **11 — LLM News Analysis** | **Shadow workflow — not read by `signal_runner`.** Event-centric view of the local-LLM news analyst: de-duplicated events table (mean score, resolved-ticker vs feed-tag, attribution status), per-symbol sentiment drill-down, research expander. Populated by `run_llm_news.bat` (opt-in via `config.llm.enabled`). See [docs/11-llm-news-analyst.md](docs/11-llm-news-analyst.md) |
 
 ---
 
@@ -162,6 +163,7 @@ The daily and weekly runs are driven by two batch files that execute the pipelin
 | `run_intraday.bat` | Mon–Fri 12:00 PM ET and 03:30 PM ET | `intraday_check.py` — Phase 1 circuit-breaker check + Phase 3.5 trailing-stop re-evaluation against live IBKR price.  Two scheduled slots per day.  Ratchet-only by default (no new TP→TRAIL conversions; opt-in via `RiskConfig.intraday_trail_conversion_enabled`).  Exits 0 on Gateway-down with a `status='gateway_down'` row in `intraday_run_log` so missed runs are visible on Page 8. |
 | `run_eod.bat`   | Mon–Fri 04:30 PM ET | `refresh_recent_bars.py` — re-fetches the last 5 days of OHLCV + indicators for the union of (active universe, recently-acted symbols, held positions) and overwrites the mid-day partial bars the morning `signal_runner` Phase 2 wrote |
 | `run_weekly.bat` | Sunday 01:00 AM | `universe_scheduler.py --run-now` → `run_pipeline.py` → `train_models.py --force` → `backfill_benchmark_returns.py` |
+| `run_llm_news.bat` | *(not yet scheduled)* | LLM news analyst shadow workflow: `ingest_news_bodies.py --days 1` (needs Gateway) → `score_news_llm.py` (needs Ollama, slow ~80s/article). Both no-op unless `config.llm.enabled=True`. Kept off the pre-market critical path on purpose — Step 2 can take ~2h and must never delay `signal_runner`. Logs to `logs/llm/`. Output is surfaced only on Page 11; nothing in the trading path reads it |
 
 **Step ordering matters.** The daily run rescores the universe *before* training so that symbols freshly promoted into the active set get checkpoints the same day rather than next. `--no-signal-run` suppresses the inline signal runner that `universe_scheduler.py` would otherwise fire post-rescore; signals are run explicitly as the final step, after training has caught up.
 
@@ -190,6 +192,10 @@ logs/
     eod_run_20260416.log       ← one file per run_eod.bat execution
   weekly/
     weekly_run_20260420.log
+  llm/
+    llm_news_20260605.log      ← one file per run_llm_news.bat execution
+  backup/
+    backup_2026-06-05.log      ← one file per backup.bat execution
   python/
     trading_app.log            ← rotating Python logger (all app code)
 ```
@@ -302,6 +308,22 @@ python scripts/open_positions.py --close --all --yes            # same, no promp
 
 Only long positions are closed; shorts and zero-qty ghost positions are skipped with a warning. `--qty` requires exactly one `--symbol`.
 
+### Fill reconciliation & backfills
+
+These reconstruct `trade_log` / `fundamental_data` from external sources. The daily run reconciles automatically (Phase 1); these are the manual / one-off equivalents.
+
+```bash
+python scripts/reconcile_fills.py              # poll IBKR reqExecutions → fill_log → trade_log (needs Gateway)
+python scripts/reconcile_fills.py --dry-run    # show what would be reconciled without writing
+python scripts/backfill_flex_trades.py FILE.xml  # one-time: recover fills aged out of the 7-day reqExecutions window from an IBKR Activity Flex Query export (no Gateway needed)
+python scripts/backfill_benchmark_returns.py   # idempotent: fill trade_log.benchmark_return_pct (raw SPY return over each trade's hold)
+python scripts/backfill_sectors.py             # one-time: fill fundamental_data.sector on pre-2026-06-03 rows
+```
+
+### Backup — `backup.bat`
+
+Backs up to an external drive (`D:\trading_app_backup` by default — edit `BACKUP_ROOT` in the file): an **atomic** SQLite snapshot via Python's `sqlite3.Connection.backup()` (safe against concurrent writers — a raw file copy mid-write can corrupt the destination), plus `robocopy /MIR` mirrors of `logs/` and `models/cache/`, and a copy of `config/settings.yaml`. Dated DB snapshots and local backup logs are pruned after 30 days. Bails out cleanly (and logs locally to `logs/backup/`) if the drive isn't mounted. Intended to be scheduled at ~17:00 ET after `run_eod.bat`, but is not yet wired into Task Scheduler.
+
 ---
 
 ## Configuration
@@ -342,6 +364,7 @@ Key settings:
 | `risk.intraday_conversion_buffer_atr` | 0.5 | Extra ATR buffer above the daily activation threshold required for intraday conversions |
 | `risk.hold_timeout_enabled` | False | Opt-in: flatten held longs whose latest passed-gate BUY in `signal_log` is older than `max_hold_days` |
 | `risk.max_hold_days` | 30 | Calendar-day threshold for the hold-timeout rule (Phase 3.6). 0 disables defensively |
+| `llm.enabled` | False | Opt-in master switch for the LLM news analyst shadow workflow (Page 11). When False, `run_llm_news.bat` no-ops. Requires a local Ollama install — see [docs/11](docs/11-llm-news-analyst.md) |
 
 ---
 
@@ -412,6 +435,8 @@ News is fetched in priority order with automatic fallback:
 
 Run `run_pipeline.py` with IB Gateway open to get full IBKR news history. The Data Status page (Page 6) shows per-symbol news source and article counts.
 
+These three tiers feed **FinBERT**, which scores **headlines only**. A separate opt-in **LLM news analyst** (`run_llm_news.bat`, `config.llm.enabled`) reads **full article bodies** through a local LLM, resolves which company each story is actually about, and produces a transparent composite sentiment — surfaced on Page 11 as a research signal. It is **not** consumed by `signal_runner`. See [docs/11-llm-news-analyst.md](docs/11-llm-news-analyst.md).
+
 ---
 
 ## Tests
@@ -438,7 +463,10 @@ SQLite at `db/trading.db` (auto-created on first run). Schema migrations are han
 | `signal_log` | Every ensemble prediction and gate result |
 | `ensemble_weight_history` | Per-fold ensemble weight snapshots after each rebalance |
 | `walk_forward_results` | Per-fold Sharpe, drawdown, win rate |
-| `trade_log` | Closed trades (WF-simulated and, with Phase B, live IBKR fills) — entry/exit, P&L, exit reason |
+| `trade_log` | Closed trades (WF-simulated and, with Phase B, live IBKR fills) — entry/exit, P&L, exit reason, benchmark return |
+| `fill_log` | Raw IBKR executions ingested by Phase B reconciliation — the audit trail `trade_log` `source='live'` rows are aggregated from (`exec_id` is the idempotency key) |
+| `reconciliation_state` | Phase B reconciliation watermark (one row per source/account) — newest `exec_time` persisted so far |
+| `llm_news_analysis` | LLM news analyst extractions + composite scores (one row per feed-symbol/article/model). Shadow workflow — not read by `signal_runner` |
 | `universe_assets` | Dynamic universe candidates and their scores |
 | `universe_run_log` | Per-stage timing + symbol counts for each universe refresh |
 | `order_decisions` | Every DRY_RUN / APPROVED / REJECTED / CLOSED_LONG decision |

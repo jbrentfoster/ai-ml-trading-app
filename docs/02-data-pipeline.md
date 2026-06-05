@@ -190,6 +190,10 @@ This means a single dramatic headline from yesterday outweighs five mildly posit
 
 During walk-forward backtesting, FinBERT is called with `as_of=bar_timestamp`. This filters the news cache to only include articles published **on or before** that bar's date, preventing the model from "seeing" future news during historical evaluation.
 
+### Article bodies (LLM news analyst)
+
+FinBERT only ever sees **headlines** — that is all `news_cache` originally stored. A separate, opt-in **body-ingestion** step (`scripts/ingest_news_bodies.py`) back-fills `news_cache.body` with the full HTML-stripped article text via IBKR's `reqNewsArticle` API (`set_news_body` only writes when `body` is NULL — never overwrites). Those bodies feed the **LLM news analyst** shadow workflow, not FinBERT and not the trading path. Gated behind `config.llm.enabled` (default off). See [LLM News Analyst](11-llm-news-analyst.md).
+
 ---
 
 ## VIX caching
