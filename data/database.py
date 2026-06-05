@@ -41,6 +41,7 @@ from sqlalchemy import (
     create_engine,
     desc,
     func,
+    or_,
 )
 from sqlalchemy.orm import DeclarativeBase, Session
 
@@ -2102,6 +2103,38 @@ def live_trade_exists(exit_exec_id: str) -> bool:
         row = (
             session.query(TradeLog.id)
             .filter(TradeLog.source == "live", TradeLog.exit_exec_id == exit_exec_id)
+            .first()
+        )
+    return row is not None
+
+
+def live_trade_uses_exec_ids(exec_ids: list[str]) -> bool:
+    """True if any of ``exec_ids`` is already a leg of a source='live' trade.
+
+    The ``uq_trade_live_exit`` index (and ``live_trade_exists``) only guard the
+    *exit* leg, so the same physical fill can be re-paired as a *different* round
+    trip's entry/exit and dodge dedup.  Concretely (2026-06-05 SLV): the
+    2026-04-29 orphan-short fills were recorded once as the correct short
+    (id=2002, with the MKT-buy as its exit leg) and then re-paired by the
+    aggregator in the opposite direction (id=2022, with the STP-sell as its exit
+    leg) — two distinct exit_exec_ids, so the exit-only guard let the duplicate
+    through.  This helper closes that gap: a fill already consumed as EITHER an
+    entry or exit leg of any live row must not be re-paired into a new trade.
+    """
+    ids = [e for e in exec_ids if e]
+    if not ids:
+        return False
+    engine = get_engine()
+    with Session(engine) as session:
+        row = (
+            session.query(TradeLog.id)
+            .filter(
+                TradeLog.source == "live",
+                or_(
+                    TradeLog.entry_exec_id.in_(ids),
+                    TradeLog.exit_exec_id.in_(ids),
+                ),
+            )
             .first()
         )
     return row is not None

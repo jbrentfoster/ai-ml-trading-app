@@ -155,6 +155,72 @@ class TestIdempotencyAndOrphans:
         assert res.n_trades_written == 0
         assert _trades("AAPL").empty
 
+    def test_lone_exit_no_entry_surfaced_as_orphan(self, mem_engine):
+        """Regression for the 2026-06-05 GLW silent-drop.
+
+        An exit fill with no matching entry in fill_log (entry aged out / never
+        ingested) used to fall through both the round-trip write and the orphan
+        branch (which only fired for entry_fills), vanishing with no row and no
+        warning.  It must now count as an orphan (visible, recoverable).
+        """
+        from execution.reconciliation import reconcile_fills
+
+        t0 = _now() - timedelta(days=2)
+        execs = [_exec("X1", "GLW", "SELL", 231, 183.40, t=t0, order_type=None)]
+        res = reconcile_fills(_fetcher(execs))
+
+        assert res.n_orphans == 1               # surfaced, not silently dropped
+        assert res.n_trades_written == 0        # no synthetic entry fabricated
+        assert _trades("GLW").empty
+
+
+class TestInvertedRoundTripGuard:
+    """Regression for the 2026-06-05 SLV exit-before-entry corruption.
+
+    The aggregator collects all BUYs into entry_fills and all SELLs into
+    exit_fills regardless of order, so an orphaned-short sequence (a SELL stop
+    fires, then a BUY covers the next day) trips the net==flat check as a "long"
+    with exit_ts < entry_ts.  Persisting it created a chronologically-impossible
+    row that double-counted the loss (id=2022 dup of the correct short id=2002).
+    """
+
+    def test_sell_then_buy_does_not_write_inverted_row(self, mem_engine):
+        from execution.reconciliation import reconcile_fills
+
+        t_sell = _now() - timedelta(days=3)          # 4/29-analog STP sell
+        t_buy  = t_sell + timedelta(days=1)          # 4/30-analog MKT cover
+        execs = [
+            _exec("STP", "SLV", "SELL", 100, 64.96, t=t_sell, order_type="STP"),
+            _exec("MKT", "SLV", "BUY",  100, 66.67, t=t_buy,  order_type="MKT"),
+        ]
+        res = reconcile_fills(_fetcher(execs))
+
+        assert res.n_trades_written == 0
+        assert res.n_skipped_inverted == 1
+        assert _trades("SLV").empty
+        # Detector the 2026-06-04 verification relied on must stay clean.
+        from data.database import get_trade_log
+        all_live = get_trade_log(source="live")
+        if not all_live.empty:
+            inverted = all_live[all_live["exit_ts"] < all_live["entry_ts"]]
+            assert inverted.empty
+
+    def test_inverted_guard_stable_on_rerun(self, mem_engine):
+        from execution.reconciliation import reconcile_fills
+
+        t_sell = _now() - timedelta(days=3)
+        t_buy  = t_sell + timedelta(days=1)
+        execs = [
+            _exec("STP", "SLV", "SELL", 100, 64.96, t=t_sell, order_type="STP"),
+            _exec("MKT", "SLV", "BUY",  100, 66.67, t=t_buy,  order_type="MKT"),
+        ]
+        reconcile_fills(_fetcher(execs))
+        res2 = reconcile_fills(_fetcher(execs))
+
+        assert res2.n_trades_written == 0
+        assert res2.n_skipped_inverted == 1          # re-rejected, never persisted
+        assert _trades("SLV").empty
+
 
 class TestNetPnlConvention:
 

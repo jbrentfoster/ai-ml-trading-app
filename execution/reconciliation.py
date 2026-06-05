@@ -48,6 +48,7 @@ from data.database import (
     has_closed_long_near,
     has_converted_trailing_before,
     live_trade_exists,
+    live_trade_uses_exec_ids,
     log_trade,
     set_reconciliation_state,
     upsert_fill,
@@ -67,6 +68,7 @@ class ReconcileResult:
     n_trades_skipped: int = 0   # dedup hits (already reconciled)
     n_deferred_cost: int = 0    # round trips withheld pending commissionReport
     n_orphans: int = 0          # symbols not flat at end of window
+    n_skipped_inverted: int = 0 # pairings rejected for exit_ts <= entry_ts
     window_start: Optional[datetime] = None
 
 
@@ -270,11 +272,32 @@ def _aggregate(fills: list[dict], result: ReconcileResult, *, dry_run: bool) -> 
                 entry_fills = []
                 exit_fills = []
 
-        if entry_fills and not (exit_fills and abs(net) < 1e-9):
-            # Net never returned to flat — orphan (open position / partial).
+        if (entry_fills or exit_fills) and abs(net) > 1e-9:
+            # Leftover fills that never closed into a flat round trip.
             result.n_orphans += 1
-            log.warning("Reconciliation: %s not flat at window end "
-                        "(net=%.2f) — leaving fills for a later run", sym, net)
+            if net > 0:
+                # Open long / partial — entry with no (full) matching exit yet.
+                log.warning("Reconciliation: %s not flat at window end "
+                            "(net=%.2f) — open position / partial, leaving "
+                            "fills for a later run", sym, net)
+            else:
+                # net < 0: exit fill(s) with NO matching entry in fill_log — the
+                # 2026-06-05 GLW silent-drop class.  A between-run exit whose
+                # entry leg was never ingested (missed / aged out of the
+                # reqExecutions window) previously fell through BOTH the
+                # round-trip write AND the old orphan branch (which only fired
+                # for entry_fills), so a real realised exit vanished with no row
+                # and no warning.  Surface it so it is visible and recoverable
+                # (re-run reconcile_fills with a wider --since to ingest the
+                # entry, or Flex-backfill).  Deliberately NOT synthesising an
+                # entry from order_decisions — that would violate the
+                # "trade_log = end-to-end-observed trades only" decision
+                # (CHANGELOG 2026-05-29) and risks a new corrupt-row class.
+                log.warning("Reconciliation: %s exit fill(s) with no matching "
+                            "entry in fill_log (net=%.2f) — between-run exit "
+                            "whose entry was not ingested; realised exit is "
+                            "unrecorded.  Recover via a wider reconcile_fills "
+                            "--since or a Flex backfill", sym, net)
 
 
 def _write_round_trip(symbol: str, entry_fills: list[dict], exit_fills: list[dict],
@@ -287,6 +310,36 @@ def _write_round_trip(symbol: str, entry_fills: list[dict], exit_fills: list[dic
     exit_ts  = closing["exec_time"]
     exit_exec_id  = closing["exec_id"]
     entry_exec_id = min(entry_fills, key=lambda f: f["exec_time"])["exec_id"]
+
+    # Dedup (real-mode only — dry_run still reports would-write lines for
+    # already-reconciled trips).  Skip silently if any constituent fill is
+    # already a leg of a live trade.  live_trade_exists covers the normal
+    # exit-leg idempotency; live_trade_uses_exec_ids additionally closes the
+    # both-legs re-pairing gap that let the 2026-06-05 SLV duplicate through
+    # (the orphan-short fills were already consumed by id=2002 but with a
+    # different exit leg, so the exit-only guard didn't catch the reverse pair).
+    if not dry_run and (
+        live_trade_exists(exit_exec_id)
+        or live_trade_uses_exec_ids([entry_exec_id, exit_exec_id])
+    ):
+        result.n_trades_skipped += 1
+        return
+
+    # Guard: a valid long round trip must have entry strictly before exit.  A
+    # SELL-then-BUY sequence (an orphaned short — e.g. the 2026-04-29 SLV
+    # orphan-stop episode) collects all BUYs into entry_fills and all SELLs into
+    # exit_fills regardless of chronological order, then trips the net==flat
+    # check with exit_ts <= entry_ts.  Persisting it creates a
+    # chronologically-impossible row that double-counts the loss against the
+    # correctly-labelled short (id=2002 vs the regenerated id=2022 on
+    # 2026-06-05).  Reject + WARN rather than corrupt trade_log.
+    if exit_ts <= entry_ts:
+        result.n_skipped_inverted += 1
+        log.warning("[%s] skipping inverted round trip — exit_ts %s <= entry_ts "
+                    "%s (orphaned-short fills paired as a long; entry_exec=%s "
+                    "exit_exec=%s)", symbol, exit_ts, entry_ts,
+                    entry_exec_id, exit_exec_id)
+        return
 
     # Defer the round trip if any constituent fill's commissionReport hasn't
     # posted yet (commission IS NULL) — writing now would bake commission=0 into
@@ -321,10 +374,6 @@ def _write_round_trip(symbol: str, entry_fills: list[dict], exit_fills: list[dic
                  "pnl=%.2f reason=%s(%s)", symbol, entry_px, exit_px, shares,
                  pnl, exit_reason, exit_reason_source)
         result.n_trades_written += 1
-        return
-
-    if live_trade_exists(exit_exec_id):
-        result.n_trades_skipped += 1
         return
 
     log.info("[%s] live trade: entry %.2f → exit %.2f (%.0f sh) pnl=%.2f "
