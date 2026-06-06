@@ -9,6 +9,15 @@ Sections:
   5. Circuit breaker event log
 """
 
+from pathlib import Path
+import sys
+
+_root = Path(__file__).resolve()
+while not (_root / "config" / "settings.py").exists() and _root.parent != _root:
+    _root = _root.parent
+if str(_root) not in sys.path:
+    sys.path.insert(0, str(_root))
+
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st

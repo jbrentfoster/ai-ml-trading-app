@@ -11,9 +11,17 @@ shows the connection error and waits for the next refresh.
 
 from __future__ import annotations
 
+from pathlib import Path
+import sys
 import asyncio
 import concurrent.futures
 from datetime import datetime, timezone
+
+_root = Path(__file__).resolve()
+while not (_root / "config" / "settings.py").exists() and _root.parent != _root:
+    _root = _root.parent
+if str(_root) not in sys.path:
+    sys.path.insert(0, str(_root))
 
 import pandas as pd
 import plotly.graph_objects as go

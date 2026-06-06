@@ -6,6 +6,15 @@ are filtered down to a short, high-quality candidate list through three
 progressively tighter stages.
 """
 
+from pathlib import Path
+import sys
+
+_root = Path(__file__).resolve()
+while not (_root / "config" / "settings.py").exists() and _root.parent != _root:
+    _root = _root.parent
+if str(_root) not in sys.path:
+    sys.path.insert(0, str(_root))
+
 import streamlit as st
 import plotly.graph_objects as go
 import pandas as pd

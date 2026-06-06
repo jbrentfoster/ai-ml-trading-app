@@ -10,7 +10,15 @@ variables / .env and are never stored in settings.yaml.
 
 from __future__ import annotations
 
+from pathlib import Path
+import sys
 from datetime import datetime
+
+_root = Path(__file__).resolve()
+while not (_root / "config" / "settings.py").exists() and _root.parent != _root:
+    _root = _root.parent
+if str(_root) not in sys.path:
+    sys.path.insert(0, str(_root))
 
 import streamlit as st
 
