@@ -7,7 +7,9 @@
 ::
 :: Schedule via Windows Task Scheduler at 16:30 ET on weekdays.
 
-cd /d "%~dp0"
+:: Batch files live in batch_files/; cd to the PROJECT ROOT (parent) so every
+:: relative path below (.venv, scripts, logs, db/trading.db) resolves correctly.
+cd /d "%~dp0.."
 
 :: Force UTF-8 output from Python scripts (avoids cp1252 encoding errors)
 set PYTHONUTF8=1

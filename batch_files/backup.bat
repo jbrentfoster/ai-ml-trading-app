@@ -6,7 +6,9 @@
 ::
 :: Schedule via Windows Task Scheduler at ~17:00 ET on weekdays, after run_eod.bat.
 
-cd /d "%~dp0"
+:: Batch files live in batch_files/; cd to the PROJECT ROOT (parent) so every
+:: relative path below (.venv, db/trading.db, logs, models/cache, config) resolves correctly.
+cd /d "%~dp0.."
 
 set PYTHONUTF8=1
 

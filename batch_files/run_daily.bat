@@ -7,7 +7,9 @@
 :: Step 4 — signal runner (--no-dry-run); Phase 1 reconciles off-cycle live fills
 :: Step 4b — backfill again so today's live-reconciled rows aren't NULL until tomorrow
 
-cd /d "%~dp0"
+:: Batch files live in batch_files/; cd to the PROJECT ROOT (parent) so every
+:: relative path below (.venv, scripts, logs, db/trading.db) resolves correctly.
+cd /d "%~dp0.."
 
 :: Force UTF-8 output from all Python scripts (avoids cp1252 encoding errors)
 set PYTHONUTF8=1

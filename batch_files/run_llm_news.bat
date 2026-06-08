@@ -11,7 +11,9 @@
 :: machine stays awake.  Off the pre-market critical path on purpose: Step 2 can
 :: take ~2h and must never delay signal_runner.
 
-cd /d "%~dp0"
+:: Batch files live in batch_files/; cd to the PROJECT ROOT (parent) so every
+:: relative path below (.venv, scripts, logs, db/trading.db) resolves correctly.
+cd /d "%~dp0.."
 
 set PYTHONUTF8=1
 

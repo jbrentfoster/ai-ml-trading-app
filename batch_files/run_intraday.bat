@@ -21,7 +21,11 @@
 :: gateway.  The missed run is visible on Page 8 via intraday_run_log rows
 :: with status='gateway_down' or status='error'.
 
-cd /d "%~dp0"
+:: Batch files live in batch_files/; cd to the PROJECT ROOT (parent) so every
+:: relative path below (.venv, scripts, logs, db/trading.db) resolves correctly.
+:: The DB path in config is cwd-relative — running from batch_files/ would create
+:: a stray empty batch_files/db/trading.db instead of using the real one.
+cd /d "%~dp0.."
 
 :: Force UTF-8 output from all Python scripts (avoids cp1252 encoding errors)
 set PYTHONUTF8=1
