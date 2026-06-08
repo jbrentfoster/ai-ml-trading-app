@@ -38,7 +38,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Callable, Optional
+from typing import Callable, Iterable, Optional
 
 from core.logger import get_logger
 from data.database import (
@@ -68,6 +68,7 @@ class ReconcileResult:
     n_trades_skipped: int = 0   # dedup hits (already reconciled)
     n_deferred_cost: int = 0    # round trips withheld pending commissionReport
     n_orphans: int = 0          # symbols not flat at end of window
+    n_missed_exits: int = 0     # net>0 orphans that are FLAT at the broker (exit fill missed)
     n_skipped_inverted: int = 0 # pairings rejected for exit_ts <= entry_ts
     window_start: Optional[datetime] = None
 
@@ -154,14 +155,27 @@ def reconcile_fills(
     dry_run: bool = False,
     account: Optional[str] = None,
     source: str = "live",
+    live_positions: Optional[Iterable[str]] = None,
 ) -> ReconcileResult:
     """Reconcile IBKR executions into fill_log + trade_log.
 
     ``fetch_executions`` is injected: in production it wraps
     ``loop.run_until_complete(ibkr.get_executions(since))``; in tests it returns
     canned execution dicts.  Returns a ReconcileResult summary.
+
+    ``live_positions`` (optional) is the set of symbols currently held at the
+    broker.  When supplied, a net>0 orphan (entry with no matching exit) whose
+    symbol is NOT in that set is FLAT at the broker — i.e. the position closed
+    but its exit fill was never ingested (aged out of reqExecutions before any
+    run polled it; the GE/VRT 2026-06-08 silent-drop class).  It is surfaced as
+    a distinct "missed exit" WARNING + ``n_missed_exits`` count instead of being
+    silently deferred forever as "still open".  When ``None`` (the Flex-backfill
+    path, tests, any caller without broker state) the legacy behaviour is
+    preserved exactly — every net>0 orphan is treated as still-open.
     """
     result = ReconcileResult()
+    held = ({s.upper() for s in live_positions}
+            if live_positions is not None else None)
 
     # ── Resolve the reconciliation window ────────────────────────────────────
     if since is None:
@@ -210,7 +224,8 @@ def reconcile_fills(
     if dry_run:
         # Aggregate against whatever is already in fill_log so the operator sees
         # would-be trades.  We don't write trade_log.
-        _aggregate(get_fills(symbol=symbol), result, dry_run=True)
+        _aggregate(get_fills(symbol=symbol), result, dry_run=True,
+                   live_positions=held)
         log.info("Reconciliation [dry-run]: %s", result)
         return result
 
@@ -221,7 +236,8 @@ def reconcile_fills(
     # entry leg.  The live_trade_exists dedup guard makes re-walking completed
     # round trips a cheap no-op.  fill_log is small (a few fills/week), so the
     # all-time walk per touched symbol is negligible.
-    _aggregate(get_fills(symbol=symbol), result, dry_run=False)
+    _aggregate(get_fills(symbol=symbol), result, dry_run=False,
+               live_positions=held)
 
     # ── Advance the watermark ────────────────────────────────────────────────
     if max_exec_time is not None:
@@ -238,13 +254,19 @@ def reconcile_fills(
     return result
 
 
-def _aggregate(fills: list[dict], result: ReconcileResult, *, dry_run: bool) -> None:
+def _aggregate(fills: list[dict], result: ReconcileResult, *, dry_run: bool,
+               live_positions: Optional[set] = None) -> None:
     """Pair entry/exit fills per (symbol, conid) and write round-trip trades.
 
     Walks fills chronologically accumulating net position; a round trip closes
     when net returns to flat.  Long-only: entries are BUY, exits are SELL.
     Symbols never returning to flat are orphans (entry with no matching exit,
     e.g. a still-open position) — left in fill_log for a later run.
+
+    ``live_positions`` (when not None) is the set of symbols held at the broker;
+    a net>0 orphan whose symbol is absent from it is flat at the broker — its
+    exit fill was missed — and is surfaced as a "missed exit" rather than as a
+    still-open position.  See ``reconcile_fills`` for the rationale.
     """
     # Group by (symbol, conid).
     groups: dict[tuple, list[dict]] = {}
@@ -276,10 +298,31 @@ def _aggregate(fills: list[dict], result: ReconcileResult, *, dry_run: bool) -> 
             # Leftover fills that never closed into a flat round trip.
             result.n_orphans += 1
             if net > 0:
-                # Open long / partial — entry with no (full) matching exit yet.
-                log.warning("Reconciliation: %s not flat at window end "
-                            "(net=%.2f) — open position / partial, leaving "
-                            "fills for a later run", sym, net)
+                if live_positions is not None and sym.upper() not in live_positions:
+                    # FLAT at the broker but net>0 in fill_log → the position
+                    # closed and its exit fill was never ingested (aged out of
+                    # reqExecutions before any run polled it).  This is the
+                    # GE/VRT 2026-06-08 silent-drop class — the inverse of the
+                    # net<0 lone-exit below.  The legacy "leaving fills for a
+                    # later run" message is a lie here: the exit will NEVER
+                    # arrive via reqExecutions, so a realised round trip stays
+                    # unrecorded indefinitely.  Surface it loudly so it's
+                    # recoverable (Flex backfill).  Deliberately NOT synthesising
+                    # the exit — same "trade_log = end-to-end-observed trades
+                    # only" discipline as the net<0 branch.
+                    result.n_missed_exits += 1
+                    log.warning("Reconciliation: %s entry fill(s) with net=%.2f "
+                                "but FLAT at the broker — exit fill was missed "
+                                "(aged out of reqExecutions); realised exit is "
+                                "unrecorded.  Recover via a Flex backfill",
+                                sym, net)
+                else:
+                    # Open long / partial — entry with no (full) matching exit
+                    # yet, and the broker still shows the position held (or no
+                    # broker state was supplied to disprove it).
+                    log.warning("Reconciliation: %s not flat at window end "
+                                "(net=%.2f) — open position / partial, leaving "
+                                "fills for a later run", sym, net)
             else:
                 # net < 0: exit fill(s) with NO matching entry in fill_log — the
                 # 2026-06-05 GLW silent-drop class.  A between-run exit whose

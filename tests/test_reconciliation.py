@@ -174,6 +174,88 @@ class TestIdempotencyAndOrphans:
         assert _trades("GLW").empty
 
 
+class TestMissedExitDetection:
+    """Regression for the 2026-06-08 GE/VRT silent-drop.
+
+    A net>0 orphan (entry with no matching exit) whose symbol is FLAT at the
+    broker means the position closed but its exit fill was never ingested (aged
+    out of reqExecutions).  When ``live_positions`` is supplied, this must be
+    surfaced as a distinct ``n_missed_exits`` rather than deferred as still-open.
+    The inverse of the net<0 lone-exit branch above.
+    """
+
+    def test_flat_at_broker_flagged_as_missed_exit(self, mem_engine):
+        from execution.reconciliation import reconcile_fills
+
+        t0 = _now() - timedelta(days=2)
+        execs = [_exec("E1", "GE", "BUY", 139, 283.21, t=t0, order_type="LMT")]
+        # Broker holds nothing → GE entry is flat at the broker = missed exit.
+        res = reconcile_fills(_fetcher(execs), live_positions=set())
+
+        assert res.n_orphans == 1
+        assert res.n_missed_exits == 1          # flagged, not deferred
+        assert res.n_trades_written == 0        # no synthetic exit fabricated
+        assert _trades("GE").empty
+
+    def test_still_held_not_flagged(self, mem_engine):
+        from execution.reconciliation import reconcile_fills
+
+        t0 = _now() - timedelta(days=2)
+        execs = [_exec("E1", "AXTI", "BUY", 357, 111.93, t=t0, order_type="LMT")]
+        # Broker still holds AXTI → genuinely open, legacy "leaving for later".
+        res = reconcile_fills(_fetcher(execs), live_positions={"AXTI"})
+
+        assert res.n_orphans == 1
+        assert res.n_missed_exits == 0
+        assert res.n_trades_written == 0
+
+    def test_no_live_positions_preserves_legacy_behavior(self, mem_engine):
+        from execution.reconciliation import reconcile_fills
+
+        t0 = _now() - timedelta(days=2)
+        execs = [_exec("E1", "AAPL", "BUY", 10, 100.0, t=t0, order_type="LMT")]
+        # live_positions omitted (Flex-backfill / test path) → no missed-exit
+        # escalation; identical to the pre-fix orphan behaviour.
+        res = reconcile_fills(_fetcher(execs))
+
+        assert res.n_orphans == 1
+        assert res.n_missed_exits == 0
+
+    def test_partial_exit_still_held_not_flagged(self, mem_engine):
+        from execution.reconciliation import reconcile_fills
+
+        t0 = _now() - timedelta(days=2)
+        execs = [
+            _exec("B1", "MU", "BUY",  200, 100.0, t=t0, order_type="LMT"),
+            _exec("S1", "MU", "SELL", 100, 110.0, t=t0 + timedelta(hours=1),
+                  order_type="LMT"),
+        ]
+        # net=+100 and MU still held at broker → open/partial, not a missed exit.
+        res = reconcile_fills(_fetcher(execs), live_positions={"MU"})
+
+        assert res.n_orphans == 1
+        assert res.n_missed_exits == 0
+        assert res.n_trades_written == 0        # round trip not yet closed
+
+    def test_completed_round_trip_unaffected_by_live_positions(self, mem_engine):
+        from execution.reconciliation import reconcile_fills
+
+        t0 = _now() - timedelta(days=2)
+        execs = [
+            _exec("E1", "SPY", "BUY",  10, 100.0, t=t0, order_type="LMT"),
+            _exec("E2", "SPY", "SELL", 10, 110.0, t=t0 + timedelta(hours=1),
+                  order_type="LMT"),
+        ]
+        # A flat-at-broker symbol with a COMPLETE round trip still writes the
+        # trade — the missed-exit branch only fires for leftover net>0 fills.
+        res = reconcile_fills(_fetcher(execs), live_positions=set())
+
+        assert res.n_trades_written == 1
+        assert res.n_orphans == 0
+        assert res.n_missed_exits == 0
+        assert len(_trades("SPY")) == 1
+
+
 class TestInvertedRoundTripGuard:
     """Regression for the 2026-06-05 SLV exit-before-entry corruption.
 

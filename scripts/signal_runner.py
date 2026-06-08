@@ -296,15 +296,24 @@ def _phase1_reconcile_fills(dry_run: bool) -> None:
 
     try:
         from execution.reconciliation import reconcile_fills
+        # Pass the broker's currently-held symbols so reconciliation can tell a
+        # genuinely-open net>0 orphan apart from one that's flat at the broker
+        # (exit fill missed / aged out — the GE/VRT 2026-06-08 silent-drop class).
+        held_symbols = set(_fetch_positions(ibkr, loop).keys())
         result = reconcile_fills(
             lambda since: loop.run_until_complete(ibkr.get_executions(since)),
+            live_positions=held_symbols,
         )
-        print(
+        msg = (
             f"  Reconciliation: {result.n_new_fills} new fill(s), "
             f"{result.n_cost_updated} cost-updated, "
             f"{result.n_trades_written} live trade(s) written, "
             f"{result.n_orphans} orphan(s)."
         )
+        if result.n_missed_exits:
+            msg += (f"  ⚠ {result.n_missed_exits} missed exit(s) "
+                    f"(flat at broker, exit fill not ingested — Flex-recover).")
+        print(msg)
     except Exception as exc:
         log.warning("Fill reconciliation failed: %s", exc)
         print(f"  ⚠  Fill reconciliation failed — {exc}")
