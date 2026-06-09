@@ -50,6 +50,8 @@ The `signal_runner.py` script works in seven sequential phases (Phase 3.5 and Ph
 ### Phase 1 — Startup
 First (when not in dry-run) reconcile any off-cycle IBKR fills into `fill_log` + `trade_log` (Phase B — `execution/reconciliation.py`), so exits that filled between runs are captured before sizing reads `trade_log`. Then determine which symbols to process, check the circuit breaker state, capture an equity-baseline snapshot from IBKR, and auto-trip the circuit breaker if the realised + unrealised P&L vs that baseline has exceeded the daily / weekly loss limits. Includes orphan-position detection so any held long not in the active universe still gets pulled into the symbol list.
 
+> **Note — `reqExecutions` is current-session only.** The in-run Phase 1 poll uses IBKR `reqExecutions`, which only returns the *current* Gateway session's fills. On a Gateway that resets overnight (this account's normal behaviour) the morning poll typically sees nothing from the prior session, so between-run fills are missed by the live path. The durable backstop is the **IBKR Flex Query Web Service** (`scripts/reconcile_flex.py`, run as daily-batch Step 3c), which is session-independent and retains a year+ — it recovers prior-day fills the morning after (Flex is T+1). The two are complementary: `reqExecutions` catches same-session fills, Flex catches everything through yesterday. See `data/flex_client.py` and the CLAUDE.md "Flex Web Service is the durable trade-history source" architectural-decision note.
+
 ### Phase 2 — Data refresh
 Fetch the latest OHLCV bars and news for the symbols selected in Phase 1. This is an incremental update — only new bars since the last run are fetched. yfinance is the primary source for price data; IBKR/Alpaca/yfinance are tried in order for news. Symbols whose newest cached daily bar is older than `risk.max_bar_staleness_days` (default 3) are dropped before Phase 3 generates signals.
 
@@ -178,7 +180,7 @@ The most important tables:
 | `signal_log` | Orchestrator | Dashboard page 3 |
 | `order_decisions` | OrderManager | Dashboard page 8 |
 | `trade_log` | Walk-forward simulator (`source='walk_forward'`) + IBKR fill reconciliation (`source='live'`, Phase B — `execution/reconciliation.py`) | Dashboard page 10, realised-Kelly |
-| `fill_log` / `reconciliation_state` | IBKR fill reconciliation (Phase B) | `trade_log` aggregation (audit trail + watermark) |
+| `fill_log` / `reconciliation_state` | IBKR fill reconciliation (Phase B — `reqExecutions` in-session poll **and** the Flex Web Service daily backstop, `scripts/reconcile_flex.py`) | `trade_log` aggregation (audit trail + watermark) |
 | `trailing_stop_log` | TrailingStopManager | Dashboard page 8 |
 | `signal_runner_log` | signal_runner.py | Dashboard page 8 |
 

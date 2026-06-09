@@ -159,7 +159,7 @@ The daily and weekly runs are driven by two batch files that execute the pipelin
 
 | File | When | Steps |
 |------|------|-------|
-| `run_daily.bat` | Mon–Fri 09:40 AM | `run_pipeline.py` → `universe_scheduler.py --rescore-now --no-signal-run` → `train_models.py` (new symbols only) → `backfill_benchmark_returns.py` → `signal_runner.py` (data refresh → signals → trailing-stop conversion → hold-timeout flatten → new orders) |
+| `run_daily.bat` | Mon–Fri 09:40 AM | `run_pipeline.py` → `universe_scheduler.py --rescore-now --no-signal-run` → `train_models.py` (new symbols only) → `reconcile_flex.py` (Step 3c — Flex Web Service backstop for between-run fills) → `backfill_benchmark_returns.py` → `signal_runner.py` (data refresh → signals → trailing-stop conversion → hold-timeout flatten → new orders) |
 | `run_intraday.bat` | Mon–Fri 12:00 PM ET and 03:30 PM ET | `intraday_check.py` — Phase 1 circuit-breaker check + Phase 3.5 trailing-stop re-evaluation against live IBKR price.  Two scheduled slots per day.  Ratchet-only by default (no new TP→TRAIL conversions; opt-in via `RiskConfig.intraday_trail_conversion_enabled`).  Exits 0 on Gateway-down with a `status='gateway_down'` row in `intraday_run_log` so missed runs are visible on Page 8. |
 | `run_eod.bat`   | Mon–Fri 04:30 PM ET | `refresh_recent_bars.py` — re-fetches the last 5 days of OHLCV + indicators for the union of (active universe, recently-acted symbols, held positions) and overwrites the mid-day partial bars the morning `signal_runner` Phase 2 wrote |
 | `run_weekly.bat` | Sunday 01:00 AM | `universe_scheduler.py --run-now` → `run_pipeline.py` → `train_models.py --force` → `backfill_benchmark_returns.py` |
@@ -315,10 +315,14 @@ These reconstruct `trade_log` / `fundamental_data` from external sources. The da
 ```bash
 python scripts/reconcile_fills.py              # poll IBKR reqExecutions → fill_log → trade_log (needs Gateway)
 python scripts/reconcile_fills.py --dry-run    # show what would be reconciled without writing
-python scripts/backfill_flex_trades.py FILE.xml  # one-time: recover fills aged out of the 7-day reqExecutions window from an IBKR Activity Flex Query export (no Gateway needed)
+python scripts/reconcile_flex.py               # durable backstop: fetch the IBKR Flex Web Service → fill_log → trade_log (NO Gateway; needs IBKR_FLEX_TOKEN + IBKR_FLEX_QUERY_ID)
+python scripts/reconcile_flex.py --dry-run     # fetch + parse + show without writing
+python scripts/backfill_flex_trades.py FILE.xml  # one-time: recover fills from a manually-exported IBKR Activity Flex Query XML file (no Gateway, no token)
 python scripts/backfill_benchmark_returns.py   # idempotent: fill trade_log.benchmark_return_pct (raw SPY return over each trade's hold)
 python scripts/backfill_sectors.py             # one-time: fill fundamental_data.sector on pre-2026-06-03 rows
 ```
+
+> **Why `reconcile_flex.py` exists:** `reqExecutions` (used by `reconcile_fills.py` and the daily Phase 1 poll) only returns the *current* Gateway session's fills — on a Gateway that resets overnight, the morning poll misses every between-run fill. The Flex Web Service is session-independent and retains a year+, so it recovers prior-day fills the morning after (Flex is **T+1**). It runs automatically as `run_daily.bat` Step 3c once the two env vars are set; it's a no-op (exit 0) when they aren't, and degrades gracefully (exit 0, retried next day) on a Flex service error. Unlike `backfill_flex_trades.py` (which parses a file you export by hand) this fetches over HTTPS — no manual export.
 
 ### Backup — `backup.bat`
 
@@ -334,6 +338,14 @@ Settings are edited in the dashboard (Settings page) or directly in `config/sett
 # Required for Alpaca news and universe selection
 set ALPACA_API_KEY=your_key
 set ALPACA_SECRET_KEY=your_secret
+
+# Optional — enables the daily Flex Web Service reconciliation backstop (Step 3c).
+# Generate both in IBKR Account Management → Flex Web Service (token) + a Trades
+# Flex Query (Level of Detail = Execution, period Month-to-Date or Last N Days).
+# When unset, reconcile_flex.py is a no-op. The token is a secret (never written
+# to settings.yaml). Prefer a .env file (gitignored, auto-loaded at startup).
+set IBKR_FLEX_TOKEN=your_flex_token
+set IBKR_FLEX_QUERY_ID=your_query_id
 ```
 
 Key settings:

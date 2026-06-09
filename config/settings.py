@@ -407,6 +407,33 @@ class LLMConfig:
 
 
 @dataclass
+class FlexConfig:
+    """IBKR Flex Query Web Service — durable, session-independent trade history.
+
+    The real-time ``reqExecutions`` poll only sees the current Gateway session,
+    which the overnight reset wipes; the Flex Web Service retains a year+ and is
+    polled once per daily run by ``scripts/reconcile_flex.py`` to backfill any
+    prior-day fills the live path missed.  ``token`` is a secret (read from env,
+    never written to YAML — see ``_SECRET_FIELDS``); generate it + a Trades
+    (Level of Detail = Execution, period Month-to-Date or Last N Days) query in
+    IBKR Account Management.  When ``token``/``query_id`` are unset the reconcile
+    step is a no-op, so the feature is opt-in by simply not setting the env vars.
+
+    ``source_tz`` is the timezone the query's ``dateTime`` field is emitted in;
+    this account's queries emit US/Eastern (verified 2026-06-09: a VRT fill at
+    Flex ``143817`` == ``18:38:17`` UTC in fill_log).  Dedup is keyed on
+    ``ibExecID`` so a wrong tz never double-writes — it only shifts shown times.
+    """
+    token:     str = field(default_factory=lambda: os.environ.get("IBKR_FLEX_TOKEN", ""))
+    query_id:  str = field(default_factory=lambda: os.environ.get("IBKR_FLEX_QUERY_ID", ""))
+    source_tz: str = "America/New_York"
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.token and self.query_id)
+
+
+@dataclass
 class AppConfig:
     """Top-level app config — compose all sub-configs here."""
     ibkr:     IBKRConfig     = field(default_factory=IBKRConfig)
@@ -418,6 +445,7 @@ class AppConfig:
     risk:     RiskConfig     = field(default_factory=RiskConfig)
     logging:  LoggingConfig  = field(default_factory=LoggingConfig)
     llm:      LLMConfig      = field(default_factory=LLMConfig)
+    flex:     FlexConfig     = field(default_factory=FlexConfig)
 
 
 # ── Singleton instance ────────────────────────────────────────────────────────
@@ -438,10 +466,11 @@ _SECTION_MAP = {
     "risk":     lambda: config.risk,
     "logging":  lambda: config.logging,
     "llm":      lambda: config.llm,
+    "flex":     lambda: config.flex,
 }
 
 # Fields that should never be written to YAML (live in env vars only)
-_SECRET_FIELDS = {"api_key", "secret_key"}
+_SECRET_FIELDS = {"api_key", "secret_key", "token"}
 
 
 def _apply_yaml_section(obj, values: dict, section_name: str = "") -> None:
