@@ -95,6 +95,10 @@ class TestDigestDetection:
         "Substantial Insider Purchases: Morning Report",
         "Comex Gold Delivery Intentions Breakdown - Jun 3",
         "HPE, Marvell, Oracle, Google, and More Stocks That Explain Today's Market -- Barrons.com",
+        "CFA Technology:Insider Review For Week Ended 5-Jun -5-",
+        "CFA High Yield:Insider Review For Week Ended 5-Jun -2-",
+        "Stock Market Today: Dow, S&P 500 Extend Win Streaks; Apple Rises, Nvidia Sinks -- IBD",
+        "Dow Jones Futures: Broadcom, Micron, Nvidia, Sandisk, Tesla Are Big Movers -- IBD",
     ])
     def test_known_digest_headlines(self, headline):
         assert is_digest(headline) is True

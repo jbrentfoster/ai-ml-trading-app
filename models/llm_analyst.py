@@ -169,6 +169,9 @@ _DIGEST_HEADLINE_PATTERNS = (
     re.compile(r"\bdelivery intentions\b", re.I),          # "Comex Gold Delivery Intentions Breakdown"
     re.compile(r"\bstocks that explain (today'?s|the) market", re.I),  # Barron's market wrap
     re.compile(r",\s*and more stocks\b", re.I),            # "HPE, Marvell, ... and More Stocks ..."
+    re.compile(r"\binsider review\b", re.I),               # "CFA Technology:Insider Review For Week Ended ..."
+    re.compile(r"\bstock market today\b", re.I),           # IBD daily market wrap (multi-company)
+    re.compile(r"\bdow jones futures\b", re.I),            # IBD futures wrap (multi-company)
 )
 
 
