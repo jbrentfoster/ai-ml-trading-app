@@ -6,6 +6,18 @@ The retirement convention lives in CLAUDE.md → *Convention: documenting fixed 
 
 ---
 
+## 2026-06-10
+
+### Daily `reqExecutions` reconciliation systematically returns 0 — Gateway overnight reset wipes prior-session fills
+
+*(code complete 2026-06-09 → verified 2026-06-10)* (`execution/reconciliation.py`, `execution/ibkr_connection.py:get_executions`, `data/flex_client.py`, `scripts/reconcile_flex.py`): the Phase B polling design assumed IBKR retains ~7d of executions server-side, but a 2026-06-09 empirical probe proved the entire real-time API tier (`reqExecutions` with/without time filter, `reqCompletedOrders`, `ib.fills()`/`trades()`) is **current-session-only** — on this nightly-resetting Gateway, effective retention is <24h, so the ~10am poll reliably `fetched 0`. Observed 2026-06-08 + 2026-06-09 (two consecutive empty polls): IWM/SATS entries APPROVED+filled 6/08, held, had zero `fill_log` rows (escalated from the 2026-06-08 GE/VRT silent-drop followup). **Fix:** added the IBKR Flex Query **Web Service** as a durable, session-independent daily backstop — `data/flex_client.py` (`SendRequest`+1001-backoff / `GetStatement`+1019-poll), `FlexConfig` (env `IBKR_FLEX_TOKEN`/`IBKR_FLEX_QUERY_ID`, `token` ∈ `_SECRET_FIELDS`), `scripts/reconcile_flex.py` (reuses `parse_flex_trades` + `reconcile_fills`, dedups on `ibExecID`), wired as `run_daily.bat` Step 3c. Flex is T+1 (recovers prior-day fills); the in-session `reqExecutions` poll stays as the same-day path. See the "Flex Web Service is the durable trade-history source" architectural-decision note. Note: does NOT fix the *upstream* cause (Gateway wiping execution history overnight); the durable answer to keep the in-session poll useful is IBC (keep the session alive overnight) — tracked as a separate Enhancement.
+
+**Status:** 12 new tests in `tests/test_flex_client.py`; full suite **441 passed**; real run 2026-06-09 (via cached statement ref) recovered the 14 missing fills (IWM/SATS/ON/INTC/GLW entries) with **0 double-writes** (17 fills + 31 round trips deduped) and `exit_ts<entry_ts`=0 held.
+
+**Verified (2026-06-10 — first scheduled `run_daily.bat` Step 3c):** the Flex backstop ran un-throttled on today's daily run (`Flex statement retrieved (ref=5324557942, 78858 bytes)`, first `SendRequest` succeeded with no 1001 throttle), parsed 46 executions, and **wrote 4 live round trips the in-session poll missed** — AXTI/GEV/NXPI/ON stops, all exited 2026-06-09 (`trade_log` id 2187–2190, total −$20,154.38): `n_new_fills=15, n_trades_written=4, n_skipped_fills=31 (dedup), 0 double-writes`, invariant holds (`exit_ts<entry_ts`=0, `n_missed_exits=0`, `n_skipped_inverted=0`). The position-diff fully reconciled (every 6/09→6/10 disappearance maps to a written round trip; no silent drops), and the in-session Phase 1 poll still `fetched 0` — confirming reqExecutions is session-only by design while the Flex backstop (T+1) now covers the gap. Exactly the verification signature the entry's "Verification pending" called for.
+
+---
+
 ## 2026-05-31
 
 *Verification sweep — eight "code complete — awaiting live verification" entries whose verification triggers had fired (the daily/weekly cadence ran them many times since the code landed) and whose evidence was confirmed in the DB / logs from today's 2026-05-31 weekly retrain, or by an active test this session.*

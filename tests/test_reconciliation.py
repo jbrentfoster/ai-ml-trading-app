@@ -125,6 +125,46 @@ class TestReconcileHappyPath:
         assert row["exit_exec_id"] == "S2"          # closing (latest) exit fill
 
 
+class TestExitedSymbolsTracking:
+    """exited_symbols drives the same-run exit-day bar refresh (losers_2026-06.md §5a)."""
+
+    def test_written_round_trip_records_exited_symbol(self, mem_engine):
+        from execution.reconciliation import reconcile_fills
+
+        t0 = _now() - timedelta(days=2)
+        execs = [
+            _exec("E1", "GEV", "BUY",  4, 100.0, t=t0, order_type="LMT"),
+            _exec("E2", "GEV", "SELL", 4,  90.0, t=t0 + timedelta(hours=1),
+                  order_type="STP"),
+        ]
+        res = reconcile_fills(_fetcher(execs))
+        assert res.n_trades_written == 1
+        assert res.exited_symbols == {"GEV"}
+
+    def test_dry_run_does_not_record_exited_symbol(self, mem_engine):
+        from execution.reconciliation import reconcile_fills
+
+        t0 = _now() - timedelta(days=2)
+        execs = [
+            _exec("E1", "GEV", "BUY",  4, 100.0, t=t0, order_type="LMT"),
+            _exec("E2", "GEV", "SELL", 4,  90.0, t=t0 + timedelta(hours=1),
+                  order_type="STP"),
+        ]
+        res = reconcile_fills(_fetcher(execs), dry_run=True)
+        # dry-run never persists fills, so there is nothing to refresh and no
+        # caller-visible exit to act on — exited_symbols must stay empty.
+        assert res.exited_symbols == set()
+
+    def test_orphan_only_run_records_no_exited_symbol(self, mem_engine):
+        from execution.reconciliation import reconcile_fills
+
+        t0 = _now() - timedelta(days=2)
+        execs = [_exec("E1", "MU", "BUY", 4, 100.0, t=t0, order_type="LMT")]
+        res = reconcile_fills(_fetcher(execs), live_positions={"MU"})
+        assert res.n_trades_written == 0
+        assert res.exited_symbols == set()
+
+
 class TestIdempotencyAndOrphans:
 
     def test_idempotent_rerun_is_noop(self, mem_engine):

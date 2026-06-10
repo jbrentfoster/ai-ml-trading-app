@@ -314,6 +314,15 @@ def _phase1_reconcile_fills(dry_run: bool) -> None:
             msg += (f"  ⚠ {result.n_missed_exits} missed exit(s) "
                     f"(flat at broker, exit fill not ingested — Flex-recover).")
         print(msg)
+        # Finalise the exit-day bar(s) for any symbol that just got a live exit
+        # row, so a rotated-out long-held name's exit-day OHLCV isn't left as a
+        # stale mid-morning partial until the next EOD run (losers_2026-06.md §5a).
+        if result.exited_symbols:
+            from scripts.refresh_recent_bars import refresh_symbols
+            n_bars, _n_ind, _failed = refresh_symbols(result.exited_symbols)
+            print(f"  ⟳  Finalised exit-day bars for {len(result.exited_symbols)} "
+                  f"reconciled symbol(s): {sorted(result.exited_symbols)} "
+                  f"({n_bars} bar(s) overwritten)")
     except Exception as exc:
         log.warning("Fill reconciliation failed: %s", exc)
         print(f"  ⚠  Fill reconciliation failed — {exc}")

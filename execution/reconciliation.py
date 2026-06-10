@@ -36,7 +36,7 @@ Never compute net_pnl = pnl - costs_charged anywhere — that double-counts fees
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Iterable, Optional
 
@@ -71,6 +71,12 @@ class ReconcileResult:
     n_missed_exits: int = 0     # net>0 orphans that are FLAT at the broker (exit fill missed)
     n_skipped_inverted: int = 0 # pairings rejected for exit_ts <= entry_ts
     window_start: Optional[datetime] = None
+    # Symbols for which a source='live' exit row was actually written this run.
+    # Callers with data-fetch access (signal_runner Phase 1, scripts/reconcile_flex)
+    # refresh these symbols' recent bars immediately so the exit-day OHLCV bar is
+    # finalised in the same run that records the trade — closing the ~1-day stale-bar
+    # window for rotated-out long-held names (AXTI/GEV 2026-06-09; losers_2026-06.md §5a).
+    exited_symbols: set = field(default_factory=set)
 
 
 def _utc_now_naive() -> datetime:
@@ -445,3 +451,4 @@ def _write_round_trip(symbol: str, entry_fills: list[dict], exit_fills: list[dic
         "recorded_at":     _utc_now_naive(),
     })
     result.n_trades_written += 1
+    result.exited_symbols.add(symbol)

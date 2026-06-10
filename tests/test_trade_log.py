@@ -256,51 +256,52 @@ class TestBenchmarkAggregatesBaseline20260519:
             "win_rate_vs_bench": 100.0 * (strategy["excess_pct"] > 0).sum() / n,
         }
 
-    def test_benchmark_aggregates_deduped_baseline_2026_06_08(self):
+    def test_benchmark_aggregates_deduped_baseline_2026_06_10(self):
         """Default page view (dedup=ON, active_universe=ON), fold_end excluded.
 
-        Pin date: 2026-06-08.  Tolerances are wide enough to absorb
+        Pin date: 2026-06-10.  Tolerances are wide enough to absorb
         floating-point recomputation but tight enough to catch a real shift.
         FAILURE EXPECTED after the next weekly retrain — re-pin to new
         numbers and bump the date in the test name.
 
-        Re-pin note (2026-06-08): NOT a retrain — a one-time Flex backfill on the
-        6/08 daily run recovered two between-run live exits that had aged out of
-        reqExecutions (GE +$5,928.17 winner, +13.75% excess; VRT -$4,258.45 stop,
-        -11.15% excess — see daily_run_20260608 review).  Both are source='live'
-        rows, so they pass dedup AND the active-universe filter untouched.
-        Deduped n 120 -> 122 (+2); cum_excess +313.50 -> +316.10 (+2.60 = GE
-        +13.75 - VRT 11.15); win_rate unchanged 49.2.  The identical +2 rows /
-        +2.60 pp delta on the raw view below is the internal-consistency check
-        (same 2 live rows in both slices — mirrors the 2026-06-01 Flex-backfill
-        re-pin)."""
+        Re-pin note (2026-06-10): NOT a retrain — the first scheduled Flex Web
+        Service backstop (run_daily.bat Step 3c) recovered FOUR between-run live
+        stop exits that the in-session reqExecutions poll missed (Gateway
+        overnight reset): AXTI -$8,875.73/-21.45% excess, ON -$4,410.16/-10.98%,
+        GEV -$3,760.75/-9.22%, NXPI -$3,107.74/-5.53% — all exited 2026-06-09,
+        all source='live' (see daily_run_20260610 review).  Live rows pass dedup
+        AND the active-universe filter, so deduped n 122 -> 126 (+4); cum_excess
+        +316.10 -> +268.92 (Δ -47.18 = sum of the 4 rows' excess); win_rate
+        49.2 -> 47.6 (4 fresh losses).  The identical +4 rows / -47.18 pp delta
+        on the raw view below is the internal-consistency check (same 4 live rows
+        in both slices)."""
         m = self._strategy_metrics(dedup=True, active_universe=True)
-        assert m["n"]                 == 122,                      (
-            f"Row count drifted from 2026-06-08 baseline of 122 — got {m['n']}.  "
+        assert m["n"]                 == 126,                      (
+            f"Row count drifted from 2026-06-10 baseline of 126 — got {m['n']}.  "
             "Likely cause: a new weekly --force retrain has landed.  Eyeball "
             "the new numbers (Page 10 default view) and re-pin this test."
         )
-        assert m["cum_excess_pct"]    == pytest.approx(+316.10, abs=0.5)
-        assert m["win_rate_vs_bench"] == pytest.approx(  49.2,  abs=0.5)
+        assert m["cum_excess_pct"]    == pytest.approx(+268.92, abs=0.5)
+        assert m["win_rate_vs_bench"] == pytest.approx(  47.6,  abs=0.5)
 
-    def test_benchmark_aggregates_raw_baseline_2026_06_08(self):
+    def test_benchmark_aggregates_raw_baseline_2026_06_10(self):
         """Multi-run view (dedup=OFF, active_universe=OFF), fold_end excluded.
 
-        Pin date: 2026-06-08.  Same fold_end-excluded slice as the deduped
+        Pin date: 2026-06-10.  Same fold_end-excluded slice as the deduped
         baseline — the divergence vs the deduped numbers is the architectural
         finding (see CLAUDE.md 'Dedup vs raw views are honest answers').
 
-        Re-pin note (2026-06-08): NOT a retrain — the same GE/VRT Flex backfill
-        as the deduped re-pin above.  Live rows survive both dedup and the
-        active-universe filter, so raw n grew by the SAME +2 (1179 -> 1181) and
-        cum_excess moved by the SAME +2.60 pp (-540.00 -> -537.40); win_rate
-        unchanged 37.5.  The identical delta on both views confirms the same 2
+        Re-pin note (2026-06-10): NOT a retrain — the same 4 Flex-recovered stop
+        exits as the deduped re-pin above.  Live rows survive both dedup and the
+        active-universe filter, so raw n grew by the SAME +4 (1181 -> 1185) and
+        cum_excess moved by the SAME -47.18 pp (-537.40 -> -584.58); win_rate
+        37.5 -> 37.4.  The identical delta on both views confirms the same 4
         live rows populate both slices."""
         m = self._strategy_metrics(dedup=False, active_universe=False)
-        assert m["n"]                 == 1181,                     (
-            f"Row count drifted from 2026-06-08 baseline of 1181 — got {m['n']}.  "
+        assert m["n"]                 == 1185,                     (
+            f"Row count drifted from 2026-06-10 baseline of 1185 — got {m['n']}.  "
             "Likely cause: a new --force retrain inserted rows OR the backfill "
             "skipped rows for some symbols.  Investigate before re-pinning."
         )
-        assert m["cum_excess_pct"]    == pytest.approx(-537.40, abs=2.0)
-        assert m["win_rate_vs_bench"] == pytest.approx(   37.5,  abs=0.5)
+        assert m["cum_excess_pct"]    == pytest.approx(-584.58, abs=2.0)
+        assert m["win_rate_vs_bench"] == pytest.approx(   37.4,  abs=0.5)

@@ -114,6 +114,19 @@ def main() -> int:
     )
     if result.n_trades_written:
         print(f"  ✓  {result.n_trades_written} live round trip(s) recovered via Flex.")
+
+    # Finalise the exit-day bar(s) for every symbol that just got a live exit row.
+    # Flex is T+1, so the exit day is a completed prior session — refreshing now
+    # overwrites the stale mid-morning partial that would otherwise hide the stop
+    # fill until the next EOD run (rotated-out long-held names; losers_2026-06.md §5a).
+    if not args.dry_run and result.exited_symbols:
+        from scripts.refresh_recent_bars import refresh_symbols
+        n_bars, _n_ind, failed = refresh_symbols(result.exited_symbols)
+        print(f"  ⟳  Finalised exit-day bars for {len(result.exited_symbols)} "
+              f"reconciled symbol(s): {sorted(result.exited_symbols)} "
+              f"({n_bars} bar(s) overwritten)")
+        if failed:
+            print(f"     ⚠  bar refresh failed for: {sorted(failed)}")
     return 0
 
 

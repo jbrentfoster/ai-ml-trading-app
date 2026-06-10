@@ -146,6 +146,31 @@ def _refresh_indicators(symbol: str, interval: str) -> int:
     return upsert_indicators(ind_df, symbol, interval, overwrite=True)
 
 
+def refresh_symbols(symbols, interval: str = "1d", days_back: int = 5) -> tuple[int, int, list[str]]:
+    """Refresh recent bars + indicators for an arbitrary set of symbols.
+
+    The reusable core of ``main()``'s per-symbol loop, factored out so the daily
+    reconciliation callers (signal_runner Phase 1, scripts/reconcile_flex) can
+    finalise the exit-day bar of a just-reconciled trade in the SAME run that
+    records it — closing the ~1-day stale-bar window for rotated-out long-held
+    names whose exit-day bar is otherwise left as a mid-morning partial until the
+    next EOD run (AXTI/GEV 2026-06-09; losers_2026-06.md §5a).  Overwrites via
+    ``refresh_recent`` (days_back covers the prior-day exit bar with margin).
+    Returns ``(n_bars, n_ind, failed_symbols)``.
+    """
+    fetcher = DataFetcher()
+    bars_total = ind_total = 0
+    failed: list[str] = []
+    for sym in sorted({s for s in symbols if s}):
+        try:
+            bars_total += fetcher.refresh_recent(sym, interval=interval, days_back=days_back)
+            ind_total  += _refresh_indicators(sym, interval)
+        except Exception as exc:
+            failed.append(sym)
+            log.error("Refresh failed for %s: %s", sym, exc, exc_info=True)
+    return bars_total, ind_total, failed
+
+
 def main(days_back: int = 5, use_ibkr: bool = True, interval: str = "1d") -> None:
     print(f"=== End-of-day bar refresh (days_back={days_back}, interval={interval}) ===")
     started = datetime.now(timezone.utc).replace(tzinfo=None)
