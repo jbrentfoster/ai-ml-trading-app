@@ -252,8 +252,8 @@ class RiskConfig:
     correlation_lookback_bars: int = 60     # bars used for correlation calculation
 
     # ── Circuit breaker ───────────────────────────────────────────────────────
-    circuit_breaker_daily_loss_pct: float = 0.03   # 3% single-day loss → halt
-    circuit_breaker_weekly_loss_pct: float = 0.07  # 7% weekly loss → halt
+    circuit_breaker_daily_loss_pct: float = 0.05   # 5% single-day loss → halt
+    circuit_breaker_weekly_loss_pct: float = 0.10  # 10% weekly loss → halt
     circuit_breaker_reset_hours: int = 24           # auto-reset after N hours
 
     # ── Stale-bar gate ────────────────────────────────────────────────────────

@@ -550,8 +550,8 @@ Key configurable fields:
 | `RiskConfig.kelly_max_position_pct` | 0.10 | Hard cap on any single position regardless of Kelly output |
 | `RiskConfig.atr_stop_multiplier` | 2.0 | Stop = entry ± ATR × multiplier |
 | `RiskConfig.atr_take_profit_multiplier` | 3.0 | Take-profit = entry ± ATR × multiplier |
-| `RiskConfig.circuit_breaker_daily_loss_pct` | 0.03 | 3% single-day loss triggers trading halt |
-| `RiskConfig.circuit_breaker_weekly_loss_pct` | 0.07 | 7% weekly loss triggers trading halt |
+| `RiskConfig.circuit_breaker_daily_loss_pct` | 0.05 | 5% single-day loss triggers trading halt (raised from 0.03 on 2026-06-11 — 3% was first-line position-risk territory for a high-beta semis/AI book; the CB is the portfolio tail-brake behind the per-position ATR stops, so it sits further out. See CHANGELOG 2026-06-11) |
+| `RiskConfig.circuit_breaker_weekly_loss_pct` | 0.10 | 10% weekly loss triggers trading halt (raised from 0.07 on 2026-06-11 in tandem with the daily bump — keeps the pair coherent so a single max-daily-loss day doesn't make the weekly limit the de-facto daily brake) |
 | `RiskConfig.circuit_breaker_reset_hours` | 24 | Auto-reset halt after N hours |
 | `RiskConfig.max_sector_exposure_pct` | 0.30 | 30% cap on total equity in any one sector |
 | `RiskConfig.max_correlated_positions` | 3 | Max positions with Pearson r ≥ correlation_threshold |

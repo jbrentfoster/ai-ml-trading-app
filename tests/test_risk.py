@@ -711,18 +711,22 @@ class TestCircuitBreaker:
         assert triggered is False
         assert cb.is_halted()[0] is False
 
-    def test_daily_loss_triggers(self, mem_engine):
-        """A daily loss past the 3% limit trips the breaker with a magnitude message."""
+    def test_daily_loss_triggers(self, mem_engine, monkeypatch):
+        """A daily loss past the configured limit trips the breaker with a magnitude
+        message.  Pins its own limit via monkeypatch so the logic test is independent
+        of the production default (which moved 3%→5% on 2026-06-11)."""
         cb = self._cb()
-        triggered = cb.check_loss_limits(-0.035, 0.0)
+        monkeypatch.setattr(cb._cfg, "circuit_breaker_daily_loss_pct", 0.05)
+        triggered = cb.check_loss_limits(-0.06, 0.0)
         assert triggered is True
         halted, reason = cb.is_halted()
         assert halted is True
-        assert "Daily loss 3.5% >= limit 3.0%" in reason
+        assert "Daily loss 6.0% >= limit 5.0%" in reason
 
-    def test_weekly_loss_triggers(self, mem_engine):
+    def test_weekly_loss_triggers(self, mem_engine, monkeypatch):
         cb = self._cb()
-        triggered = cb.check_loss_limits(0.0, -0.08)
+        monkeypatch.setattr(cb._cfg, "circuit_breaker_weekly_loss_pct", 0.10)
+        triggered = cb.check_loss_limits(0.0, -0.12)
         assert triggered is True
         assert cb.is_halted()[0] is True
 
