@@ -2215,3 +2215,36 @@ def has_closed_long_near(symbol: str, ts: datetime, minutes: int = 1) -> bool:
             .first()
         )
     return row is not None
+
+
+def has_cb_flatten_near(symbol: str, ts: datetime, minutes: int = 5) -> bool:
+    """True if ``symbol`` has a CB_FLATTENED order_decision within ±``minutes`` of ``ts``.
+
+    Disambiguates a forced circuit-breaker liquidation from a discretionary
+    close.  ``intraday_check.py`` / ``order_manager.flatten_all_longs`` cancel a
+    position's bracket children and submit a plain MKT sell when the daily/weekly
+    loss limit trips — leaving no signal the reconciler's exit-reason waterfall
+    recognises, so it otherwise mislabels these as ``manual_close`` (MKT default)
+    or even ``trailing`` (if a stale trailing_stop_log row predates the fill).
+    The ``CB_FLATTENED`` decision is the authoritative record (one per symbol per
+    flatten event, timestamped to the second) so a tight ±``minutes`` match is
+    unambiguous — CB flatten events are rare and the decision lands within ~1s of
+    the fill.  Used by ``_infer_exit_reason`` ahead of the trailing-log /
+    price-match / default branches.
+    """
+    from datetime import timedelta
+    lo = ts - timedelta(minutes=minutes)
+    hi = ts + timedelta(minutes=minutes)
+    engine = get_engine()
+    with Session(engine) as session:
+        row = (
+            session.query(OrderDecisionRecord.id)
+            .filter(
+                OrderDecisionRecord.symbol == symbol,
+                OrderDecisionRecord.decision == "CB_FLATTENED",
+                OrderDecisionRecord.decided_at >= lo,
+                OrderDecisionRecord.decided_at <= hi,
+            )
+            .first()
+        )
+    return row is not None

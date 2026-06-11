@@ -478,6 +478,63 @@ class TestExitReasonInference:
         assert _trades("FLP").iloc[0]["exit_reason"] == "signal_flip"
 
 
+class TestCBFlattenExitReason:
+    """A CB_FLATTENED order_decision near the exit fill ⇒ exit_reason='cb_flatten',
+    AND it must win over the stale-trailing-log path (the 2026-06-10 C/GLW bug)."""
+
+    def _round_trip(self, symbol, exit_px, *, order_type, t):
+        return [
+            _exec(f"{symbol}-B", symbol, "BUY",  10, 100.0, t=t, order_type="LMT"),
+            _exec(f"{symbol}-S", symbol, "SELL", 10, exit_px, t=t + timedelta(hours=1),
+                  order_type=order_type),
+        ]
+
+    def _seed_cb_flatten(self, symbol, decided_at):
+        from data.database import log_order_decision
+        log_order_decision({
+            "run_id": "cb1", "symbol": symbol, "signal": "SELL",
+            "decision": "CB_FLATTENED", "shares": 10, "entry_price": 100.0,
+            "stop_price": None, "take_profit_price": None, "position_value": 1000.0,
+            "reject_reason": None, "decided_at": decided_at,
+        })
+
+    def test_cb_flatten_decision_near_exit(self, mem_engine):
+        """MKT close with a CB_FLATTENED decision within minutes → cb_flatten."""
+        from execution.reconciliation import reconcile_fills
+
+        t0 = _now() - timedelta(days=2)
+        exit_t = t0 + timedelta(hours=1)
+        self._seed_cb_flatten("CBF", decided_at=exit_t - timedelta(seconds=1))
+        reconcile_fills(_fetcher(self._round_trip("CBF", 95.0, order_type="MKT", t=t0)))
+        assert _trades("CBF").iloc[0]["exit_reason"] == "cb_flatten"
+
+    def test_cb_flatten_wins_over_stale_trailing_log(self, mem_engine):
+        """The C/GLW 2026-06-10 case: a CONVERTED trailing row predates the fill,
+        but the exit was a CB liquidation — cb_flatten must win, not trailing."""
+        from execution.reconciliation import reconcile_fills
+        from data.database import log_trailing_stop_action
+
+        t0 = _now() - timedelta(days=2)
+        exit_t = t0 + timedelta(hours=1)
+        log_trailing_stop_action({
+            "run_id": "r1", "symbol": "DUO", "action": "CONVERTED", "shares": 10,
+            "entry_price": 100.0, "current_price": 108.0, "atr": 2.0,
+            "trail_amount": 4.0, "reason": "converted",
+            "decided_at": t0 - timedelta(hours=1),
+        })
+        self._seed_cb_flatten("DUO", decided_at=exit_t)
+        reconcile_fills(_fetcher(self._round_trip("DUO", 96.0, order_type=None, t=t0)))
+        assert _trades("DUO").iloc[0]["exit_reason"] == "cb_flatten"
+
+    def test_no_cb_flatten_unaffected(self, mem_engine):
+        """No CB_FLATTENED decision → MKT close still defaults to manual_close."""
+        from execution.reconciliation import reconcile_fills
+
+        t0 = _now() - timedelta(days=2)
+        reconcile_fills(_fetcher(self._round_trip("PLN", 110.0, order_type="MKT", t=t0)))
+        assert _trades("PLN").iloc[0]["exit_reason"] == "manual_close"
+
+
 class TestPriceMatchToleranceRegimes:
 
     def _seed_bracket(self, symbol, stop, tp, decided_at):

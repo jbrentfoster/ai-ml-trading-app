@@ -6,6 +6,30 @@ The retirement convention lives in CLAUDE.md → *Convention: documenting fixed 
 
 ---
 
+## 2026-06-11
+
+### Event note — first live circuit-breaker full-portfolio liquidation (2026-06-10 12:00 ET)
+
+Not a bug — a dated record of the first time the loss-side CB fired in production, because it exercised two long-pending verifications (below) and is the kind of operational event future agents will want context for. On **2026-06-10 at 12:00 ET** the intraday runner (`scripts/intraday_check.py`) found the account at **daily −3.30% / weekly −5.30%** (NLV $1,038,705, unrealized −$9,202) — a genuine loss day — and `risk/circuit_breaker.check_loss_limits` correctly tripped on the **loss side** (`Daily loss 3.3% >= limit 3.0%`). `risk/order_manager.flatten_all_longs` then cancelled every bracket and **market-sold all 17 long positions** in ~18s (`intraday_run_20260610_1200.log`, `status='cb_tripped'`, `positions_flattened=17`). The book was reconciled the next morning (6/11) via the Flex Step 3c backstop as **18 round trips** (the 17 CB flattens + a separate META bracket stop), **net realised −$9,307.63**. Design notes for context: (a) `flatten_all_longs` liquidates the *whole* book, so 5 winners were closed alongside the losers (C +$3,061, USO +$1,808, SATS +$1,577, INTC +$1,305, IWM +$44 = +$7,794 given up) — converting −$9,202 unrealized into −$9,308 realized; (b) with `circuit_breaker_reset_hours=24` the 12:00 trip halted the 6/11 10:07 daily run too (≈22h later, still inside the window → 0 signals), auto-clearing for 6/12. Both behaviors are working-as-designed; the full-book-flatten and 24h-persistence tradeoffs are tracked as watch items in `docs/reviews/followups.md` (2026-06-11). The 17 flatten exits initially mislabeled in `trade_log.exit_reason` were fixed the same day (`cb_flatten` exit reason — see CLAUDE.md "Outstanding bugs", code complete 2026-06-11).
+
+### Circuit breaker is effectively manual-only
+
+*(code complete 2026-04-28 → verified 2026-06-10)* (`risk/circuit_breaker.py`, `signal_runner.py`): `check_loss_limits(daily_pct, weekly_pct)` requires the caller to pass realised loss percentages, but nothing in the codebase computes them. `signal_runner._phase1_startup` should pull `realized_pnl + unrealized_pnl` from `IBKRConnection.get_account_summary()` (and a cached equity baseline) and invoke the check before any signals are processed. Without this, the CB only trips when a human clicks "Trigger" on Page 8.
+
+**Status:** implemented via new `equity_snapshots` table + `_check_loss_limits_against_baseline` helper called from Phase 1 when not dry-run. Unit tests pass (5 new in `test_signal_runner.py`). The same auto-trigger plumbing is shared by the intraday runner (`scripts/intraday_check.py` Phase 1), which reads live account P&L from `IBKRConnection.get_account_summary()` and invokes `check_loss_limits` on every intraday slot.
+
+**Verified (2026-06-10 — first live loss-side auto-trigger + halt):** the 12:00 ET intraday CB check computed daily −3.30% / weekly −5.30% from the live account summary, auto-tripped (`Circuit breaker TRIGGERED: Daily loss 3.3% >= limit 3.0%`), and drove `flatten_all_longs` to close all 17 longs end-to-end — then *persisted* the halt into the next morning's 6/11 daily run (0 signals processed). This is the actual halt path firing on a genuine loss, exercised in production: auto-compute → trigger → flatten → persist. The earlier 2026-06-02 fire confirmed the daily-Δ math but on the wrong sign (the gain bug, fixed separately and also verified by this run); 6/10 is the first time the halt fired on a real loss as designed.
+
+### Circuit breaker auto-trigger fires on large gains, not just losses (sign bug)
+
+*(code complete 2026-06-02 → verified 2026-06-10)* (`risk/circuit_breaker.py:check_loss_limits`): the auto-trigger tested `abs(daily_loss_pct) >= circuit_breaker_daily_loss_pct` (and the weekly equivalent), but `daily_loss_pct` is a *signed* return computed in `signal_runner._check_loss_limits_against_baseline` as `(nlv - baseline)/baseline` — positive on a gain. The `abs()` made a strongly *positive* day trip the loss breaker exactly as a loss would. **Observed 2026-06-02 (first-ever live auto-trigger):** account up +3.46% on the day (NLV $1,062,357 → $1,099,073, driven partly by the MRVL +$9,755 reconciled gain), yet the CB AUTO-TRIGGERED "Daily loss 3.5% >= limit 3.0%" and halted Phases 3–4 (0 signals generated). Compounding: with `circuit_breaker_reset_hours=24` and the 10:08 ET trigger, the next morning's ~10:00 ET run is still inside the reset window, so a single up-day silently halts ≥2 trading days. **Fix:** trigger only on the loss side — `daily_loss_pct <= -limit` (weekly likewise) instead of `abs(...) >= limit`; the reason string reports `-daily_loss_pct` so genuine-loss messages are unchanged.
+
+**Status:** implemented in `check_loss_limits`. Test coverage: 4 new in `tests/test_risk.py::TestCircuitBreaker` (gain-no-trigger / daily-loss-triggers-with-magnitude-message / weekly-loss-triggers / sub-limit-loss-no-trigger). Full suite: 311 passed + 1 skipped (was 304 + 1).
+
+**Verified (2026-06-10 — loss-side trip on a real loss; no false gain-trips since):** the 12:00 ET intraday trip fired on `daily_loss_pct = -0.0330` (a genuine loss, correct sign) with the magnitude-correct message "Daily loss 3.3% >= limit 3.0%" — the loss path still halts end-to-end after the fix. Symmetric confirmation of the bug being gone: since the 6/02 fix landed, **no up-day has tripped the breaker** despite multiple gain days (the 6/02 +3.46% false-trip was the last gain-side trigger in `circuit_breaker_log`). The post-fix `daily_loss_pct <= -limit` branch is exercised correctly on both sides — gains don't trip, this real loss did.
+
+---
+
 ## 2026-06-10
 
 ### Daily `reqExecutions` reconciliation systematically returns 0 — Gateway overnight reset wipes prior-session fills

@@ -134,7 +134,7 @@ with st.sidebar:
         "Exit reasons",
         options=all_exit_reasons,
         default=[],
-        help="Empty = all exit reasons.  stop / tp / trailing / signal_flip / fold_end / manual_close.",
+        help="Empty = all exit reasons.  stop / tp / trailing / signal_flip / fold_end / manual_close / cb_flatten.",
     )
 
     # Active-universe toggle — defaults ON because walk_forward_results
@@ -1022,6 +1022,7 @@ with chart_r:
         "fold_end":     "#90a4ae",   # grey
         "stop":         "#ef5350",   # red
         "manual_close": "#ff9800",   # amber
+        "cb_flatten":   "#d32f2f",   # dark red — forced CB liquidation
     }
     reason_colors = [reason_color_map.get(r, "#cccccc") for r in reason_counts["Reason"]]
 
@@ -1068,7 +1069,13 @@ with chart_r:
             "strategy's normal lifecycle — operator manually flattened (e.g. "
             "`scripts/open_positions.py --close`), or some off-strategy event terminated the "
             "trade.  Not produced by the WF simulator; appears once Phase B (live fill "
-            "subscription) lands."
+            "subscription) lands.\n"
+            "- **cb_flatten** — *Live only.*  A circuit-breaker liquidation — the daily/weekly "
+            "loss limit tripped (`intraday_check.py` / `flatten_all_longs`), cancelling every "
+            "bracket and market-selling the whole book at once.  Distinct from `manual_close` "
+            "(discretionary) so a forced de-risking event doesn't pollute the exit-reason mix or "
+            "the trailing-stop attribution.  Heavy `cb_flatten` in one cluster = one bad day, not "
+            "a strategy pattern — cross-check the date before drawing conclusions."
         )
 
 # ── 5. Per-symbol breakdown ───────────────────────────────────────────────────

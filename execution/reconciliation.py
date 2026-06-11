@@ -45,6 +45,7 @@ from data.database import (
     get_fills,
     get_latest_approved_bracket,
     get_reconciliation_state,
+    has_cb_flatten_near,
     has_closed_long_near,
     has_converted_trailing_before,
     live_trade_exists,
@@ -124,11 +125,23 @@ def _infer_exit_reason(symbol: str, exit_px: float, exit_ts: datetime,
     if closing_order_type == "TRAIL":
         return "trailing", "order_lookup"
 
-    # 2. trailing_log — a CONVERTED trailing row predates this fill.
+    # 2. cb_flatten — a CB_FLATTENED order_decision near this fill.  A
+    #    circuit-breaker liquidation (flatten_all_longs) cancels the bracket
+    #    children and submits a plain MKT sell, so it never resolves via step 1
+    #    (off-session ⇒ closing_order_type is None) and WOULD otherwise be
+    #    mislabeled by the trailing-log step below (a stale CONVERTED row for the
+    #    same symbol → "trailing", e.g. C/GLW on the 2026-06-10 17-position CB
+    #    flatten) or fall through to "manual_close".  CB_FLATTENED is the
+    #    authoritative record (one per symbol per flatten event) so it must win
+    #    BEFORE the heuristic trailing/price-match branches.
+    if has_cb_flatten_near(symbol, exit_ts):
+        return "cb_flatten", "cb_flatten"
+
+    # 3. trailing_log — a CONVERTED trailing row predates this fill.
     if has_converted_trailing_before(symbol, exit_ts):
         return "trailing", "trailing_log"
 
-    # 3. order_decisions_price_match — match exit_px to the recorded bracket,
+    # 4. order_decisions_price_match — match exit_px to the recorded bracket,
     #    DIRECTIONALLY and gap-aware (long-only live case).  A long's TP (sell
     #    LMT) fills at-or-ABOVE the TP level — on a gap-up open it fills well
     #    above it (MRVL 2026-06-02: TP $244.89, gap-up fill $255.90).  A long's
@@ -147,7 +160,7 @@ def _infer_exit_reason(symbol: str, exit_px: float, exit_ts: datetime,
         if stop is not None and exit_px <= stop + tol:
             return "stop", "order_decisions_price_match"
 
-    # 4. default — MKT with a nearby CLOSED_LONG is a signal flip, else manual.
+    # 5. default — MKT with a nearby CLOSED_LONG is a signal flip, else manual.
     if closing_order_type == "MKT" and has_closed_long_near(symbol, exit_ts):
         return "signal_flip", "default"
     return "manual_close", "default"
