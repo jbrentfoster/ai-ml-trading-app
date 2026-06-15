@@ -78,15 +78,25 @@ async def _fetch_ibkr_data() -> dict:
         summary   = await conn.get_account_summary()
         positions = await conn.get_positions()
         orders    = await conn.get_open_orders()
-        # Fetch a live price per held symbol from IBKR (yfinance is the built-in
+        # Fetch a price per held symbol from IBKR (yfinance is the built-in
         # tier-3 fallback inside get_last_price, so this still degrades to a
         # Yahoo close if IBKR has no quote at all).
-        prices: dict[str, float | None] = {}
-        for symbol in {p["symbol"] for p in positions}:
+        #   * market_data_type=3 → skip the doomed live-snapshot probe (this
+        #     account has no real-time subscription) and go straight to 15-min
+        #     delayed, saving ~2 s/symbol.
+        #   * asyncio.gather → fan the per-symbol fetches out concurrently so
+        #     total latency is ~one delayed-snapshot wait, not N of them.
+        symbols = sorted({p["symbol"] for p in positions})
+
+        async def _price(sym: str) -> tuple[str, float | None]:
             try:
-                prices[symbol] = await conn.get_last_price(symbol)
+                return sym, await conn.get_last_price(sym, market_data_type=3)
             except Exception:
-                prices[symbol] = None
+                return sym, None
+
+        prices: dict[str, float | None] = dict(
+            await asyncio.gather(*(_price(s) for s in symbols))
+        )
     return {
         "summary":    summary,
         "positions":  positions,

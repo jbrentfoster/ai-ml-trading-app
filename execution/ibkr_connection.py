@@ -655,7 +655,13 @@ class IBKRConnection:
 
     # ── Market data ──────────────────────────────────────────────────────────
 
-    async def get_last_price(self, symbol: str, exchange: str = "SMART", currency: str = "USD") -> Optional[float]:
+    async def get_last_price(
+        self,
+        symbol: str,
+        exchange: str = "SMART",
+        currency: str = "USD",
+        market_data_type: int = 1,
+    ) -> Optional[float]:
         """
         Return the last traded price for a symbol using a three-tier fallback:
 
@@ -665,6 +671,22 @@ class IBKRConnection:
 
         ib_insync populates the same ticker.last / ticker.close fields for both
         live and delayed data; ticker.marketPrice() returns the best non-NaN value.
+
+        ``market_data_type`` controls the FIRST IBKR tier attempted:
+          * ``1`` (default) — try the live snapshot first, then 15-min delayed,
+            then yfinance.  Correct for accounts that hold a real-time
+            market-data subscription.
+          * ``3`` — skip the live probe entirely and go straight to 15-min
+            delayed, then yfinance.  On an account with no real-time
+            subscription the live tier never succeeds, so probing it just burns
+            the ~2 s snapshot timeout per symbol; pass ``3`` to avoid it.
+
+        Concurrency note: ``reqMarketDataType`` sets connection-GLOBAL state, but
+        each tier sets it immediately before its own ``reqMktData`` with no await
+        in between, so the (type → subscribe) pair is atomic relative to other
+        coroutines.  That makes it safe to fan this out across symbols with
+        ``asyncio.gather`` (used by the Account page) — an in-flight subscription
+        keeps the type it was created with regardless of later global flips.
         """
         self._require_connection()
 
@@ -681,19 +703,21 @@ class IBKRConnection:
                     return float(val)
             return None
 
-        # ── Attempt 1: IBKR live data ────────────────────────────────────────
-        self._ib.reqMarketDataType(1)
-        ticker = self._ib.reqMktData(contract, snapshot=True)
-        await asyncio.sleep(2)
-        price = _extract(ticker)
-        self._ib.cancelMktData(contract)
+        # ── Attempt 1: IBKR live data (skipped when market_data_type != 1) ───
+        if market_data_type == 1:
+            self._ib.reqMarketDataType(1)
+            ticker = self._ib.reqMktData(contract, snapshot=True)
+            await asyncio.sleep(2)
+            price = _extract(ticker)
+            self._ib.cancelMktData(contract)
 
-        if price is not None:
-            log.debug("Last price %s = %.2f (IBKR live)", symbol, price)
-            return price
+            if price is not None:
+                log.debug("Last price %s = %.2f (IBKR live)", symbol, price)
+                return price
+
+            log.info("No live quote for %s — trying IBKR delayed data ...", symbol)
 
         # ── Attempt 2: IBKR 15-min delayed data ─────────────────────────────
-        log.info("No live quote for %s — trying IBKR delayed data ...", symbol)
         self._ib.reqMarketDataType(3)
         ticker = self._ib.reqMktData(contract, snapshot=False)
         await asyncio.sleep(3)

@@ -119,6 +119,65 @@ class TestConnection:
                 conn._require_connection()
 
 
+class TestGetLastPrice:
+    """get_last_price tier selection — fix (a): market_data_type lets callers
+    skip the live-snapshot probe on accounts with no real-time subscription."""
+
+    @staticmethod
+    def _ticker(price: float = 150.0):
+        """A ticker whose marketPrice() returns a real float (a bare MagicMock
+        would blow up math.isnan in _extract)."""
+        t = MagicMock()
+        t.marketPrice.return_value = price
+        t.last = price
+        t.close = price
+        return t
+
+    @pytest.mark.asyncio
+    async def test_market_data_type_3_skips_live_probe(self, mock_ib):
+        """market_data_type=3 → straight to delayed: exactly one reqMktData,
+        snapshot=False, no live (snapshot=True) probe."""
+        mock_ib.reqMktData.return_value = self._ticker(150.0)
+        with patch("execution.ibkr_connection._IB_AVAILABLE", True), \
+             patch("execution.ibkr_connection.IB", return_value=mock_ib), \
+             patch("execution.ibkr_connection.Stock"), \
+             patch("asyncio.sleep", new_callable=AsyncMock):
+            from execution.ibkr_connection import IBKRConnection
+            conn = IBKRConnection()
+            await conn.connect()
+            price = await conn.get_last_price("AAPL", market_data_type=3)
+
+        assert price == pytest.approx(150.0)
+        assert mock_ib.reqMktData.call_count == 1
+        snapshots = [c.kwargs.get("snapshot") for c in mock_ib.reqMktData.call_args_list]
+        assert snapshots == [False]                 # delayed only
+        # The only market-data-type calls are the delayed request + restore;
+        # the live tier (the first reqMarketDataType(1)) is never issued.
+        mdt_calls = [c.args[0] for c in mock_ib.reqMarketDataType.call_args_list]
+        assert mdt_calls == [3, 1]                  # set delayed, restore default
+
+    @pytest.mark.asyncio
+    async def test_default_probes_live_first(self, mock_ib):
+        """Default (market_data_type=1) tries the live snapshot first and
+        returns it without ever requesting delayed data."""
+        mock_ib.reqMktData.return_value = self._ticker(150.0)
+        with patch("execution.ibkr_connection._IB_AVAILABLE", True), \
+             patch("execution.ibkr_connection.IB", return_value=mock_ib), \
+             patch("execution.ibkr_connection.Stock"), \
+             patch("asyncio.sleep", new_callable=AsyncMock):
+            from execution.ibkr_connection import IBKRConnection
+            conn = IBKRConnection()
+            await conn.connect()
+            price = await conn.get_last_price("AAPL")
+
+        assert price == pytest.approx(150.0)
+        assert mock_ib.reqMktData.call_count == 1
+        snapshots = [c.kwargs.get("snapshot") for c in mock_ib.reqMktData.call_args_list]
+        assert snapshots == [True]                  # live snapshot only
+        mdt_calls = [c.args[0] for c in mock_ib.reqMarketDataType.call_args_list]
+        assert mdt_calls == [1]                     # only the live tier ran
+
+
 class TestOrders:
     """Test order placement and cancellation."""
 
