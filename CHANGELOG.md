@@ -6,6 +6,18 @@ The retirement convention lives in CLAUDE.md → *Convention: documenting fixed 
 
 ---
 
+## 2026-06-15
+
+### Account-page Refresh is ~5s/position because `get_last_price` always probes live-first
+
+*(code complete 2026-06-15 → verified 2026-06-15)* (`dashboard/pages/9_Account.py:_fetch_ibkr_data`, `execution/ibkr_connection.py:get_last_price`): the 2026-06-15 Account-page price-source fix (commit `e653049`) priced the Open Positions table off IBKR (`get_last_price` per held symbol) so the table reconciles with the headline Unrealized P&L — but `get_last_price` is a 3-tier fallback that *first* requested `reqMarketDataType(1)` live data, which this account has no real-time subscription for, so every symbol waited out the ~2s live-snapshot timeout before falling to `reqMarketDataType(3)` 15-min delayed. The calls were also issued **sequentially** in a `for symbol in {...positions}` loop. Net: a 10-position account took ~50s on a Refresh click (behind an explicit button + spinner, so correct but slow).
+
+**Status:** both fixes shipped (commit `20b097b`). (a) `get_last_price` gained a `market_data_type: int = 1` param — default preserves the live-first 3-tier behaviour for accounts that *do* hold a real-time subscription; `market_data_type=3` skips the doomed live probe and goes straight to 15-min delayed (then yfinance). The live-tier `reqMarketDataType`/`reqMktData`/`cancelMktData` block is gated behind `if market_data_type == 1`. (b) `_fetch_ibkr_data` now fans the per-symbol fetches out with `asyncio.gather` (passing `market_data_type=3`) instead of the sequential loop. Concurrency is safe because each tier sets `reqMarketDataType` immediately before its own `reqMktData` with no await between, so the (type → subscribe) pair is atomic relative to other coroutines (documented in the `get_last_price` docstring). The default `get_last_price` path used by the intraday runner / order manager is unchanged — only the Account page opts into `market_data_type=3`. Test coverage: 2 new in `tests/test_ibkr_connection.py::TestGetLastPrice` (market_data_type=3 skips the live probe — one `reqMktData(snapshot=False)`, no `snapshot=True`; default probes live first). 25/25 passing across `test_ibkr_connection.py` + `test_account_page.py`.
+
+**Verified (2026-06-15 — live against the paper Gateway):** concurrent delayed fetch returned **10/10 held symbols priced in 3.0s** (was ~50s sequential), with prices matching IBKR's delayed marks (MU 1060, WDC 603, ORCL 189, …) and no races — confirming the atomic (type → subscribe) concurrency reasoning holds against the real Gateway.
+
+---
+
 ## 2026-06-11
 
 ### Event note — first live circuit-breaker full-portfolio liquidation (2026-06-10 12:00 ET)
