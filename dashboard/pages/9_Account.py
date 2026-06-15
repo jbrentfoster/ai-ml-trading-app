@@ -63,16 +63,35 @@ def _run_async(coro):
 
 
 async def _fetch_ibkr_data() -> dict:
-    """Open a short-lived IBKR connection, pull all account data, disconnect."""
+    """Open a short-lived IBKR connection, pull all account data, disconnect.
+
+    Position prices come from `IBKRConnection.get_last_price()` (the 3-tier
+    live → 15-min delayed → yfinance fallback) so the positions table reconciles
+    with the IBKR-sourced account-summary figures (NetLiquidation, GrossPosition-
+    Value, UnrealizedPnL).  Pricing the table off yfinance directly produced a
+    ~$14k discrepancy vs the headline Unrealized P&L on 2026-06-15 — yfinance's
+    `history(period='1d')` close lags IBKR's marks (badly outside RTH on fast-
+    moving names), and the two sources sitting on one page disagreed silently.
+    """
     _, IBKRConnection = _import_ibkr()
     async with IBKRConnection() as conn:
         summary   = await conn.get_account_summary()
         positions = await conn.get_positions()
         orders    = await conn.get_open_orders()
+        # Fetch a live price per held symbol from IBKR (yfinance is the built-in
+        # tier-3 fallback inside get_last_price, so this still degrades to a
+        # Yahoo close if IBKR has no quote at all).
+        prices: dict[str, float | None] = {}
+        for symbol in {p["symbol"] for p in positions}:
+            try:
+                prices[symbol] = await conn.get_last_price(symbol)
+            except Exception:
+                prices[symbol] = None
     return {
         "summary":    summary,
         "positions":  positions,
         "orders":     orders,
+        "prices":     prices,
         "fetched_at": datetime.now(timezone.utc),
     }
 
@@ -118,6 +137,7 @@ def _enrich_positions(
     positions: list[dict],
     risk_levels: dict[str, dict] | None = None,
     open_orders: list[dict] | None = None,
+    prices: dict[str, float | None] | None = None,
 ) -> pd.DataFrame:
     """
     Enrich positions with live price data (via yfinance), risk levels from
@@ -152,16 +172,27 @@ def _enrich_positions(
 
     df = pd.DataFrame(positions)
 
-    # ── Live prices via yfinance ──────────────────────────────────────────────
-    prices: dict[str, float] = {}
-    for symbol in df["symbol"].unique():
+    # ── Live prices ───────────────────────────────────────────────────────────
+    # Prefer IBKR prices passed in by the caller (get_last_price — same source
+    # as the account-summary marks, so the table reconciles with the headline
+    # Unrealized P&L).  Fall back to a direct yfinance close per-symbol when
+    # IBKR returned nothing for that symbol, or for all symbols when no prices
+    # dict is supplied at all (back-compat for callers/tests that don't pass it).
+    supplied = prices or {}
+
+    def _yf_close(symbol: str) -> float | None:
         try:
             hist = yf.Ticker(symbol).history(period="1d")
-            prices[symbol] = float(hist["Close"].iloc[-1]) if not hist.empty else None
+            return float(hist["Close"].iloc[-1]) if not hist.empty else None
         except Exception:
-            prices[symbol] = None
+            return None
 
-    df["current_price"] = df["symbol"].map(prices)
+    resolved: dict[str, float | None] = {}
+    for symbol in df["symbol"].unique():
+        px = supplied.get(symbol)
+        resolved[symbol] = px if px is not None else _yf_close(symbol)
+
+    df["current_price"] = df["symbol"].map(resolved)
     df["market_value"] = df.apply(
         lambda r: r["quantity"] * r["current_price"]
         if r["current_price"] is not None
@@ -398,7 +429,9 @@ if st.session_state.ibkr_data:
     else:
         symbols = [p["symbol"] for p in positions_raw]
         risk_levels = get_latest_risk_levels(symbols)
-        pos_df = _enrich_positions(positions_raw, risk_levels, data["orders"])
+        pos_df = _enrich_positions(
+            positions_raw, risk_levels, data["orders"], data.get("prices"),
+        )
 
         # ── Risk-level summary cards ──────────────────────────────────────────
         # One card per position, chunked into rows of CARDS_PER_ROW.  Each card:
@@ -610,7 +643,9 @@ if st.session_state.ibkr_data:
             "**→ Stop %** = how far the current price is above the stop-loss — "
             "red < 5 %, amber 5–10 %, green > 10 %. "
             "**→ TP %** = remaining upside to the take-profit target. "
-            "Live prices are fetched from Yahoo Finance."
+            "Live prices come from IBKR (live → 15-min delayed), falling back to "
+            "Yahoo Finance only when IBKR has no quote — so this table reconciles "
+            "with the IBKR-sourced Unrealized P&L above."
         )
 
         # ── Allocation donut ──────────────────────────────────────────────────
@@ -793,6 +828,8 @@ if st.session_state.ibkr_data:
 
 st.markdown("---")
 st.caption(
-    "Live prices via Yahoo Finance where IBKR market data subscription is unavailable.  "
-    "Unrealized P&L is approximate."
+    "Position prices come from IBKR (live → 15-min delayed), falling back to "
+    "Yahoo Finance only when IBKR has no quote.  Without a real-time market-data "
+    "subscription the IBKR tier is up to 15 minutes delayed, so intraday figures "
+    "are approximate."
 )

@@ -205,6 +205,51 @@ class TestEnrichPositions:
         assert pd.isna(row["take_profit"])
         assert pd.isna(row["stop_loss"])
 
+    def test_ibkr_price_preferred_over_yfinance(self, page_module):
+        """When the caller supplies an IBKR price, it drives current_price /
+        market_value / unrealized_pnl — not the yfinance close.  This is the
+        2026-06-15 fix: the table must reconcile with the IBKR-sourced headline
+        Unrealized P&L, and yfinance lags IBKR's marks outside RTH."""
+        positions = [{"symbol": "MU", "quantity": 40, "avg_cost": 994.94}]
+        risk_levels = {"MU": self._risk(
+            entry_price=994.94, stop_price=950.0, take_profit_price=1100.0,
+        )}
+        orders: list[dict] = []
+        # yfinance would say 981.61 (stale); IBKR says 1062.75.
+        with patch.object(page_module, "yf") as mock_yf:
+            mock_yf.Ticker.side_effect = _mock_yf_history({"MU": 981.61})
+            df = page_module._enrich_positions(
+                positions, risk_levels, orders, prices={"MU": 1062.75},
+            )
+
+        row = df.iloc[0]
+        assert row["current_price"]   == pytest.approx(1062.75)
+        assert row["unrealized_pnl"]  == pytest.approx(40 * (1062.75 - 994.94))
+        # yfinance must NOT have been consulted for a symbol IBKR priced.
+        mock_yf.Ticker.assert_not_called()
+
+    def test_falls_back_to_yfinance_when_ibkr_price_missing(self, page_module):
+        """A None IBKR price for a symbol falls back to that symbol's yfinance
+        close (get_last_price returning None despite its own tier-3 fallback —
+        e.g. a delisted/illiquid name)."""
+        positions = [
+            {"symbol": "AAPL", "quantity": 10, "avg_cost": 100.0},
+            {"symbol": "MSFT", "quantity":  5, "avg_cost": 300.0},
+        ]
+        risk_levels = {"AAPL": self._risk(), "MSFT": self._risk()}
+        orders: list[dict] = []
+        with patch.object(page_module, "yf") as mock_yf:
+            mock_yf.Ticker.side_effect = _mock_yf_history({"AAPL": 105.0, "MSFT": 305.0})
+            df = page_module._enrich_positions(
+                positions, risk_levels, orders,
+                prices={"AAPL": 111.0, "MSFT": None},  # MSFT must fall back
+            )
+
+        aapl = df[df["symbol"] == "AAPL"].iloc[0]
+        msft = df[df["symbol"] == "MSFT"].iloc[0]
+        assert aapl["current_price"] == pytest.approx(111.0)   # IBKR
+        assert msft["current_price"] == pytest.approx(305.0)   # yfinance fallback
+
     def test_cross_symbol_orders_dont_leak(self, page_module):
         """Open orders for SYMA must not affect SYMB's row."""
         positions = [
