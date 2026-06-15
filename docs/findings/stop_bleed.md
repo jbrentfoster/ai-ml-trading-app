@@ -2,7 +2,7 @@
 
 ## Status
 
-**observed** (2026-05-19) · **hypothesized** (2026-05-19) · untested
+**observed** (2026-05-19) · **hypothesized** (2026-05-19) · **realised-confirmed** (2026-06-08, n=10 live stops) · **intervention applied** (2026-06-15 — `atr_stop_multiplier` 2.0→3.0, WF-confirmed at full universe; awaiting forward/live verification)
 
 ---
 
@@ -118,7 +118,7 @@ GROUP BY spy_bucket;
 
 ## What we are NOT doing yet, and why
 
-- **Not changing `atr_stop_multiplier`**, **not adding a regime-aware stop**, **not adding a saturation gate to entries**. The pattern is real but the *cause* is not yet diagnosed; any of the three hypotheses could be the driver, and the fix differs by hypothesis (H1 → adaptive stops by VIX, H2 → benchmark-aware stop placement or position-relative-to-SPY hold rule, H3 → entry-side LSTM-saturation or MACD-disagreement gate). Acting before the discriminator runs would be parameter tuning without a cost function.
+- ~~**Not changing `atr_stop_multiplier`**~~ **(superseded 2026-06-15 — see Status log)**, **not adding a regime-aware stop**, **not adding a saturation gate to entries**. The pattern is real but the *cause* is not yet diagnosed; any of the three hypotheses could be the driver, and the fix differs by hypothesis (H1 → adaptive stops by VIX, H2 → benchmark-aware stop placement or position-relative-to-SPY hold rule, H3 → entry-side LSTM-saturation or MACD-disagreement gate). Acting before the discriminator runs would be parameter tuning without a cost function. **Update 2026-06-15:** the H1 strand (stops too tight → fire on noise) accumulated enough evidence — stable bleed across 7 weekly retrains, a 46% whipsaw rate, and a fixed-entry counterfactual — to justify the single reversible config change `atr_stop_multiplier` 2.0→3.0, which a full-universe retrain confirmed flips the active-universe excess headline positive. The regime-aware stop and entry-saturation gate remain un-built (still want the H1-vs-H2-vs-H3 discriminators + Phase B live data before those).
 - **Not opening a CLAUDE.md *Enhancements* entry yet.** Enhancements are for directions worth pursuing once evidence accumulates; the discriminating tests above produce that evidence and either escalate the finding into a specific Enhancement entry or eliminate one hypothesis at a time. Opening an Enhancement entry today would presuppose a direction the data hasn't supported.
 - **Phase B live data is not yet available.** Simulated WF stops may differ from realized broker fills in slippage, gap-through behavior, and stop-modification timing. Diagnosing a structural pattern using *only* simulator output risks fixing the simulator rather than the strategy. Phase B realised-fill data lets the H1/H2/H3 tests run against actual broker outcomes.
 
@@ -160,3 +160,40 @@ Revisit when **any** of the following fires:
 **Decomposition (the headline bleed splits into two distinct drivers):** mean realised loss ≈ **−6.5%** (the longs genuinely fell to their stops) plus mean SPY drift ≈ **+1.8%** over the holds (SPY rose while the long bled). So the −8.3% excess is *mostly* H1/H3 (real declines triggering the stop) with H2 (SPY outrunning a stopped long) contributing ~1.8 pp on top — **not** a pure H2 effect. UAL is the clean counter-example to a pure-H2 reading: SPY was *down* −0.41% over its hold yet excess was still −9.15%, because UAL itself dropped −9.56%. The H2 amplifier is real but secondary; the dominant term is that these were genuine losers, consistent with H1 (too-tight ATR stops firing on real moves) and H3 (dip-buys that were downtrends).
 
 **Does not yet satisfy the *Trigger to revisit*** (which wants ≥50 live *closed* trades, not 10 live *stops*) — but it converts the SCHW n=1 seed into a 10-point realised cohort and answers the simulator-vs-live divergence direction: **live stops bleed slightly worse than simulated**, so the simulator is, if anything, *under*-stating the problem. Re-run the H1/H2/H3 discriminating SQL against the live subset once the cohort reaches ~30. (Surfaced during the 2026-06-08 VRT case-study triage — VRT did not warrant a standalone case study but is a clean member of this distribution; see the daily-review thread.)
+
+**2026-06-15 — Intervention applied: `atr_stop_multiplier` 2.0 → 3.0, WF-confirmed at full universe.** Triggered by the *Trigger to revisit* clause "win-rate-vs-benchmark drops below 51% on two consecutive weekly retrains" — the 2026-06-14 weekly retrain showed the deduped active-universe strategy-decided slice at avg excess **−0.184%**, median **−2.708%**, win-vs-SPY **38.9%** (n=95). Three pieces of evidence built the case for the H1 strand (stops too tight, firing on noise):
+
+1. **Bleed is stable, not drifting.** Stop-exit excess across the last 7 weekly retrains: −6.64 / −6.57 / −7.22 / −5.83 / −7.24 / −7.03 / −6.65 % (05-03 → 06-14/15). Flat at −6.5 to −7.2% for six weeks — structural, hence a legitimate tuning target rather than a one-off.
+2. **46% of current-model stops are whipsaws.** Reconstructing the post-stop path from `ohlcv_bars` (10 bars forward) on the 85 current-model stops: **39/85 (46%) recovered back to entry within 10 bars**; average max bounce off the stop low was **+9.5%** (median +5.8%). Nearly half the stops fire then reverse — direct H1 evidence (stops too tight, triggering on noise rather than thesis breaks).
+3. **Fixed-entry counterfactual.** Because widening the stop only changes the outcome of trades that *currently* stop (every tp/trailing/signal_flip/fold_end path never touches the 2× level), the clean experiment is to re-simulate just the stopped trades with a wider stop, holding entries fixed. Result on the 85 current-model stops (modeling gap fills, worst-case intrabar, trail activation, 21-bar fold horizon):
+
+   | stop mult | mean outcome of stopped trades | survivors to better exit |
+   |---|---|---|
+   | 2.0 (re-sim baseline) | −7.1% | 80/85 still stop |
+   | **3.0** | **−5.4%** (+1.7/trade) | 23/85 reach fold-end/tp/trailing |
+   | 4.0 | −3.9% (+3.2/trade) | 42/85 survive |
+
+   (Re-sim at 2.0 reproduced the actual −7.7% within the fold-horizon approximation, validating the model. +1.7%/stop is the **clean lower-bound** attribution to the stop alone.)
+
+**Full-universe confirmation retrain** (`train_models.py --force`, all active symbols, 3× stop) vs the prior 2× weekly baseline — same per-symbol pairing, active-universe + strategy-decided + fold_end-excluded (the exact Page 10 default view), 59 paired symbols:
+
+| metric (excess vs SPY) | 2× (old) | 3× (new) |
+|---|---:|---:|
+| n | 94 | 76 |
+| **avg excess** | **−0.25%** | **+2.45%** |
+| **median excess** | **−2.78%** | **+3.03%** |
+| **win vs SPY** | **38.3%** | **60.5%** |
+| stop share of exits | 61% (57/94) | 33% (25/76) |
+
+The old column reproduces the alarming 2026-06-14 headline (−0.25/−2.78/38.3 ≈ −0.184/−2.708/38.9), confirming apples-to-apples measurement. The 3× stop **flips all three headline numbers positive.** Exit mix shifted exactly as theorized — `stop` 57→25, `trailing` 12→**22**, `tp` 17→**21**, `signal_flip` 8→8: whipsawed trades converted into trailing/TP winners.
+
+**Caveats (recorded so the result isn't over-read):**
+- **Retrain confound.** `--force` retrains the models, so entries changed too — trade count fell 94→76 (−19%). Part of the +2.7%/trade gain is the retrained model trading differently, not pure stop-widening. The fixed-entry counterfactual (+1.7%/stop) is the confound-free lower bound.
+- **Tail cost confirmed at scale.** The stops that *do* fire now lose **−9.85% vs −7.46%** (~50% deeper, as expected for 3×ATR vs 2×ATR). Net favorable only because they're 33% of exits instead of 61%; a higher-stop-count week would let the fatter tail bite, and it interacts with the 5% daily circuit breaker.
+- **Single WF instance.** One retrain draw; WF has week-to-week variance. The proof it *holds* is the bleed staying reduced across future weekly retrains and eventually live (Phase B) realised stops.
+
+**Which hypothesis this supports.** Primarily **H1** — the 46% whipsaw/recovery rate is direct evidence that a large share of stops were noise triggers, and widening the band recovers them. H2 (SPY outrunning a stopped long) and H3 (dip-buys that are downtrends) are untouched by this change and remain the targets for the still-unbuilt regime-aware stop / entry-saturation gate.
+
+**Config:** `risk.atr_stop_multiplier: 3.0` in `config/settings.yaml` (shared with live `OrderManager` bracket placement — the next daily run places 3×ATR brackets on paper positions, not just the backtest).
+
+**Forward verification:** (a) confirm the stop-bucket excess stays materially above the −6.5/−7.2% band on the next 2–3 weekly retrains; (b) the `tests/test_trade_log.py::test_benchmark_aggregates_*_baseline_*` canaries now reflect pre-intervention numbers and will need re-pinning on the next weekly review (normal cadence — this mid-week `--force` moved `trade_log`); (c) watch live (Phase B) stop-outs accumulate against the new 3× band as the realised cohort grows toward the ≥30 mark.
