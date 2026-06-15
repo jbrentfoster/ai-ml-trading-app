@@ -6,6 +6,7 @@ No live connections, yfinance, or database calls required.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -13,10 +14,30 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def _restore_event_loop():
+    """Restore a usable thread event loop after each test.
+
+    Functions exercised here (`_phase4_risk_orders`, `_phase3_6_hold_timeouts`,
+    …) legitimately call `asyncio.set_event_loop(None)` in their teardown — the
+    correct production behaviour after closing a per-run loop.  That leaks
+    across tests: a later test whose code path touches `get_event_loop()`
+    (e.g. ib_insync / eventkit at import) then raises "no current event loop"
+    on Python ≥ 3.12.  Re-seed a fresh loop after every test so order can't
+    matter.
+    """
+    yield
+    # Unconditional re-seed (cheap; orphaned loops are GC'd) — avoids the
+    # get_event_loop() deprecation probe while guaranteeing the next test
+    # starts with a valid current loop.
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
 from scripts.signal_runner import (
     EQUIVALENT_PAIRS,
     _check_loss_limits_against_baseline,
     _fetch_held_long_symbols,
+    _fetch_pending_entry_symbols,
     _phase3_6_hold_timeouts,
     _phase3_signals,
     _phase4_risk_orders,
@@ -88,7 +109,9 @@ class TestPhase4Deduplication:
         """
         Patch OrderManager so its process() returns decisions in order,
         then call _phase4_risk_orders and return
-        (approved, dry_run_logged, rejected, skipped, longs_closed).
+        (approved, dry_run_logged, rejected, skipped_duplicates,
+        skipped_pending_orders, longs_closed).  dry_run=True ⇒ no IBKR
+        connection, so skipped_pending_orders is always 0 here.
         """
         mock_mgr = MagicMock()
         mock_mgr.process.side_effect = decisions
@@ -111,7 +134,7 @@ class TestPhase4Deduplication:
             _make_decision("AAPL"),
             _make_decision("MSFT"),
         ]
-        approved, dry_run_logged, rejected, skipped, longs_closed = self._run(
+        approved, dry_run_logged, rejected, skipped, skipped_pending, longs_closed = self._run(
             actionable, decisions
         )
         assert approved       == 0
@@ -127,7 +150,7 @@ class TestPhase4Deduplication:
         ]
         # Only one decision will be consumed because GOOGL is skipped.
         decisions = [_make_decision("GOOG")]
-        approved, dry_run_logged, rejected, skipped, longs_closed = self._run(
+        approved, dry_run_logged, rejected, skipped, skipped_pending, longs_closed = self._run(
             actionable, decisions
         )
         assert approved       == 0
@@ -142,7 +165,7 @@ class TestPhase4Deduplication:
             (_make_signal("GOOG"),  1.5),
         ]
         decisions = [_make_decision("GOOGL")]
-        approved, dry_run_logged, rejected, skipped, longs_closed = self._run(
+        approved, dry_run_logged, rejected, skipped, skipped_pending, longs_closed = self._run(
             actionable, decisions
         )
         assert approved       == 0
@@ -159,7 +182,7 @@ class TestPhase4Deduplication:
         rejected_decision = _make_decision("GOOG", decision="REJECTED")
         rejected_decision.reject_reason = "portfolio drawdown exceeded"
         decisions = [rejected_decision]
-        approved, dry_run_logged, rejected, skipped, longs_closed = self._run(
+        approved, dry_run_logged, rejected, skipped, skipped_pending, longs_closed = self._run(
             actionable, decisions
         )
         assert approved       == 0
@@ -183,7 +206,7 @@ class TestPhase4Deduplication:
             _make_decision("MSFT", decision="REJECTED_NO_POSITION", signal="SELL"),
             _make_decision("GOOG", decision="REJECTED_NO_POSITION", signal="SELL"),
         ]
-        approved, dry_run_logged, rejected, skipped, longs_closed = self._run(
+        approved, dry_run_logged, rejected, skipped, skipped_pending, longs_closed = self._run(
             actionable, decisions
         )
         assert approved       == 0
@@ -191,6 +214,159 @@ class TestPhase4Deduplication:
         assert rejected       == 3
         assert skipped        == 0
         assert longs_closed   == 0
+
+
+# ── Pending-entry-order dedup (Phase 4) ───────────────────────────────────────
+
+class TestFetchPendingEntrySymbols:
+    """
+    _fetch_pending_entry_symbols returns symbols with a working (unfilled) open
+    order at IBKR that are NOT currently held — the set Phase 4 skips so it
+    can't stack a duplicate bracket on a still-working entry.
+    """
+
+    def _ibkr(self, open_orders):
+        ibkr = MagicMock()
+        ibkr.get_open_orders = MagicMock(return_value=_async_value(open_orders))
+        loop = MagicMock()
+        loop.run_until_complete.side_effect = lambda coro: _run_coro(coro)
+        return ibkr, loop
+
+    def test_unfilled_unheld_entry_is_pending(self):
+        """A working BUY entry on a not-held symbol is returned."""
+        ibkr, loop = self._ibkr([
+            {"symbol": "HPE", "action": "BUY", "order_type": "LMT", "remaining": 837},
+        ])
+        assert _fetch_pending_entry_symbols(ibkr, loop, {}) == {"HPE"}
+
+    def test_held_symbol_excluded(self):
+        """Protective TP/STP legs on a held position are NOT pending entries."""
+        ibkr, loop = self._ibkr([
+            {"symbol": "ARM", "action": "SELL", "order_type": "LMT", "remaining": 109},
+            {"symbol": "ARM", "action": "SELL", "order_type": "STP", "remaining": 109},
+        ])
+        held = {"ARM": {"shares": 109}}
+        assert _fetch_pending_entry_symbols(ibkr, loop, held) == set()
+
+    def test_fully_filled_order_excluded(self):
+        """remaining == 0 (nothing left to fill) is not a working entry."""
+        ibkr, loop = self._ibkr([
+            {"symbol": "HPE", "action": "BUY", "order_type": "LMT", "remaining": 0},
+        ])
+        assert _fetch_pending_entry_symbols(ibkr, loop, {}) == set()
+
+    def test_unknown_remaining_treated_as_working(self):
+        """Missing `remaining` defaults to working (conservative)."""
+        ibkr, loop = self._ibkr([
+            {"symbol": "LRCX", "action": "BUY", "order_type": "LMT"},
+        ])
+        assert _fetch_pending_entry_symbols(ibkr, loop, {}) == {"LRCX"}
+
+    def test_no_ibkr_returns_empty(self):
+        """Dry-run / paper-disabled (ibkr None) → empty set, no crash."""
+        assert _fetch_pending_entry_symbols(None, None, {}) == set()
+
+    def test_fetch_exception_returns_empty(self):
+        """get_open_orders raising → empty set (best-effort guard, never blocks)."""
+        async def _raise():
+            raise RuntimeError("API error")
+        ibkr = MagicMock()
+        ibkr.get_open_orders = MagicMock(return_value=_raise())
+        loop = MagicMock()
+        loop.run_until_complete.side_effect = lambda coro: _run_coro(coro)
+        assert _fetch_pending_entry_symbols(ibkr, loop, {}) == set()
+
+
+class TestPhase4PendingOrderDedup:
+    """
+    Phase 4 must skip an actionable signal whose symbol already has an unfilled
+    entry bracket working at IBKR — otherwise a second bracket is stacked on top
+    (the duplicate guard only sees filled positions).
+    """
+
+    def _run(self, monkeypatch, actionable, decisions, positions, open_orders):
+        from config.settings import config as cfg, TradingMode
+        monkeypatch.setattr(cfg.trading, "mode", TradingMode.SIMULATION)
+        monkeypatch.setattr(cfg.trading, "paper_orders_enabled", True)
+
+        ibkr = MagicMock()
+        ibkr.disconnect = MagicMock(return_value=_async_value(None))
+        ibkr.get_positions = MagicMock(return_value=_async_value(positions))
+        ibkr.get_open_orders = MagicMock(return_value=_async_value(open_orders))
+        loop = MagicMock()
+        loop.run_until_complete.side_effect = lambda coro: _run_coro(coro)
+
+        mock_mgr = MagicMock()
+        mock_mgr.process.side_effect = decisions
+
+        with patch("scripts.signal_runner._connect_ibkr_if_needed",
+                   return_value=(ibkr, loop)), \
+             patch("scripts.signal_runner.OrderManager", return_value=mock_mgr):
+            result = _phase4_risk_orders(
+                actionable=actionable, equity=100_000,
+                run_id="test-run", dry_run=False,
+            )
+        return result, mock_mgr
+
+    def test_pending_entry_skips_new_buy(self, monkeypatch):
+        """HPE has an unfilled BUY entry → today's HPE BUY is skipped, not sized."""
+        actionable = [(_make_signal("HPE"), 2.0)]
+        open_orders = [
+            {"symbol": "HPE", "action": "BUY", "order_type": "LMT", "remaining": 837},
+        ]
+        (approved, dry_run_logged, rejected, skipped_dup, skipped_pending,
+         longs_closed), mgr = self._run(
+            monkeypatch, actionable, decisions=[], positions=[], open_orders=open_orders,
+        )
+        assert skipped_pending == 1
+        assert approved == 0 and dry_run_logged == 0 and rejected == 0
+        mgr.process.assert_not_called()
+
+    def test_held_symbol_with_protective_legs_not_skipped(self, monkeypatch):
+        """A held symbol's SELL TP/STP legs must NOT block a new decision —
+        that path belongs to the duplicate guard / long-only close."""
+        actionable = [(_make_signal("ARM"), 2.0)]
+        positions = [{"symbol": "ARM", "quantity": 109, "avg_cost": 300.0}]
+        open_orders = [
+            {"symbol": "ARM", "action": "SELL", "order_type": "LMT", "remaining": 109},
+            {"symbol": "ARM", "action": "SELL", "order_type": "STP", "remaining": 109},
+        ]
+        (approved, dry_run_logged, rejected, skipped_dup, skipped_pending,
+         longs_closed), mgr = self._run(
+            monkeypatch, actionable, decisions=[_make_decision("ARM")],
+            positions=positions, open_orders=open_orders,
+        )
+        assert skipped_pending == 0
+        assert dry_run_logged == 1
+        mgr.process.assert_called_once()
+
+    def test_unrelated_pending_does_not_skip(self, monkeypatch):
+        """A pending entry on HPE must not block an unrelated AAPL signal."""
+        actionable = [(_make_signal("AAPL"), 2.0)]
+        open_orders = [
+            {"symbol": "HPE", "action": "BUY", "order_type": "LMT", "remaining": 837},
+        ]
+        (approved, dry_run_logged, rejected, skipped_dup, skipped_pending,
+         longs_closed), mgr = self._run(
+            monkeypatch, actionable, decisions=[_make_decision("AAPL")],
+            positions=[], open_orders=open_orders,
+        )
+        assert skipped_pending == 0
+        assert dry_run_logged == 1
+        mgr.process.assert_called_once()
+
+    def test_equivalent_pending_entry_skips(self, monkeypatch):
+        """A pending GOOG entry blocks a fresh GOOGL signal (and vice versa)."""
+        actionable = [(_make_signal("GOOGL"), 2.0)]
+        open_orders = [
+            {"symbol": "GOOG", "action": "BUY", "order_type": "LMT", "remaining": 10},
+        ]
+        (approved, dry_run_logged, rejected, skipped_dup, skipped_pending,
+         longs_closed), mgr = self._run(
+            monkeypatch, actionable, decisions=[], positions=[], open_orders=open_orders,
+        )
+        assert skipped_pending == 1
+        mgr.process.assert_not_called()
 
 
 # ── Stale-bar gate ────────────────────────────────────────────────────────────

@@ -334,6 +334,7 @@ class SignalRunnerLog(Base):
     orders_submitted      = Column(Integer, default=0)
     orders_rejected       = Column(Integer, default=0)
     skipped_duplicates    = Column(Integer, default=0)
+    skipped_pending_orders = Column(Integer, default=0)  # unfilled-entry dedup (Phase 4)
     skipped_stale         = Column(Integer, default=0)
     longs_closed          = Column(Integer, default=0)
     trailing_conversions  = Column(Integer, default=0)
@@ -683,6 +684,12 @@ def _migrate(engine) -> None:
                 ))
                 conn.commit()
                 log.info("Migration applied: signal_runner_log.hold_timeouts")
+            if "skipped_pending_orders" not in srl_cols:
+                conn.execute(text(
+                    "ALTER TABLE signal_runner_log ADD COLUMN skipped_pending_orders INTEGER DEFAULT 0"
+                ))
+                conn.commit()
+                log.info("Migration applied: signal_runner_log.skipped_pending_orders")
 
         # trade_log.benchmark_return_pct  (2026-05-19 — benchmark-relative
         # performance tracking on Page 10).  Raw (cost-unadjusted) benchmark
@@ -1758,6 +1765,7 @@ def get_signal_runner_log(limit: int = 50) -> pd.DataFrame:
         "orders_submitted":     r.orders_submitted,
         "orders_rejected":      r.orders_rejected,
         "skipped_duplicates":   r.skipped_duplicates,
+        "skipped_pending_orders": r.skipped_pending_orders,
         "skipped_stale":        r.skipped_stale,
         "longs_closed":         r.longs_closed,
         "trailing_conversions": r.trailing_conversions,

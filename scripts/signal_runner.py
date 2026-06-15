@@ -605,6 +605,45 @@ def _fetch_positions(ibkr, loop) -> dict:
     return positions
 
 
+def _fetch_pending_entry_symbols(ibkr, loop, held) -> set[str]:
+    """Symbols with a working (unfilled) open order at IBKR that are NOT
+    currently held — i.e. an entry bracket whose parent has not filled yet.
+
+    These are invisible to PortfolioGuard's duplicate check, which only sees
+    *filled* positions (``_fetch_positions``).  Without this guard a fresh
+    same-symbol BUY in Phase 4 stacks a SECOND bracket on top of the still-
+    working entry.  Bracket entries are GTC, so an unfilled BUY LMT routinely
+    sits for days (e.g. a Friday entry the symbol gapped past at the open),
+    which makes the duplicate-stack a real recurring hazard, not a corner case.
+
+    Held symbols are excluded on purpose: their open orders are protective
+    TP/STP/TRAIL legs, already handled by the duplicate guard (new BUY) and the
+    long-only close path (SELL).  Returns an empty set when IBKR is unavailable
+    (dry-run, paper disabled, or a fetch error) — this is a best-effort guard,
+    never a hard blocker on order submission.
+    """
+    if ibkr is None or loop is None:
+        return set()
+    try:
+        orders = loop.run_until_complete(ibkr.get_open_orders())
+    except Exception as exc:
+        log.warning("Could not fetch IBKR open orders for dedup: %s", exc)
+        return set()
+    held_syms = set(held.keys()) if isinstance(held, dict) else set(held)
+    pending: set[str] = set()
+    for o in orders:
+        sym = o.get("symbol")
+        if not sym or sym in held_syms:
+            continue
+        remaining = o.get("remaining")
+        # openTrades() only returns active orders; treat unknown remaining as
+        # working.  A partially-filled entry makes the symbol held (non-zero
+        # shares) → excluded above and caught by the duplicate guard instead.
+        if remaining is None or remaining > 0:
+            pending.add(sym)
+    return pending
+
+
 def _phase3_5_trailing_stops(dry_run: bool, run_id: str = "") -> int:
     """
     Phase 3.5: Walk existing long positions and convert qualifying bracket
@@ -866,10 +905,11 @@ def _phase4_risk_orders(
     equity: float,
     run_id: str,
     dry_run: bool,
-) -> tuple[int, int, int, int, int]:
+) -> tuple[int, int, int, int, int, int]:
     """
     Run OrderManager for each actionable signal.
-    Returns (approved, dry_run_logged, rejected, skipped_duplicates, longs_closed).
+    Returns (approved, dry_run_logged, rejected, skipped_duplicates,
+    skipped_pending_orders, longs_closed).
 
     When `dry_run=False` and paper/live mode is active, an IBKRConnection is
     opened for the duration of Phase 4 and passed to OrderManager (along with
@@ -885,7 +925,7 @@ def _phase4_risk_orders(
     if not actionable:
         print("  No actionable signals.")
         print()
-        return 0, 0, 0, 0, 0
+        return 0, 0, 0, 0, 0, 0
 
     ibkr, loop = _connect_ibkr_if_needed(dry_run)
     effective_dry_run = dry_run
@@ -911,12 +951,21 @@ def _phase4_risk_orders(
         if positions:
             print(f"  IBKR positions: {sorted(positions.keys())}")
 
+        # Symbols with an unfilled entry bracket still working at IBKR.  Skipping
+        # these prevents Phase 4 from stacking a duplicate bracket on a symbol
+        # whose prior entry hasn't filled (PortfolioGuard only sees *filled*
+        # positions, so it can't catch this).
+        pending_entries = _fetch_pending_entry_symbols(ibkr, loop, positions)
+        if pending_entries:
+            print(f"  Pending entry orders (skipping new signals): {sorted(pending_entries)}")
+
         decided_symbols: set[str] = set()
-        approved           = 0
-        dry_run_logged     = 0
-        rejected           = 0
-        skipped_duplicates = 0
-        longs_closed       = 0
+        approved               = 0
+        dry_run_logged         = 0
+        rejected               = 0
+        skipped_duplicates     = 0
+        skipped_pending_orders = 0
+        longs_closed           = 0
 
         for signal_result, atr in actionable:
             sym = signal_result.symbol
@@ -929,6 +978,17 @@ def _phase4_risk_orders(
                     "Skipping %s — equivalent symbol already decided this run", sym
                 )
                 print(f"  {sym}: SKIPPED (equivalent to already-decided symbol)")
+                continue
+
+            # Skip symbols (or their GOOG/GOOGL equivalent) that already have an
+            # unfilled entry bracket working at IBKR — submitting again would
+            # stack a duplicate bracket on the same name.
+            if sym in pending_entries or (equivalent and equivalent in pending_entries):
+                skipped_pending_orders += 1
+                log.info(
+                    "Skipping %s — unfilled entry order already working at IBKR", sym
+                )
+                print(f"  {sym}: SKIPPED (open entry order already working at IBKR)")
                 continue
 
             decision = manager.process(
@@ -972,7 +1032,10 @@ def _phase4_risk_orders(
                 )
 
         print()
-        return approved, dry_run_logged, rejected, skipped_duplicates, longs_closed
+        return (
+            approved, dry_run_logged, rejected,
+            skipped_duplicates, skipped_pending_orders, longs_closed,
+        )
     finally:
         if ibkr is not None and loop is not None:
             try:
@@ -999,6 +1062,7 @@ def _phase5_summary(
     rejected: int,
     skipped_duplicates: int,
     skipped_stale: int,
+    skipped_pending_orders: int,
     longs_closed: int,
     trailing_conversions: int,
     hold_timeouts: int,
@@ -1015,6 +1079,7 @@ def _phase5_summary(
     print(f"  Orders rejected:       {rejected}")
     print(f"  Longs closed:          {longs_closed}")
     print(f"  Skipped duplicates:    {skipped_duplicates}")
+    print(f"  Skipped pending orders:{skipped_pending_orders}")
     print(f"  Skipped stale:         {skipped_stale}")
     print(f"  Trailing conversions:  {trailing_conversions}")
     print(f"  Hold timeouts:         {hold_timeouts}")
@@ -1039,6 +1104,7 @@ def _phase5_summary(
             "orders_submitted":      approved + dry_run_logged,
             "orders_rejected":       rejected,
             "skipped_duplicates":    skipped_duplicates,
+            "skipped_pending_orders": skipped_pending_orders,
             "skipped_stale":         skipped_stale,
             "longs_closed":          longs_closed,
             "trailing_conversions":  trailing_conversions,
@@ -1065,16 +1131,17 @@ def run(dry_run: bool = True, symbol_filter: str = "") -> None:
 
     if halted:
         # Still log the aborted run
-        _phase5_summary(run_id, symbols, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.0, dry_run)
+        _phase5_summary(run_id, symbols, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.0, dry_run)
         return
 
     _phase2_refresh(symbols)
     actionable, skipped_stale = _phase3_signals(symbols)
     trailing_conversions = _phase3_5_trailing_stops(dry_run, run_id=run_id)
     hold_timeouts = _phase3_6_hold_timeouts(dry_run, run_id=run_id)
-    approved, dry_run_logged, rejected, skipped_duplicates, longs_closed = (
-        _phase4_risk_orders(actionable, equity, run_id, dry_run)
-    )
+    (
+        approved, dry_run_logged, rejected,
+        skipped_duplicates, skipped_pending_orders, longs_closed,
+    ) = _phase4_risk_orders(actionable, equity, run_id, dry_run)
 
     duration = time.monotonic() - t_start
     _phase5_summary(
@@ -1085,6 +1152,7 @@ def run(dry_run: bool = True, symbol_filter: str = "") -> None:
         dry_run_logged=dry_run_logged,
         rejected=rejected,
         skipped_duplicates=skipped_duplicates,
+        skipped_pending_orders=skipped_pending_orders,
         skipped_stale=skipped_stale,
         longs_closed=longs_closed,
         trailing_conversions=trailing_conversions,
