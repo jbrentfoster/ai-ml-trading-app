@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import re
 import time
+import urllib.error
 import urllib.request
 from typing import Callable
 
@@ -54,8 +55,15 @@ class FlexError(RuntimeError):
 
 def _default_http_get(url: str, timeout: int = 30) -> str:
     req = urllib.request.Request(url, headers={"User-Agent": "trading_app-flex/1.0"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read().decode("utf-8", errors="replace")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read().decode("utf-8", errors="replace")
+    except (urllib.error.URLError, OSError) as exc:
+        # DNS / connection / timeout failures (e.g. socket.gaierror "[Errno 11001]
+        # getaddrinfo failed") raise raw URLError/OSError.  Re-raise as FlexError so
+        # all transport failures funnel through the single failure type callers
+        # already handle (reconcile_flex.py logs + exits 0 on FlexError).
+        raise FlexError(f"Flex HTTP request failed: {exc}") from exc
 
 
 def _tag(xml: str, name: str) -> str | None:

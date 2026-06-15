@@ -5,9 +5,11 @@ Network + sleep are injected, so these run offline and instantly.  The fake
 response per call, letting each test script the exact 1001/1019 sequence.
 """
 
+import urllib.error
+
 import pytest
 
-from data.flex_client import FlexError, fetch_flex_statement
+from data.flex_client import FlexError, _default_http_get, fetch_flex_statement
 
 # ── canned Flex responses ──────────────────────────────────────────────────────
 SEND_THROTTLE = (
@@ -132,6 +134,19 @@ def test_empty_but_valid_statement_returns_body():
 def test_missing_credentials_raises(token, qid):
     with pytest.raises(FlexError, match="required"):
         fetch_flex_statement(token, qid, http_get=lambda u: SEND_OK, sleep=_no_sleep)
+
+
+def test_default_http_get_reraises_transport_error_as_flexerror(monkeypatch):
+    # A DNS / transport failure (e.g. socket.gaierror "[Errno 11001] getaddrinfo
+    # failed") raises raw URLError; _default_http_get must funnel it through
+    # FlexError so reconcile_flex.py's `except FlexError` graceful path engages
+    # instead of an uncaught traceback + non-zero exit.
+    def _boom(_req, timeout=30):
+        raise urllib.error.URLError("getaddrinfo failed")
+
+    monkeypatch.setattr("data.flex_client.urllib.request.urlopen", _boom)
+    with pytest.raises(FlexError, match="Flex HTTP request failed"):
+        _default_http_get("https://example.invalid/x")
 
 
 def test_send_url_used_when_no_url_tag():
