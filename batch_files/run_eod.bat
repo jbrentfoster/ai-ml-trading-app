@@ -3,7 +3,10 @@
 :: Step 1 — re-fetch last 5 days' OHLCV bars and recompute indicators for the
 ::          union of (current universe, recently-acted symbols, held positions).
 ::          Replaces mid-day partial bars (written by morning signal_runner)
-::          with the final post-close values from yfinance.
+::          with the final post-close values from yfinance.  ALSO sweeps unfilled
+::          GTC entry orders (working orders on NOT-held symbols) so a gapped-past
+::          BUY LMT doesn't rest for days — tomorrow's run re-prices off a fresh
+::          close.  (--no-cancel to skip; no-op when Gateway is down.)
 ::
 :: Schedule via Windows Task Scheduler at 16:30 ET on weekdays.
 

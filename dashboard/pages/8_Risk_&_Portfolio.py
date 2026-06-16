@@ -162,7 +162,9 @@ st.caption(
     "**DRY_RUN** = logged without submitting.  **REJECTED** = blocked by PortfolioGuard.  "
     "**APPROVED** = bracket order submitted to IBKR.  "
     "**CLOSED_LONG** = SELL signal closed an existing long position (long-only mode).  "
-    "**REJECTED_NO_POSITION** = SELL signal ignored — no long held and short selling is disabled."
+    "**REJECTED_NO_POSITION** = SELL signal ignored — no long held and short selling is disabled.  "
+    "**CANCELLED_UNFILLED** = a GTC entry that never filled was swept at end of day "
+    "(refresh_recent_bars.py) so tomorrow's run re-prices off a fresh close."
 )
 
 run_ids = query_distinct_run_ids(limit=20)
@@ -197,6 +199,7 @@ else:
                 "REJECTED":             "background-color: #3a1b1b",   # dark red
                 "CLOSED_LONG":          "background-color: #2a1b3a",   # dark purple
                 "REJECTED_NO_POSITION": "background-color: #2a2a1b",   # dark amber
+                "CANCELLED_UNFILLED":   "background-color: #2b2b2b",   # slate (EOD sweep)
             }.get(decision, "")
 
         display_cols = [

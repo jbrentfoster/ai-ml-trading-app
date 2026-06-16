@@ -19,6 +19,15 @@ What this script does:
     For each symbol it overwrites OHLCV rows in place (upsert_bars overwrite=True)
     and recomputes the derived indicator snapshots for those same dates.
 
+    It also sweeps UNFILLED ENTRY ORDERS after the close (see
+    `_cancel_unfilled_entries`).  Entry brackets are submitted GTC, so a BUY LMT
+    the symbol gapped past at the open rests at IBKR for days.  We don't chase
+    gap-aways intraday (the ATR stop/TP were sized off the prior close), so each
+    unfilled entry is treated as good-for-one-session: cancelled here so the next
+    morning's signal_runner re-prices and re-decides off a fresh close rather than
+    resting on a stale signal.  Protective legs of HELD positions are never
+    touched — only working orders on symbols we do not currently hold.
+
     Why (3) is separate from (2): bracket fills (TP / stop / trailing) reconcile
     straight into trade_log as source='live' with NO order_decisions row, so the
     order_decisions-based union in (2) misses them.  A symbol that exits via a
@@ -36,6 +45,7 @@ Usage:
     python scripts/refresh_recent_bars.py              # default 5 days back
     python scripts/refresh_recent_bars.py --days 10    # wider backfill window
     python scripts/refresh_recent_bars.py --no-ibkr    # skip IBKR positions query
+    python scripts/refresh_recent_bars.py --no-cancel  # skip the unfilled-entry sweep
 """
 
 from __future__ import annotations
@@ -47,7 +57,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from config.settings import config
+from config.settings import TradingMode, config
 from core.logger import get_logger
 from data.database import (
     get_order_decisions,
@@ -135,6 +145,132 @@ def _ibkr_position_symbols() -> set[str]:
         asyncio.set_event_loop(None)
 
 
+def _live_orders_active() -> bool:
+    """True when the system is actually placing orders at IBKR — paper or live.
+
+    Same gate signal_runner uses (``_phase1`` etc.): mode==LIVE, or SIMULATION
+    with paper_orders_enabled.  When False there are no automated working orders
+    to sweep, so the unfilled-entry cancel step is skipped.
+    """
+    return config.trading.mode == TradingMode.LIVE or (
+        config.trading.mode == TradingMode.SIMULATION
+        and config.trading.paper_orders_enabled
+    )
+
+
+def _cancel_unfilled_entries() -> int:
+    """Cancel working (unfilled) entry orders after the close.
+
+    Entry brackets are GTC, so a BUY LMT the symbol gapped past at the open rests
+    at IBKR for days (CVX 2026-06-15/16).  We deliberately do NOT chase gap-aways
+    intraday — the ATR stop/TP were sized off the prior close, so a later fill
+    worsens the R:R against an unchanged stop.  Instead each unfilled entry is
+    good-for-one-session: swept here so tomorrow's signal_runner re-prices and
+    re-decides off a fresh close rather than resting on a stale signal.
+
+    SAFETY — only orders on symbols we do NOT currently hold are cancelled.  A
+    working order on a *held* symbol is a protective STP/TP/TRAIL leg and is never
+    touched (same not-held filter as signal_runner._fetch_pending_entry_symbols).
+    An unfilled entry's inactive bracket children share the symbol, so they're
+    swept together, tearing down the whole bracket; a duplicate cancel of an
+    already-cancelled leg is the benign 10148 in the informational set.
+
+    Each cancelled symbol is recorded to order_decisions as
+    decision='CANCELLED_UNFILLED' (one row per symbol) for Page 8 visibility.
+    No-op + returns 0 when Gateway is unreachable (nothing visible → cancel
+    nothing) or on any fetch error — never blocks the bar-refresh that is this
+    script's primary job.  Returns the number of symbols swept.
+    """
+    import asyncio
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    ibkr = None
+    try:
+        from execution.ibkr_connection import IBKRConnection
+        from data.database import log_order_decision
+
+        ibkr = IBKRConnection()
+        if not loop.run_until_complete(ibkr.connect()):
+            log.warning("IBKR Gateway unreachable — skipping unfilled-entry sweep")
+            print("  Unfilled-entry sweep: Gateway unreachable — skipped")
+            return 0
+
+        positions = loop.run_until_complete(ibkr.get_positions())
+        held = {p["symbol"] for p in positions if int(p.get("quantity", 0) or 0) != 0}
+        orders = loop.run_until_complete(ibkr.get_open_orders())
+
+        # Group working orders on NOT-held symbols (= unfilled entry brackets).
+        pending: dict[str, list[dict]] = {}
+        for o in orders:
+            sym = o.get("symbol")
+            if not sym or sym in held:
+                continue
+            remaining = o.get("remaining")
+            if remaining is None or remaining > 0:
+                pending.setdefault(sym, []).append(o)
+
+        if not pending:
+            print("  Unfilled-entry sweep: no unfilled entries to cancel")
+            return 0
+
+        cancelled = 0
+        for sym, legs in sorted(pending.items()):
+            sent_any = False
+            for leg in legs:
+                oid = leg.get("order_id")
+                try:
+                    if loop.run_until_complete(ibkr.cancel_order(oid)):
+                        sent_any = True
+                except Exception as exc:
+                    log.warning("Cancel failed for %s id=%s: %s", sym, oid, exc)
+            if not sent_any:
+                print(f"  {sym}: cancel send failed for all {len(legs)} leg(s)")
+                continue
+            cancelled += 1
+            # One audit row per symbol, priced off the BUY LMT entry leg if present.
+            entry_leg = next(
+                (l for l in legs
+                 if l.get("action") == "BUY" and l.get("order_type") == "LMT"),
+                legs[0],
+            )
+            try:
+                log_order_decision({
+                    "run_id":            "",
+                    "symbol":            sym,
+                    "signal":            entry_leg.get("action", "BUY"),
+                    "decision":          "CANCELLED_UNFILLED",
+                    "shares":            int(entry_leg.get("quantity", 0) or 0),
+                    "entry_price":       entry_leg.get("limit_price"),
+                    "stop_price":        None,
+                    "take_profit_price": None,
+                    "position_value":    None,
+                    "reject_reason":     "Unfilled entry swept at EOD (good-for-one-session)",
+                    "decided_at":        datetime.now(timezone.utc).replace(tzinfo=None),
+                })
+            except Exception as exc:
+                log.warning("Could not persist CANCELLED_UNFILLED for %s: %s", sym, exc)
+            print(f"  {sym}: cancelled {len(legs)} unfilled order leg(s)")
+
+        log.info("EOD unfilled-entry sweep: cancelled entries on %d symbol(s)", cancelled)
+        return cancelled
+    except Exception as exc:
+        log.warning("Unfilled-entry sweep failed (%s) — continuing", exc)
+        print(f"  Unfilled-entry sweep: error ({exc}) — skipped")
+        return 0
+    finally:
+        if ibkr is not None:
+            try:
+                loop.run_until_complete(ibkr.disconnect())
+            except Exception:
+                pass
+        try:
+            loop.close()
+        except Exception:
+            pass
+        asyncio.set_event_loop(None)
+
+
 def _refresh_indicators(symbol: str, interval: str) -> int:
     """Recompute indicators from the (now-refreshed) bars and overwrite snapshots."""
     from data.database import get_bars
@@ -171,7 +307,8 @@ def refresh_symbols(symbols, interval: str = "1d", days_back: int = 5) -> tuple[
     return bars_total, ind_total, failed
 
 
-def main(days_back: int = 5, use_ibkr: bool = True, interval: str = "1d") -> None:
+def main(days_back: int = 5, use_ibkr: bool = True, interval: str = "1d",
+         cancel_unfilled: bool = True) -> None:
     print(f"=== End-of-day bar refresh (days_back={days_back}, interval={interval}) ===")
     started = datetime.now(timezone.utc).replace(tzinfo=None)
 
@@ -213,6 +350,20 @@ def main(days_back: int = 5, use_ibkr: bool = True, interval: str = "1d") -> Non
             log.error("Refresh failed for %s: %s", sym, exc, exc_info=True)
             print(f"  {sym}: FAILED — {exc}")
 
+    # ── Unfilled-entry sweep ────────────────────────────────────────────────
+    # Run AFTER the bar refresh so the script's primary job always completes
+    # even if the Gateway is flaky on the order step.
+    print()
+    print("=== Unfilled-entry sweep ===")
+    if not cancel_unfilled:
+        print("  Skipped (--no-cancel).")
+    elif not use_ibkr:
+        print("  Skipped (--no-ibkr — needs Gateway to see/cancel orders).")
+    elif not _live_orders_active():
+        print("  Skipped (no automated orders: SIMULATION + paper_orders_enabled=False).")
+    else:
+        _cancel_unfilled_entries()
+
     duration = (datetime.now(timezone.utc).replace(tzinfo=None) - started).total_seconds()
     print()
     print(f"=== Done in {duration:.1f}s — {len(symbols)} symbols, "
@@ -228,6 +379,9 @@ if __name__ == "__main__":
                         help="Calendar days of history to re-fetch (default 5)")
     parser.add_argument("--no-ibkr", action="store_true",
                         help="Skip the IBKR-positions union (useful when Gateway is down)")
+    parser.add_argument("--no-cancel", action="store_true",
+                        help="Skip the end-of-day unfilled-entry cancellation sweep")
     parser.add_argument("--interval", default="1d", help="Bar interval (default 1d)")
     args = parser.parse_args()
-    main(days_back=args.days, use_ibkr=not args.no_ibkr, interval=args.interval)
+    main(days_back=args.days, use_ibkr=not args.no_ibkr, interval=args.interval,
+         cancel_unfilled=not args.no_cancel)
