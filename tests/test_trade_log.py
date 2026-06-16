@@ -256,52 +256,54 @@ class TestBenchmarkAggregatesBaseline20260519:
             "win_rate_vs_bench": 100.0 * (strategy["excess_pct"] > 0).sum() / n,
         }
 
-    def test_benchmark_aggregates_deduped_baseline_2026_06_14(self):
+    def test_benchmark_aggregates_deduped_baseline_2026_06_16(self):
         """Default page view (dedup=ON, active_universe=ON), fold_end excluded.
 
-        Pin date: 2026-06-14.  Tolerances are wide enough to absorb
+        Pin date: 2026-06-16.  Tolerances are wide enough to absorb
         floating-point recomputation but tight enough to catch a real shift.
         FAILURE EXPECTED after the next weekly retrain — re-pin to new
         numbers and bump the date in the test name.
 
-        Re-pin note (2026-06-14): weekly --force retrain (68 symbols, +144 raw
-        fold rows).  The deduped view recomputes the latest-run WF trades over the
-        freshly-rotated universe, so the swing is a genuine model+rotation churn,
-        not drift: n 144 -> 148 (+4) but cum_excess collapsed +274.76 -> +8.03.
-        Two compounding effects — (1) high-excess names that rotated OUT (GOOG/
-        AMZN/TSLA/SPOT/STX/TXN/CIEN/…, 16 marked inactive) drop from the
-        active-universe filter entirely; (2) this cycle's fresh WF-simulated
-        trades on the rotated-in semis/AI cohort net to ~flat vs SPY (mean avg
-        Sharpe was +0.05).  win_rate 45.8 -> 39.2.  The current-model excess being
-        ~flat this week is a WF-simulated observation over a near-zero-edge cycle,
-        not a bug (see weekly_run_20260614 review)."""
+        Re-pin note (2026-06-16): the big swing vs the 2026-06-14 baseline
+        (n 148 -> 134, cum_excess +8.03 -> +292.0, win_rate 39.2 -> 53.0) is NOT
+        from a weekly retrain — it is the manual `train_models.py --force` run on
+        2026-06-15 that validated the atr_stop_multiplier 2.0 -> 3.0 stop-bleed
+        intervention (commit a94a761, "WF-confirmed").  710 WF-result rows + 406
+        WF trade rows were rewritten 6/15 (recorded 00:57->16:50, universe_policy
+        'static', ~2x full-universe run_ids).  The deduped view recomputes the
+        latest-run WF trades, so the wider 3.0 stop directly lifts current-model
+        excess (fewer premature stop-outs) — this IS the WF evidence the stop
+        change was meant to produce.  The 6/16 daily added 2 live rows (NBIS
+        +2,700 signal_flip, WDC +8,557 tp) but those are a rounding-level nudge
+        next to the 6/15 retrain.  (The 6/15 daily review missed re-pinning this —
+        see daily_run_20260616 review §5.)"""
         m = self._strategy_metrics(dedup=True, active_universe=True)
-        assert m["n"]                 == 148,                      (
-            f"Row count drifted from 2026-06-14 baseline of 148 — got {m['n']}.  "
+        assert m["n"]                 == 134,                      (
+            f"Row count drifted from 2026-06-16 baseline of 134 — got {m['n']}.  "
             "Likely cause: a new weekly --force retrain has landed.  Eyeball "
             "the new numbers (Page 10 default view) and re-pin this test."
         )
-        assert m["cum_excess_pct"]    == pytest.approx(  +8.03, abs=1.0)
-        assert m["win_rate_vs_bench"] == pytest.approx(  39.2,  abs=0.5)
+        assert m["cum_excess_pct"]    == pytest.approx( +292.0, abs=2.0)
+        assert m["win_rate_vs_bench"] == pytest.approx(   53.0, abs=0.5)
 
-    def test_benchmark_aggregates_raw_baseline_2026_06_14(self):
+    def test_benchmark_aggregates_raw_baseline_2026_06_16(self):
         """Multi-run view (dedup=OFF, active_universe=OFF), fold_end excluded.
 
-        Pin date: 2026-06-14.  Same fold_end-excluded slice as the deduped
+        Pin date: 2026-06-16.  Same fold_end-excluded slice as the deduped
         baseline — the divergence vs the deduped numbers is the architectural
         finding (see CLAUDE.md 'Dedup vs raw views are honest answers').
 
-        Re-pin note (2026-06-14): weekly --force retrain added +144 fresh fold
-        rows (raw n 1203 -> 1347); cum_excess moved less-negative-then-more as the
-        new fold dilutes older drag (-578.74 -> -616.76); win_rate 37.3 -> 37.5.
-        Unlike the deduped view, the raw view keeps every historical run so it does
-        not feel the rotation-out effect — its movement is the usual additive
-        fold-drag pattern seen on every weekly re-pin."""
+        Re-pin note (2026-06-16): the 2026-06-15 manual --force stop-multiplier
+        validation retrain (see deduped note) stacked a fresh batch of fold rows
+        on top of history (raw keeps every run), so raw n 1347 -> 1439; cum_excess
+        moved less-negative (-616.76 -> -358.48) and win_rate 37.5 -> 39.1 as the
+        wider-stop fold dilutes older drag.  +2 live rows from the 6/16 daily
+        (NBIS/WDC) are included in the count."""
         m = self._strategy_metrics(dedup=False, active_universe=False)
-        assert m["n"]                 == 1347,                     (
-            f"Row count drifted from 2026-06-14 baseline of 1347 — got {m['n']}.  "
+        assert m["n"]                 == 1439,                     (
+            f"Row count drifted from 2026-06-16 baseline of 1439 — got {m['n']}.  "
             "Likely cause: a new --force retrain inserted rows OR the backfill "
             "skipped rows for some symbols.  Investigate before re-pinning."
         )
-        assert m["cum_excess_pct"]    == pytest.approx(-616.76, abs=2.0)
-        assert m["win_rate_vs_bench"] == pytest.approx(   37.5,  abs=0.5)
+        assert m["cum_excess_pct"]    == pytest.approx(-358.48, abs=2.0)
+        assert m["win_rate_vs_bench"] == pytest.approx(   39.1,  abs=0.5)

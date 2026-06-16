@@ -816,6 +816,21 @@ class TestCostModel:
 class TestBracketSimulation:
     """Tests for Phase 4.5 (Phase A) bracket simulation in _run_test_window."""
 
+    @pytest.fixture(autouse=True)
+    def _pin_bracket_multipliers(self, monkeypatch):
+        """Pin the ATR stop/TP multipliers to the values this class's synthetic
+        bars are built against (stop = entry-2*ATR, tp = entry+3*ATR).
+
+        `_run_test_window` reads `config.risk.atr_stop_multiplier` /
+        `atr_take_profit_multiplier` live at call time, so a change to the
+        production defaults (e.g. the 2026-06-15 stop-bleed intervention that
+        raised atr_stop_multiplier 2.0 -> 3.0, commit a94a761) silently shifts
+        the stop level and breaks these mechanics tests.  Pinning here keeps the
+        class testing bracket *behaviour*, not the current default values."""
+        from config.settings import config
+        monkeypatch.setattr(config.risk, "atr_stop_multiplier", 2.0)
+        monkeypatch.setattr(config.risk, "atr_take_profit_multiplier", 3.0)
+
     def test_stop_caps_loss_at_atr_distance(self):
         """ATR=2, stop_mult=2 → stop=entry-4.  A bar with Low<=stop fires
         the stop intra-bar and exits at stop_px with extra slippage."""
