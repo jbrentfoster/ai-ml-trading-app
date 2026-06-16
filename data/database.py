@@ -832,19 +832,32 @@ def upsert_bars(
     if df.empty:
         return 0
 
+    # Normalise to plain Python datetimes once, deduping on timestamp (last wins).
+    rows_by_ts = {
+        (ts.to_pydatetime().replace(tzinfo=None) if hasattr(ts, "to_pydatetime") else ts): row
+        for ts, row in df.iterrows()
+    }
+
     engine = get_engine()
     affected = 0
 
     with Session(engine) as session:
-        for ts, row in df.iterrows():
-            # Normalise to a plain Python datetime
-            ts_dt = ts.to_pydatetime().replace(tzinfo=None) if hasattr(ts, "to_pydatetime") else ts
+        # One range query for every existing row instead of a SELECT per bar.
+        existing = {
+            r.timestamp: r
+            for r in session.query(OHLCVBar).filter(
+                OHLCVBar.symbol == symbol,
+                OHLCVBar.interval == interval,
+                OHLCVBar.timestamp >= min(rows_by_ts),
+                OHLCVBar.timestamp <= max(rows_by_ts),
+            ).all()
+        }
 
-            exists = session.query(OHLCVBar).filter_by(
-                symbol=symbol, interval=interval, timestamp=ts_dt
-            ).first()
+        new_objs = []
+        for ts_dt, row in rows_by_ts.items():
+            exists = existing.get(ts_dt)
             if exists is None:
-                session.add(OHLCVBar(
+                new_objs.append(OHLCVBar(
                     symbol=symbol,
                     interval=interval,
                     timestamp=ts_dt,
@@ -863,6 +876,8 @@ def upsert_bars(
                 exists.volume = float(row["Volume"])
                 affected += 1
 
+        if new_objs:
+            session.add_all(new_objs)
         session.commit()
 
     return affected
@@ -934,23 +949,36 @@ def upsert_indicators(
     if df.empty:
         return 0
 
+    rows_by_ts = {
+        (ts.to_pydatetime().replace(tzinfo=None) if hasattr(ts, "to_pydatetime") else ts): row
+        for ts, row in df.iterrows()
+    }
+
     engine = get_engine()
     affected = 0
 
     with Session(engine) as session:
-        for ts, row in df.iterrows():
-            ts_dt = ts.to_pydatetime().replace(tzinfo=None) if hasattr(ts, "to_pydatetime") else ts
+        # One range query for every existing row instead of a SELECT per bar.
+        existing = {
+            r.timestamp: r
+            for r in session.query(IndicatorSnapshot).filter(
+                IndicatorSnapshot.symbol == symbol,
+                IndicatorSnapshot.interval == interval,
+                IndicatorSnapshot.timestamp >= min(rows_by_ts),
+                IndicatorSnapshot.timestamp <= max(rows_by_ts),
+            ).all()
+        }
 
-            exists = session.query(IndicatorSnapshot).filter_by(
-                symbol=symbol, interval=interval, timestamp=ts_dt
-            ).first()
+        new_objs = []
+        for ts_dt, row in rows_by_ts.items():
+            exists = existing.get(ts_dt)
             kwargs = {
                 col: (None if pd.isna(row.get(col)) else float(row[col]))
                 for col in _INDICATOR_COLS
                 if col in df.columns
             }
             if exists is None:
-                session.add(IndicatorSnapshot(
+                new_objs.append(IndicatorSnapshot(
                     symbol=symbol, interval=interval, timestamp=ts_dt, **kwargs
                 ))
                 affected += 1
@@ -959,6 +987,8 @@ def upsert_indicators(
                     setattr(exists, col, val)
                 affected += 1
 
+        if new_objs:
+            session.add_all(new_objs)
         session.commit()
 
     return affected
