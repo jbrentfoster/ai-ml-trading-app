@@ -80,7 +80,7 @@ Write a `signal_runner_log` row with run-level counters (signals generated, orde
 
 ## Complementary runners (intraday and post-close)
 
-The seven-phase daily runner above fires once per weekday at 09:35 ET via `run_daily.bat`. Two smaller runners handle work that has to happen on a different cadence:
+The seven-phase daily runner above fires once per weekday at 09:40 ET via `run_daily.bat`. Two smaller runners handle work that has to happen on a different cadence:
 
 ### Intraday lightweight runner — `scripts/intraday_check.py`
 Scheduled at 12:00 ET and 15:30 ET via `run_intraday.bat`. Runs only Phase 1 (circuit-breaker check against live IBKR account P&L) and Phase 3.5 (trailing-stop re-evaluation against live `IBKRConnection.get_last_price()`, NOT the cached daily bar). Does **not** regenerate signals, refresh data, fetch news, retrain models, rescore the universe, or evaluate hold-timeouts — those stay on the daily/weekly cadence. Each invocation writes one row to `intraday_run_log` (status ∈ `completed` / `gateway_down` / `cb_tripped` / `error`). Ratchet-only by default; new TP→TRAIL conversions are opt-in via `RiskConfig.intraday_trail_conversion_enabled`. Exits 0 on Gateway-down to avoid Task Scheduler retry storms — a missed slot surfaces as a `status='gateway_down'` row on Page 8 instead.
