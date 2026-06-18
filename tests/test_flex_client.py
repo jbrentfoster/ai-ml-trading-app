@@ -138,15 +138,51 @@ def test_missing_credentials_raises(token, qid):
 
 def test_default_http_get_reraises_transport_error_as_flexerror(monkeypatch):
     # A DNS / transport failure (e.g. socket.gaierror "[Errno 11001] getaddrinfo
-    # failed") raises raw URLError; _default_http_get must funnel it through
-    # FlexError so reconcile_flex.py's `except FlexError` graceful path engages
-    # instead of an uncaught traceback + non-zero exit.
+    # failed") raises raw URLError; after exhausting in-process retries
+    # _default_http_get must funnel it through FlexError so reconcile_flex.py's
+    # `except FlexError` graceful path engages instead of an uncaught traceback +
+    # non-zero exit.  Inject a no-op sleep so the backoff doesn't slow the test.
+    calls = {"n": 0}
+
     def _boom(_req, timeout=30):
+        calls["n"] += 1
         raise urllib.error.URLError("getaddrinfo failed")
 
     monkeypatch.setattr("data.flex_client.urllib.request.urlopen", _boom)
     with pytest.raises(FlexError, match="Flex HTTP request failed"):
-        _default_http_get("https://example.invalid/x")
+        _default_http_get("https://example.invalid/x", sleep=lambda _s: None)
+    # 1 initial attempt + 2 retries (transport_retries default)
+    assert calls["n"] == 3
+
+
+def test_default_http_get_retries_transient_then_succeeds(monkeypatch):
+    # A transient DNS blip on the first lookup that clears on retry must NOT abort
+    # the fetch — the in-process retry recovers within the same run (the 6/15 +
+    # 6/18 pre-market getaddrinfo failures).
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return b"<FlexQueryResponse>ok</FlexQueryResponse>"
+
+    calls = {"n": 0}
+
+    def _flaky(_req, timeout=30):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise urllib.error.URLError("getaddrinfo failed")
+        return _Resp()
+
+    slept = []
+    monkeypatch.setattr("data.flex_client.urllib.request.urlopen", _flaky)
+    body = _default_http_get("https://example.invalid/x", sleep=slept.append)
+    assert "FlexQueryResponse" in body
+    assert calls["n"] == 2          # failed once, succeeded on retry
+    assert slept == [4.0]           # one backoff before the successful retry
 
 
 def test_send_url_used_when_no_url_tag():

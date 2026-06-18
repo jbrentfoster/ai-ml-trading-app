@@ -53,17 +53,42 @@ class FlexError(RuntimeError):
     """Raised when the Flex Web Service cannot produce a statement."""
 
 
-def _default_http_get(url: str, timeout: int = 30) -> str:
+def _default_http_get(
+    url: str,
+    timeout: int = 30,
+    *,
+    transport_retries: int = 2,
+    transport_backoff_s: float = 4.0,
+    sleep: Callable[[float], None] = time.sleep,
+) -> str:
     req = urllib.request.Request(url, headers={"User-Agent": "trading_app-flex/1.0"})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.read().decode("utf-8", errors="replace")
-    except (urllib.error.URLError, OSError) as exc:
-        # DNS / connection / timeout failures (e.g. socket.gaierror "[Errno 11001]
-        # getaddrinfo failed") raise raw URLError/OSError.  Re-raise as FlexError so
-        # all transport failures funnel through the single failure type callers
-        # already handle (reconcile_flex.py logs + exits 0 on FlexError).
-        raise FlexError(f"Flex HTTP request failed: {exc}") from exc
+    # Retry transient transport failures in-process.  DNS / connection / timeout
+    # failures (e.g. socket.gaierror "[Errno 11001/11002] getaddrinfo failed")
+    # raise raw URLError/OSError, and these recur on the pre-market critical path —
+    # a momentary resolver hiccup on the first lookup otherwise aborts the whole
+    # Flex fetch for the run (observed 6/15 + 6/18).  These codes are the transient
+    # resolver-failure class, so a short backoff usually clears them within the same
+    # run.  Note: this is distinct from the SendRequest/GetStatement (1001/1019)
+    # application-level retries in fetch_flex_statement, which only fire on a
+    # *successful* HTTP response carrying an IBKR error code.
+    last_exc: Exception | None = None
+    for attempt in range(1, transport_retries + 2):  # +1 initial try, +N retries
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read().decode("utf-8", errors="replace")
+        except (urllib.error.URLError, OSError) as exc:
+            last_exc = exc
+            if attempt <= transport_retries:
+                log.warning(
+                    "Flex HTTP transport error (attempt %d/%d) — retrying in %.0fs: %s",
+                    attempt, transport_retries + 1, transport_backoff_s, exc,
+                )
+                sleep(transport_backoff_s)
+                continue
+            # Exhausted: re-raise as FlexError so all transport failures funnel
+            # through the single failure type callers already handle
+            # (reconcile_flex.py logs + exits 0 on FlexError).
+            raise FlexError(f"Flex HTTP request failed: {last_exc}") from last_exc
 
 
 def _tag(xml: str, name: str) -> str | None:
