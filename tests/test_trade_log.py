@@ -256,47 +256,47 @@ class TestBenchmarkAggregatesBaseline20260519:
             "win_rate_vs_bench": 100.0 * (strategy["excess_pct"] > 0).sum() / n,
         }
 
-    def test_benchmark_aggregates_deduped_baseline_2026_06_22(self):
+    def test_benchmark_aggregates_deduped_baseline_2026_06_24(self):
         """Default page view (dedup=ON, active_universe=ON), fold_end excluded.
 
-        Pin date: 2026-06-22.  Tolerances are wide enough to absorb
+        Pin date: 2026-06-24.  Tolerances are wide enough to absorb
         floating-point recomputation but tight enough to catch a real shift.
         FAILURE EXPECTED after the next weekly retrain — re-pin to new
         numbers and bump the date in the test name.
 
-        Re-pin note (2026-06-22): 2026-06-21 weekly `--force` retrain (68
-        symbols, mean avg Sharpe +0.30, BUY:SELL 1:1.42).  Deduped n 134 -> 128
-        (held-excess names rotated out of the active-universe filter — 13 marked
-        inactive incl. CVX/COST/AXP), cum_excess +292.0 -> +282.76, win_rate
-        53.0 -> 49.2.  A modest rotation-driven cool-down, not a regime break;
-        the wider-3.0-stop edge from the 6/15 validation retrain persists in the
-        current-model view."""
+        Re-pin note (2026-06-24): fired on a *daily* run (not a weekly retrain) —
+        the 6/24 reconciliation added 5 `source='live'` rows (SATS/ARM/MU/CSCO
+        stops+trails+signal_flip, SLV stop).  Deduped n 128 -> 133 (+5),
+        cum_excess +282.76 -> +266.69, win_rate 49.2 -> 48.9.  The -16.07 pp
+        cum_excess move = the sum of the 5 live rows' excess (SATS -12.58, SLV
+        -10.93, CSCO -1.32, ARM +1.63, MU +7.13) and is identical on the raw
+        view below — the internal-consistency check confirming the same 5 rows
+        populate both slices."""
         m = self._strategy_metrics(dedup=True, active_universe=True)
-        assert m["n"]                 == 128,                      (
-            f"Row count drifted from 2026-06-22 baseline of 128 — got {m['n']}.  "
+        assert m["n"]                 == 133,                      (
+            f"Row count drifted from 2026-06-24 baseline of 133 — got {m['n']}.  "
             "Likely cause: a new weekly --force retrain has landed.  Eyeball "
             "the new numbers (Page 10 default view) and re-pin this test."
         )
-        assert m["cum_excess_pct"]    == pytest.approx( +282.76, abs=2.0)
-        assert m["win_rate_vs_bench"] == pytest.approx(   49.2,  abs=0.5)
+        assert m["cum_excess_pct"]    == pytest.approx( +266.69, abs=2.0)
+        assert m["win_rate_vs_bench"] == pytest.approx(   48.9,  abs=0.5)
 
-    def test_benchmark_aggregates_raw_baseline_2026_06_22(self):
+    def test_benchmark_aggregates_raw_baseline_2026_06_24(self):
         """Multi-run view (dedup=OFF, active_universe=OFF), fold_end excluded.
 
-        Pin date: 2026-06-22.  Same fold_end-excluded slice as the deduped
+        Pin date: 2026-06-24.  Same fold_end-excluded slice as the deduped
         baseline — the divergence vs the deduped numbers is the architectural
         finding (see CLAUDE.md 'Dedup vs raw views are honest answers').
 
-        Re-pin note (2026-06-22): the 2026-06-21 weekly `--force` retrain stacked
-        a fresh batch of fold rows on top of history (raw keeps every run), so
-        raw n 1439 -> 1512 (+73); cum_excess moved sharply less-negative
-        (-358.48 -> -126.10) and win_rate 39.1 -> 39.8 as the wider-stop fold
-        keeps diluting older drag."""
+        Re-pin note (2026-06-24): the 6/24 daily reconciliation added the same 5
+        `source='live'` rows to the raw view, so raw n 1512 -> 1517 (+5);
+        cum_excess -126.10 -> -142.18 (the same -16.07 pp move as the deduped
+        view) and win_rate held at 39.8.  No weekly retrain this cycle."""
         m = self._strategy_metrics(dedup=False, active_universe=False)
-        assert m["n"]                 == 1512,                     (
-            f"Row count drifted from 2026-06-22 baseline of 1512 — got {m['n']}.  "
+        assert m["n"]                 == 1517,                     (
+            f"Row count drifted from 2026-06-24 baseline of 1517 — got {m['n']}.  "
             "Likely cause: a new --force retrain inserted rows OR the backfill "
             "skipped rows for some symbols.  Investigate before re-pinning."
         )
-        assert m["cum_excess_pct"]    == pytest.approx(-126.10, abs=2.0)
+        assert m["cum_excess_pct"]    == pytest.approx(-142.18, abs=2.0)
         assert m["win_rate_vs_bench"] == pytest.approx(   39.8,  abs=0.5)
