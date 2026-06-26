@@ -83,3 +83,4 @@ Findings are **not auto-created by the skills**. This is the load-bearing differ
 | [`news_attribution_misallocation.md`](news_attribution_misallocation.md) | observed, hypothesized | 2026-06-04 |
 | [`entry_conviction.md`](entry_conviction.md) | hypothesized | 2026-06-10 |
 | [`trail_vs_tp_capture.md`](trail_vs_tp_capture.md) | observed, hypothesized | 2026-06-16 |
+| [`volatility_cohort_edge.md`](volatility_cohort_edge.md) | observed, hypothesized, tested | 2026-06-26 |
