@@ -6,6 +6,18 @@ The retirement convention lives in CLAUDE.md → *Convention: documenting fixed 
 
 ---
 
+## 2026-06-25
+
+### Phase 4 stacks a second bracket on a symbol with an unfilled GTC entry already working
+
+*(code complete 2026-06-15 → verified 2026-06-25)* (`scripts/signal_runner.py:_fetch_pending_entry_symbols` + `signal_runner_log.skipped_pending_orders`; commit `8465563`): bracket entries are submitted **GTC**, so a BUY LMT the symbol gaps past at the open sits unfilled for days. `PortfolioGuard`'s duplicate check only sees *filled* positions (`_fetch_positions` → `quantity != 0`), so without a separate guard the next daily run that regenerates the same signal would submit a **second** bracket on top of the still-working unfilled entry — two live entry brackets on one symbol. **Motivated by HPE + LRCX 2026-06-15:** two Friday BUY LMTs gapped past Monday's open and sat unfilled GTC; they had to be cancelled manually before the run to avoid a double-stack. This is the live-order analogue of the within-session `EQUIVALENT_PAIRS` dedup, but against the *broker's* open-order book rather than within-run state.
+
+**Status:** implemented (commit `8465563`). Phase 4 calls `_fetch_pending_entry_symbols(ibkr, loop, positions)` (one `get_open_orders()` call) to build the set of symbols with a working open order but **not** currently held — held symbols are excluded because their open orders are protective TP/STP/TRAIL legs (covered by the duplicate guard + long-only close path) — and skips any actionable signal (or its `EQUIVALENT_PAIRS` partner) in that set. **Best-effort:** returns an empty set when IBKR is unavailable, so it never hard-blocks submission. The per-run `skipped_pending_orders` count is printed in Phase 5 and persisted to `signal_runner_log` (idempotent `_migrate()` ALTER). Test coverage: 10 unit tests in `tests/test_signal_runner.py`. Documented as the "Phase 4 dedups against unfilled entry orders, not just filled positions" architectural-decision note in CLAUDE.md (which stays — it describes permanent behaviour).
+
+**Verified (2026-06-25 — first live exercise after 6 clean-but-unexercised runs):** the 6/25 `--no-dry-run` daily run printed `Pending entry orders (skipping new signals): ['GEV', 'GS']` in Phase 4 — proving the `get_open_orders()` fetch + not-held filter resolve against real book state (GEV/GS each had a working unfilled GTC entry and were not held) — **AND GS regenerated a BUY (score 0.698) that same run and was skipped**, yielding `Skipped pending orders: 1` in the Phase 5 summary. Both halves of the resolve criterion (the print proving the fetch path, and a real skip proving the dedup) fired on one run; no second bracket was stacked. The 6/15–6/24 runs all reported `Skipped pending orders: 0` with empty pending-entry sets (the motivating HPE/LRCX entries had been cancelled manually, and subsequent runs had only held-name or fresh-symbol BUYs), so this was the first run where a working-but-unheld entry coincided with a regenerated signal. See `docs/reviews/followups.md` (2026-06-15 item, resolved 2026-06-25).
+
+---
+
 ## 2026-06-24
 
 ### Exit-day OHLCV bar of a rotated-out, long-held position is left stale until the next EOD run
