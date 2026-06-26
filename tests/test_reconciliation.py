@@ -646,6 +646,97 @@ class TestGapThroughExitReason:
         assert _trades("MID").iloc[0]["exit_reason"] == "manual_close"
 
 
+class TestBracketResidualStop:
+    """Process-of-elimination residual stop (CVX 2026-06-25).
+
+    A long-only position with a KNOWN resting bracket exits via {TP, trailing,
+    CB, model-close, STP}.  When the STP fills slightly ABOVE its trigger — a
+    paper-sim / opening-auction gap fill (CVX: STP $169.60 filled $170.21 at the
+    open) — the directional `exit_px <= stop + tol` price-match misses it, and
+    with order_type unresolved (the in-session reqExecutions poll returns None)
+    step 1 misses it too, so it used to fall through to manual_close.  Having
+    ruled out everything else, a loss-side exit (below the recorded entry) must
+    be the stop.
+    """
+
+    def _seed_bracket(self, symbol, entry, stop, tp, decided_at):
+        from data.database import log_order_decision
+        log_order_decision({
+            "run_id": "r1", "symbol": symbol, "signal": "BUY",
+            "decision": "APPROVED", "shares": 223, "entry_price": entry,
+            "stop_price": stop, "take_profit_price": tp, "position_value": entry * 223,
+            "reject_reason": None, "decided_at": decided_at,
+        })
+
+    def test_stop_fill_above_trigger_classified_stop(self, mem_engine):
+        """The CVX case: STP $169.60 filled $170.21 (above trigger) on a gap open,
+        order_type unresolved, no model close → stop via bracket_residual."""
+        from execution.reconciliation import reconcile_fills
+
+        t0 = _now() - timedelta(days=2)
+        self._seed_bracket("CVX", entry=179.00, stop=169.60, tp=193.09,
+                           decided_at=t0 - timedelta(hours=1))
+        execs = [
+            _exec("EB", "CVX", "BUY",  223, 179.00, t=t0, order_type=None),
+            _exec("ES", "CVX", "SELL", 223, 170.21, t=t0 + timedelta(hours=1),
+                  order_type=None),
+        ]
+        reconcile_fills(_fetcher(execs))
+        assert _trades("CVX").iloc[0]["exit_reason"] == "stop"
+
+    def test_residual_blocked_by_closed_long(self, mem_engine):
+        """Same loss-side fill but a CLOSED_LONG decision is near it → the model
+        close (signal_flip) wins; residual-stop must NOT claim it."""
+        from execution.reconciliation import reconcile_fills
+        from data.database import log_order_decision
+
+        t0 = _now() - timedelta(days=2)
+        exit_t = t0 + timedelta(hours=1)
+        self._seed_bracket("MDL", entry=179.00, stop=169.60, tp=193.09,
+                           decided_at=t0 - timedelta(hours=1))
+        log_order_decision({
+            "run_id": "r1", "symbol": "MDL", "signal": "SELL",
+            "decision": "CLOSED_LONG", "shares": 223, "entry_price": 179.00,
+            "stop_price": None, "take_profit_price": None, "position_value": 1000.0,
+            "reject_reason": None, "decided_at": exit_t,
+        })
+        execs = [
+            _exec("EB", "MDL", "BUY",  223, 179.00, t=t0, order_type=None),
+            _exec("ES", "MDL", "SELL", 223, 170.21, t=exit_t, order_type=None),
+        ]
+        reconcile_fills(_fetcher(execs))
+        assert _trades("MDL").iloc[0]["exit_reason"] == "signal_flip"
+
+    def test_above_entry_unmatched_stays_manual_close(self, mem_engine):
+        """An above-entry exit (between entry and TP) with a bracket but no signal
+        is genuinely unattributable → manual_close, NOT a residual stop."""
+        from execution.reconciliation import reconcile_fills
+
+        t0 = _now() - timedelta(days=2)
+        self._seed_bracket("ABV", entry=179.00, stop=169.60, tp=193.09,
+                           decided_at=t0 - timedelta(hours=1))
+        execs = [
+            _exec("EB", "ABV", "BUY",  223, 179.00, t=t0, order_type=None),
+            _exec("ES", "ABV", "SELL", 223, 185.00, t=t0 + timedelta(hours=1),
+                  order_type=None),
+        ]
+        reconcile_fills(_fetcher(execs))
+        assert _trades("ABV").iloc[0]["exit_reason"] == "manual_close"
+
+    def test_no_bracket_loss_exit_stays_manual_close(self, mem_engine):
+        """No bracket on record → residual-stop cannot fire even on a loss exit."""
+        from execution.reconciliation import reconcile_fills
+
+        t0 = _now() - timedelta(days=2)
+        execs = [
+            _exec("EB", "NOBR", "BUY",  10, 100.0, t=t0, order_type=None),
+            _exec("ES", "NOBR", "SELL", 10,  90.0, t=t0 + timedelta(hours=1),
+                  order_type=None),
+        ]
+        reconcile_fills(_fetcher(execs))
+        assert _trades("NOBR").iloc[0]["exit_reason"] == "manual_close"
+
+
 class TestToNaiveUtc:
 
     def test_tz_aware_utc_coerced(self):

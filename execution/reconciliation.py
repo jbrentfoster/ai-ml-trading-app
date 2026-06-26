@@ -149,20 +149,40 @@ def _infer_exit_reason(symbol: str, exit_px: float, exit_ts: datetime,
     #    fills well below.  A symmetric tight band (the prior abs(exit-level)<=tol)
     #    missed BOTH gap-through cases — exactly the off-session scenario Phase B
     #    exists to capture — so match by side, not by proximity.  Prices that land
-    #    between stop and TP match neither and fall through to the default branch.
+    #    between stop and TP match neither and fall through to the branches below.
     bracket = get_latest_approved_bracket(symbol, exit_ts)
+    stop  = bracket.get("stop_price") if bracket else None
+    tp    = bracket.get("take_profit_price") if bracket else None
+    entry = bracket.get("entry_price") if bracket else None
     if bracket:
         tol = max(0.05, exit_px * 0.001)
-        stop = bracket.get("stop_price")
-        tp   = bracket.get("take_profit_price")
         if tp is not None and exit_px >= tp - tol:
             return "tp", "order_decisions_price_match"
         if stop is not None and exit_px <= stop + tol:
             return "stop", "order_decisions_price_match"
 
-    # 5. default — MKT with a nearby CLOSED_LONG is a signal flip, else manual.
-    if closing_order_type == "MKT" and has_closed_long_near(symbol, exit_ts):
+    # 5. model-close — a CLOSED_LONG decision near the fill is the authoritative
+    #    record of a signal-flip close.  Fires on MKT (in-session) OR an unresolved
+    #    order_type: the in-session reqExecutions poll returns order_type=None for
+    #    an order that has already filled and gone, so an off-session model close
+    #    reconciled by that poll would otherwise miss this branch (STP/LMT/TRAIL
+    #    already returned at step 1, so by here order_type is only MKT or None).
+    if closing_order_type in ("MKT", None) and has_closed_long_near(symbol, exit_ts):
         return "signal_flip", "default"
+
+    # 6. bracket_residual — process of elimination for a long-only position with a
+    #    KNOWN resting bracket.  Having ruled out the TP (step 4 up-match), the
+    #    trailing leg (steps 1/3), a CB flatten (step 2) and a model close (step 5),
+    #    a loss-side exit (below the recorded entry) can only be the protective STP.
+    #    The price-match in step 4 misses it when the stop fills slightly ABOVE its
+    #    trigger — IBKR's paper sim / the opening auction can fill a triggered STP a
+    #    little above the trigger on a gap day (CVX 2026-06-25: STP $169.60 filled
+    #    $170.21 at the open, $0.61 above the trigger), so `exit_px <= stop + tol`
+    #    fails and the trade would otherwise mislabel as manual_close.
+    if stop is not None and entry is not None and exit_px < entry:
+        return "stop", "bracket_residual"
+
+    # 7. default — no bracket on record / an above-entry exit we can't attribute.
     return "manual_close", "default"
 
 
