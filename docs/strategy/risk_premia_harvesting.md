@@ -80,12 +80,16 @@ The shape of the refactor: **strip the prediction machinery, keep the plumbing, 
 
 ---
 
-## 4. Implementation: A-now / B-as-lab
+## 4. Implementation: 80/20 core-satellite (confirmed 2026-06-27)
 
-Two ways to hold the value+quality tilt; the operator chose **both, in roles**:
+A **lighter, equity-tilted** posture (option (ii)) — more equity, gentler de-risking, accepting deeper drawdowns the operator can tolerate per §0 — split into a disciplined core and a concentrated learning satellite:
 
-- **(A) ETF core — the deployable strategy.** Hold the diversified base + the value+quality tilt via a few ETFs (e.g. VLUE / QUAL or similar), rebalanced occasionally with the trend/vol-target overlay. Minimal code, lowest cost, most robust, most transmissible — the right vehicle for $10–20k and "teach my kids." **This is what actually trades.**
-- **(B) Custom quality-value screen — the learning lab.** Build a stock screen from fundamentals (reuse the retired XGBoost feature set *as the screen*, not a predictor) to *study how factor construction works* — run in shadow / paper, **not** funded with real money (it adds value-trap risk, turnover, and complexity that aren't worth it on a small account). Its job is understanding, not returns.
+- **80% — ETF core (A).** Diversified base + value+quality equity tilt via ETFs (VLUE/QUAL-type) with a *light* trend/vol-target overlay. Robust, low-cost, transmissible — the disciplined foundation. **This is the bulk of what trades.**
+- **20% — Buffett-style satellite (B).** ~4–6 concentrated **large-cap** quality-value names surfaced by `scripts/buffett_screen.py` (rank-percentile composite `0.45·quality + 0.30·safety + 0.25·value`, anchored to the AQR "Buffett's Alpha" criteria), with operator judgment applied to the shortlist. The repurposed XGBoost fundamentals — now a *screen feeding real (small) money*, not a predictor. Capped at 20% so the worst single-name outcome is bounded. **For upside optionality + active learning, NOT modeled as reliable alpha** (same value+quality premium as the core, higher variance).
+
+**Why (ii) and not the full all-weather version — the full-strategy backtest (2006–2026):** the *fully* defensive build (diversified + trend-gate-to-cash + vol-target) delivered a −8% max drawdown and **+1.5% in 2008** at Sharpe 0.86 (≈60/40, > SPY), but only ~5–6% CAGR — *too* defensive for §0's small, drought-tolerant capital (it trades ~6%/yr of return for protection this sleeve doesn't need). So the core runs a **lighter** overlay: heavier value-tilted equity, gentler de-risking, equity-like returns with deeper (tolerable) drawdowns.
+
+**Satellite caveats (baked in, enforced by the screen's own header):** diversify the 20% across 4–6 names (never 1–2 mega-bets); lean on the **quality** filter to dodge value traps; the screen is a *shortlist, not a buy list* — moat durability + management quality (the most valuable part) can't be screened and are where the *learning* lives; financials/utilities/REITs mis-score on the safety axis and need separate judgment; can't be backtested (point-in-time fundamentals lookahead), so the satellite's selection is proven only by **paper-trading forward** — the premium it harvests is already validated (§2.1).
 
 ## 4b. Phased roadmap (validate-before-build)
 
