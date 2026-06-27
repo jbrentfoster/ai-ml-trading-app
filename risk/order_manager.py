@@ -30,13 +30,21 @@ import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
+from typing import TYPE_CHECKING
+
 from config.settings import config, TradingMode
 from core.logger import get_logger
 from data.database import log_order_decision
-from models.signal_gate import SignalResult
 from risk.circuit_breaker import CircuitBreaker
 from risk.portfolio_guard import PortfolioGuard
 from risk.position_sizer import PositionSizer, compute_realised_kelly
+
+if TYPE_CHECKING:
+    # SignalResult lives in the retired models/ layer and is used only as a type
+    # hint below; guard the import so this module stays importable after models/
+    # is archived (the annotations are string forward-refs, never evaluated at
+    # runtime). See archive/README.md.
+    from models.signal_gate import SignalResult
 
 log = get_logger("risk.order_manager")
 
@@ -76,7 +84,7 @@ class OrderManager:
 
     def process(
         self,
-        signal_result: SignalResult,
+        signal_result: "SignalResult",
         equity: float,
         positions: dict,
         atr: float | None = None,
@@ -267,7 +275,7 @@ class OrderManager:
     def _handle_long_only_sell(
         self,
         symbol: str,
-        signal_result: SignalResult,
+        signal_result: "SignalResult",
         positions: dict,
         run_id: str,
     ) -> OrderDecision:
@@ -312,7 +320,7 @@ class OrderManager:
         self,
         symbol: str,
         shares: int,
-        signal_result: SignalResult,
+        signal_result: "SignalResult",
         run_id: str,
     ) -> OrderDecision:
         """
