@@ -745,8 +745,10 @@ class TestCircuitBreaker:
 class TestOrderManager:
 
     def _signal_result(self, symbol="AAPL", signal="BUY"):
-        from models.signal_gate import SignalResult
-        return SignalResult(
+        # Lightweight stand-in for the archived models.signal_gate.SignalResult;
+        # OrderManager reads these fields duck-typed.  See archive/README.md.
+        from types import SimpleNamespace
+        return SimpleNamespace(
             symbol=symbol,
             bar_timestamp=_now(),
             lstm_score=0.6,
