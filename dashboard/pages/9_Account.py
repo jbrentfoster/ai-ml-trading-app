@@ -35,7 +35,7 @@ asyncio.set_event_loop(asyncio.new_event_loop())
 from config.settings import config, TradingMode
 from data.database import get_latest_risk_levels
 from data.ui_queries import query_company_name, query_trade_summary
-from risk.portfolio_guard import get_sector
+from data.sectors import get_sector
 
 # ── Page config ───────────────────────────────────────────────────────────────
 

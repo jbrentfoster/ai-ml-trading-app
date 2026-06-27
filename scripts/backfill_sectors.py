@@ -45,7 +45,7 @@ from sqlalchemy.orm import Session
 from config.settings import config
 from core.logger import get_logger
 from data.database import FundamentalData, get_engine
-from risk.portfolio_guard import _SECTOR_MAP, _normalize_yf_sector
+from data.sectors import _SECTOR_MAP, _normalize_yf_sector
 
 log = get_logger("scripts.backfill_sectors")
 

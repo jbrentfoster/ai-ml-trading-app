@@ -565,7 +565,7 @@ class TestGetSector:
 
     def test_hardcoded_map_takes_precedence(self, mem_engine):
         """An ETF/fixture in _SECTOR_MAP resolves from the map, never the DB."""
-        from risk.portfolio_guard import get_sector
+        from data.sectors import get_sector
         # Even with a contradictory DB row, the map wins for mapped symbols.
         self._seed_sector(mem_engine, "AAPL", "Financial Services")
         assert get_sector("SPY") == "Broad Market"
@@ -573,7 +573,7 @@ class TestGetSector:
 
     def test_db_fallback_resolves_unmapped_symbol(self, mem_engine):
         """A symbol absent from the map resolves via fundamental_data.sector."""
-        from risk.portfolio_guard import get_sector
+        from data.sectors import get_sector
         # MRVL is NOT in _SECTOR_MAP (it's a recent-rotation semi name).
         self._seed_sector(mem_engine, "MRVL", "Technology")
         self._seed_sector(mem_engine, "MS", "Financial Services")
@@ -583,7 +583,7 @@ class TestGetSector:
     def test_db_fallback_uses_latest_non_null_row(self, mem_engine):
         """The newest non-NULL sector row wins; NULL rows are ignored."""
         from data.database import FundamentalData
-        from risk.portfolio_guard import get_sector
+        from data.sectors import get_sector
         old = _now() - timedelta(days=2)
         new = _now()
         with Session(mem_engine) as session:
@@ -595,7 +595,7 @@ class TestGetSector:
 
     def test_unknown_when_neither_tier_resolves(self, mem_engine):
         """No map entry and no fundamentals row → 'Unknown'."""
-        from risk.portfolio_guard import get_sector
+        from data.sectors import get_sector
         assert get_sector("ZZZZ") == "Unknown"
 
 
