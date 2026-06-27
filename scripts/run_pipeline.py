@@ -134,42 +134,21 @@ def main(interval: str = "1d", skip_news: bool = False,
             print(f"failed ({exc})")
             all_unscored[symbol] = []
 
-    # ── FinBERT scoring ───────────────────────────────────────────────────────
-    total_unscored = sum(len(v) for v in all_unscored.values())
-    if skip_sentiment or total_unscored == 0:
-        if total_unscored == 0:
-            print("\nAll articles already scored — skipping FinBERT.")
-        else:
-            print("\nSkipping FinBERT scoring (--skip-sentiment).")
-    else:
-        print()
-        print(f"=== FinBERT sentiment scoring ({total_unscored} articles) ===")
-        print("  Loading model ...", end=" ", flush=True)
-        from models.finbert_model import FinBERTModel
-        finbert = FinBERTModel()
-        pipe    = finbert._get_pipeline()
-        if pipe is None:
-            print("could not load FinBERT pipeline — skipping sentiment scoring.")
-        else:
-            print("ready.")
-            for symbol, articles in all_unscored.items():
-                if not articles:
-                    continue
-                scored = 0
-                for art in articles:
-                    try:
-                        score = finbert._score_headline(art["headline"])
-                        upsert_news(
-                            symbol          = symbol,
-                            article_id      = art["article_id"],
-                            published_at    = art["published_at"],
-                            headline        = art["headline"],
-                            sentiment_score = score,
-                        )
-                        scored += 1
-                    except Exception:
-                        pass
-                print(f"  {symbol}: scored {scored}/{len(articles)} articles")
+    # News sentiment scoring (FinBERT) was retired in the 2026-06 risk-premia
+    # pivot.  Articles are still stored (headline only, no score); the
+    # --skip-sentiment flag is now a no-op kept for back-compat.
+    total_collected = sum(len(v) for v in all_unscored.values())
+    if total_collected:
+        for symbol, articles in all_unscored.items():
+            for art in articles:
+                upsert_news(
+                    symbol          = symbol,
+                    article_id      = art["article_id"],
+                    published_at    = art["published_at"],
+                    headline        = art["headline"],
+                    sentiment_score = None,
+                )
+        print(f"\nStored {total_collected} article(s) (sentiment scoring retired).")
 
     print()
     print("Done.  Start the dashboard with:")

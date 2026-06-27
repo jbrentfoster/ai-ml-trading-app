@@ -88,14 +88,11 @@ with st.sidebar:
         help="Pick from the current Stage 3 universe or type any symbol; leave blank to run every symbol.",
     )
 
-    if st.button("Run (dry-run)", use_container_width=True):
-        from scripts.signal_runner import run as _run
-        with st.spinner("Running signal pipeline…"):
-            _run(dry_run=True, symbol_filter=sym_input)
-        query_signal_runner_log.clear()
-        query_order_decisions.clear()
-        st.success("Done — results in the log below.")
-        st.rerun()
+    st.info(
+        "Manual signal-runner execution was retired in the 2026-06 risk-premia "
+        "pivot (the ML signal pipeline is archived).  The historical run log and "
+        "order-decision tables below still reflect past activity."
+    )
 
 
 # ── 1. Circuit breaker status ──────────────────────────────────────────────────

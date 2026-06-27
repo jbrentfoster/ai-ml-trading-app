@@ -45,13 +45,7 @@ symbol = symbol_picker("Symbol", default="AAPL", key="fn_symbol")
 news_days = st.sidebar.slider("News lookback (days)", 7, 90, 30, key="fn_days")
 
 st.sidebar.markdown("**Fetch News**")
-score_news = st.sidebar.checkbox(
-    "Score with FinBERT",
-    value=True,
-    key="fn_score",
-    help="Run ProsusAI/finbert on each headline (slow on first load — model downloads ~400 MB)",
-)
-fetch_btn = st.sidebar.button("Fetch & Score News", type="primary", key="fn_fetch")
+fetch_btn = st.sidebar.button("Fetch News", type="primary", key="fn_fetch")
 
 st.sidebar.markdown("---")
 if st.sidebar.button("Refresh cache", key="fn_refresh"):
@@ -74,36 +68,18 @@ if fetch_btn:
             if not articles:
                 st.warning("No news articles found for the selected symbol and lookback window.")
             else:
-                scored = 0
-                if score_news:
-                    from models.finbert_model import FinBERTModel
-                    finbert = FinBERTModel()
-                    pipe    = finbert._get_pipeline()
-
-                    if pipe is None:
-                        st.warning(
-                            "FinBERT pipeline could not be loaded — "
-                            "articles stored without sentiment scores."
-                        )
-                    else:
-                        for art in articles:
-                            if art.get("sentiment_score") is not None:
-                                continue
-                            score = finbert._score_headline(art["headline"])
-                            upsert_news(
-                                symbol=symbol,
-                                article_id=art["article_id"],
-                                published_at=art["published_at"],
-                                headline=art["headline"],
-                                sentiment_score=score,
-                            )
-                            scored += 1
-
+                # FinBERT sentiment scoring was retired in the 2026-06 risk-premia
+                # pivot; news is still fetched and stored (without a score).
+                for art in articles:
+                    upsert_news(
+                        symbol=symbol,
+                        article_id=art["article_id"],
+                        published_at=art["published_at"],
+                        headline=art["headline"],
+                        sentiment_score=None,
+                    )
                 query_news.clear()
-                st.success(
-                    f"Fetched {len(articles)} article(s) for {symbol}.  "
-                    + (f"FinBERT scored {scored} new article(s)." if score_news else "")
-                )
+                st.success(f"Fetched {len(articles)} article(s) for {symbol}.")
                 st.rerun()
         except Exception as exc:
             st.error(f"News fetch failed: {exc}")
