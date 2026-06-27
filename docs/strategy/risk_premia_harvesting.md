@@ -114,5 +114,18 @@ A **lighter, equity-tilted** posture (option (ii)) — more equity, gentler de-r
 
 1. ~~Confirm the success definition~~ — **resolved (§0):** understanding + durability + transmissibility on small, drought-tolerant capital; risk-adjusted vs 60/40, not raw vs SPY.
 2. ~~MVP ambition~~ — **resolved (§4):** simple ETF core (A) now; custom screen (B) as a paper learning lab. Value+quality tilt *included* (validated), not deferred.
-3. **Universe (open):** which ETFs — the diversified base (equities US/intl, treasuries, TIPS, commodities/gold, credit) *plus* the value+quality tilt vehicles (VLUE/QUAL or alternatives). US-only vs global.
-4. **Rebalance cadence + bands (open):** monthly vs quarterly; turnover budget (kept low for cost/tax).
+3. ~~Universe~~ — **PINNED (2026-06-27).** Starting strategic allocation (of total 100%), equity-tilted per (ii), simple + transmissible:
+
+   | Sleeve | Ticker | Weight | Role |
+   |---|---|---|---|
+   | US value | **VLUE** | 22% | value factor |
+   | US quality | **QUAL** | 22% | quality factor |
+   | Intl developed value | **EFV** | 8% | diversification + value |
+   | US Treasuries 7–10y | **IEF** | 14% | duration / deflation hedge |
+   | Gold | **GLD** | 8% | crisis / inflation hedge (IAU = cheaper alt) |
+   | Broad commodities | **PDBC** | 6% | inflation hedge (no K-1, unlike DBC) |
+   | **Core subtotal** | | **80%** | |
+   | Buffett satellite | 4–6 large-caps | 20% | from `scripts/buffett_screen.py` + judgment |
+
+   Net exposure ≈ **72% equity / 28% diversifiers** (52% core equity ETFs + 20% satellite). Adjustable; this is the v1 starting point, not dogma.
+4. ~~Rebalance cadence~~ — **PINNED.** **Quarterly**, **band-based** (only trade a sleeve that has drifted > ~5 absolute pts from target) to keep turnover/cost/tax low. The trend-gate / vol-target overlay from §2 is **deferred to v2** — v1 runs the static strategic allocation + band rebalance only (the full-strategy backtest showed the heavy overlay is too defensive for this scope; add a *light* version later only if wanted).

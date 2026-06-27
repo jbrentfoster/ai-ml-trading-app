@@ -2,6 +2,17 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+> ## ⚠️ PROJECT PIVOTED (2026-06-27) — read this first
+>
+> The original concept below — **predictive alpha** from an ML ensemble (LSTM/XGBoost/FinBERT) + an LLM news analyst — was **tested and retired on evidence.** Four predictive-alpha directions were each killed with cheap probes (a fair-weather momentum/vol premium that inverts in bears; LLM news re-attribution; small-cap news drift; sector-sentiment / contrarian timing). The durable direction is **risk-premia harvesting** — a value+quality-tilted, diversified, low-cost, patient portfolio (an 80% ETF core + a 20% Buffett-style large-cap satellite).
+>
+> - **Current strategy + plan:** [`docs/strategy/risk_premia_harvesting.md`](docs/strategy/risk_premia_harvesting.md)
+> - **Why we pivoted (decision record):** [`docs/strategy/pivot_decision_2026-06.md`](docs/strategy/pivot_decision_2026-06.md)
+> - **Evidence:** [`docs/findings/volatility_cohort_edge.md`](docs/findings/volatility_cohort_edge.md) + the `scripts/analyze_*.py` research scripts.
+> - **Full pre-pivot state preserved at git tag `v1.0-predictive-alpha`.** Restructure manifest + sequence: [`archive/README.md`](archive/README.md).
+>
+> **What stays (the crown jewels):** the execution / reconciliation / Flex stack, the data pipeline, the dashboard shell, and the risk primitives (circuit breaker). **What is being retired/archived:** `models/` (the ML ensemble), the LLM news cluster (`models/llm_analyst.py`, `data/news_dedup.py`, the LLM scripts), and `data/universe.py` stock rotation. The physical file relocation is a careful, test-verified refactor in progress — **the bulk of the document below describes the now-superseded v1 architecture** and is retained as history until the restructure + rewrite completes.
+
 ## Project Overview
 
 AI-driven algorithmic trading system connecting to Interactive Brokers (IBKR) via IB Gateway. Built as a learning platform with a Streamlit dashboard that explains each component visually. Python async/await throughout for IBKR; all other code is synchronous. Data pipeline uses yfinance → SQLite. Dashboard is Streamlit + Plotly.
