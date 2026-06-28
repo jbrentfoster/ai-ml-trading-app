@@ -114,8 +114,14 @@ def compute_plan(
             bigbet_pending += t.weight * nlv
 
     managed_nlv = nlv - bigbet_value - bigbet_pending
-    deployable = max(managed_nlv - cash_buffer * nlv, 0.0)
+    managed_base = max(managed_nlv - cash_buffer * nlv, 0.0)
     sum_managed_wt = sum(t.weight for t in managed) or 1.0
+    # Stated weights are fractions of NLV.  If they fit the managed base, use them
+    # *raw* — any unallocated remainder (e.g. an as-yet-unfilled satellite slot, or
+    # the cash buffer) deliberately stays in cash rather than inflating the core.
+    # Only if a ballooning big-bet has shrunk the managed base below the stated
+    # total do we scale the managed sleeves down proportionally to fit.
+    fits = (sum_managed_wt * nlv) <= managed_base
 
     proposals: list[TradeProposal] = []
     notes: list[str] = []
@@ -124,8 +130,7 @@ def compute_plan(
     for t in managed:
         price = prices.get(t.ticker)
         cur_val = value(t.ticker)
-        norm_wt = t.weight / sum_managed_wt
-        tgt_val = norm_wt * deployable
+        tgt_val = t.weight * nlv if fits else (t.weight / sum_managed_wt) * managed_base
         drift_val = tgt_val - cur_val                  # + buy, − sell
         drift_frac = (cur_val - tgt_val) / managed_nlv if managed_nlv else 0.0
         cur_wt = cur_val / nlv if nlv else 0.0

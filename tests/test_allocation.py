@@ -65,15 +65,30 @@ def test_cash_buffer_held_back():
     assert a.shares == pytest.approx(99)
 
 
-def test_managed_weights_normalized_over_managed_book():
-    # weights sum to 0.95 (a 5% big-bet bucket sits outside) → normalize to fill
+def test_managed_uses_raw_weights_when_room_fits():
+    # weights sum to 0.95 (the 5% big-bet slot is unfilled) → raw weights; the
+    # unallocated 5% stays CASH, the core is NOT inflated to fill the book.
     targets = [Target("A", CORE, 0.80), Target("B", SAT_QV, 0.15)]
     plan = compute_plan(targets, {}, {"A": 100, "B": 100}, nlv=10_000, cash=10_000,
                         band=0.05, cash_buffer=0.0)
     a, b = _prop(plan, "A"), _prop(plan, "B")
-    assert a.target_value == pytest.approx(10_000 * 0.80 / 0.95)
-    assert b.target_value == pytest.approx(10_000 * 0.15 / 0.95)
-    assert (a.target_value + b.target_value) == pytest.approx(10_000)
+    assert a.target_value == pytest.approx(8_000)         # raw 80% of NLV (not 84%)
+    assert b.target_value == pytest.approx(1_500)         # raw 15%
+    assert (a.target_value + b.target_value) == pytest.approx(9_500)   # 5% kept as cash
+
+
+def test_managed_normalizes_to_fit_when_bigbet_balloons():
+    # big-bet ballooned to 60% of NLV → only 40% left; core+qv can't fit their
+    # stated 95%, so they scale down proportionally to share the managed base.
+    targets = [Target("A", CORE, 0.80), Target("B", SAT_QV, 0.15),
+               Target("BB", SAT_BIGBET, 0.025)]
+    plan = compute_plan(targets, {"A": 20, "B": 20, "BB": 6},
+                        {"A": 100, "B": 100, "BB": 1000},
+                        nlv=10_000, cash=0, band=0.05, cash_buffer=0.0)
+    a, b = _prop(plan, "A"), _prop(plan, "B")
+    assert plan.managed_nlv == pytest.approx(4_000)
+    assert a.target_value == pytest.approx(4_000 * 0.80 / 0.95)
+    assert b.target_value == pytest.approx(4_000 * 0.15 / 0.95)
 
 
 def test_fractional_shares():
