@@ -592,6 +592,23 @@ class TargetAllocation(Base):
     updated_at    = Column(DateTime, nullable=False)
 
 
+class RebalanceLog(Base):
+    """One summary row per rebalance run (dry-run or live) — surfaced on the
+    dashboard Allocation page."""
+    __tablename__ = "rebalance_log"
+
+    id           = Column(Integer, primary_key=True, autoincrement=True)
+    run_id       = Column(String(36), nullable=False)
+    run_at       = Column(DateTime, nullable=False)
+    mode         = Column(String(8), nullable=False)   # 'dry' | 'live'
+    nlv          = Column(Float)
+    n_proposed   = Column(Integer)
+    n_submitted  = Column(Integer)
+    n_failed     = Column(Integer)
+    turnover_pct = Column(Float)
+    notes        = Column(Text)
+
+
 # ── Engine (lazy singleton) ───────────────────────────────────────────────────
 
 _engine = None
@@ -1769,6 +1786,15 @@ def replace_target_sleeves(rows: list[dict], sleeves: set[str]) -> int:
             ))
         session.commit()
     return len(rows)
+
+
+def log_rebalance(record: dict) -> None:
+    """Insert one rebalance-run summary row (run_id / run_at / mode / nlv /
+    n_proposed / n_submitted / n_failed / turnover_pct / notes)."""
+    engine = get_engine()
+    with Session(engine) as session:
+        session.add(RebalanceLog(**record))
+        session.commit()
 
 
 # ── Order decision helpers ─────────────────────────────────────────────────────

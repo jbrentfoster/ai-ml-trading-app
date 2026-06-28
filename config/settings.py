@@ -434,6 +434,22 @@ class FlexConfig:
 
 
 @dataclass
+class AllocationConfig:
+    """Risk-premia rebalancer settings (portfolio/ + scripts/rebalance.py).
+
+    ``rebalance_orders_enabled`` is the *second* of the two execution gates:
+    orders are submitted only when BOTH ``scripts/rebalance.py --no-dry-run`` is
+    passed AND this is True (default False).  Big-bets are drift-exempt in the
+    engine regardless of these settings.
+    """
+    rebalance_band:           float = 0.05   # per-sleeve drift band (fraction of NLV)
+    cash_buffer:              float = 0.01   # fraction of NLV held back as cash
+    rebalance_orders_enabled: bool  = False  # second execution gate (default OFF)
+    slippage_cap:             float = 0.005  # marketable-limit offset from the reference price
+    share_precision:          int   = 4      # fractional-share rounding (0 = whole shares)
+
+
+@dataclass
 class AppConfig:
     """Top-level app config — compose all sub-configs here."""
     ibkr:     IBKRConfig     = field(default_factory=IBKRConfig)
@@ -446,6 +462,7 @@ class AppConfig:
     logging:  LoggingConfig  = field(default_factory=LoggingConfig)
     llm:      LLMConfig      = field(default_factory=LLMConfig)
     flex:     FlexConfig     = field(default_factory=FlexConfig)
+    allocation: AllocationConfig = field(default_factory=AllocationConfig)
 
 
 # ── Singleton instance ────────────────────────────────────────────────────────
