@@ -567,6 +567,31 @@ class LLMNewsAnalysis(Base):
     )
 
 
+# ── Target allocation (the new risk-premia system) ────────────────────────────
+
+class TargetAllocation(Base):
+    """Desired portfolio weights — the rebalancer's source of truth.
+
+    Holds the fixed ETF core and the dynamic stock satellite (quality-value +
+    conviction big-bets).  ``sleeve`` is one of 'core', 'satellite_qv',
+    'satellite_bigbet'.  For core / satellite_qv, ``target_weight`` is the
+    rebalance *target* (fraction of NLV); for satellite_bigbet it is the *entry
+    cap* — the rebalancer never drift-trades big-bets (see
+    docs/strategy/risk_premia_harvesting.md §4 and portfolio/allocation.py).
+    ``active=False`` rows are history (e.g. a replaced satellite name); at most
+    one active row per ticker.
+    """
+    __tablename__ = "target_allocation"
+
+    id            = Column(Integer, primary_key=True, autoincrement=True)
+    ticker        = Column(String(12), nullable=False)
+    sleeve        = Column(String(20), nullable=False)
+    target_weight = Column(Float, nullable=False)
+    label         = Column(String(80))
+    active        = Column(Boolean, nullable=False, default=True)
+    updated_at    = Column(DateTime, nullable=False)
+
+
 # ── Engine (lazy singleton) ───────────────────────────────────────────────────
 
 _engine = None
@@ -1692,6 +1717,58 @@ def get_equity_snapshot_on_or_before(snapshot_date: str) -> dict | None:
         "realized_pnl":     row.realized_pnl,
         "recorded_at":      row.recorded_at,
     }
+
+
+# ── Target allocation helpers (the new system) ────────────────────────────────
+
+def get_target_allocation(active_only: bool = True, sleeve: str | None = None) -> list[dict]:
+    """Return target-allocation rows (ticker / sleeve / target_weight / label /
+    active / updated_at), ordered by sleeve then ticker."""
+    engine = get_engine()
+    with Session(engine) as session:
+        q = session.query(TargetAllocation)
+        if active_only:
+            q = q.filter(TargetAllocation.active.is_(True))
+        if sleeve is not None:
+            q = q.filter(TargetAllocation.sleeve == sleeve)
+        rows = q.order_by(TargetAllocation.sleeve, TargetAllocation.ticker).all()
+    return [{
+        "ticker":        r.ticker,
+        "sleeve":        r.sleeve,
+        "target_weight": r.target_weight,
+        "label":         r.label,
+        "active":        r.active,
+        "updated_at":    r.updated_at,
+    } for r in rows]
+
+
+def replace_target_sleeves(rows: list[dict], sleeves: set[str]) -> int:
+    """Atomically set the active targets for the given ``sleeves``.
+
+    Deactivates every currently-active row whose sleeve is in ``sleeves`` (kept as
+    history), then inserts ``rows`` as the new active set.  Each row needs at least
+    ``ticker`` / ``sleeve`` / ``target_weight`` (``label`` optional).  Returns the
+    number inserted.  Use this to (re)set the core, or to rewrite the satellite
+    after a re-screen, without touching the other sleeves.
+    """
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    engine = get_engine()
+    with Session(engine) as session:
+        (session.query(TargetAllocation)
+         .filter(TargetAllocation.active.is_(True))
+         .filter(TargetAllocation.sleeve.in_(sleeves))
+         .update({TargetAllocation.active: False}, synchronize_session=False))
+        for r in rows:
+            session.add(TargetAllocation(
+                ticker=r["ticker"].upper(),
+                sleeve=r["sleeve"],
+                target_weight=float(r["target_weight"]),
+                label=r.get("label"),
+                active=True,
+                updated_at=now,
+            ))
+        session.commit()
+    return len(rows)
 
 
 # ── Order decision helpers ─────────────────────────────────────────────────────
