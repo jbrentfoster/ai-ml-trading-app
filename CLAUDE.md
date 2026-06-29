@@ -47,9 +47,13 @@ python scripts/refresh_recent_bars.py
 # Buffett-style screen → ranked large-cap shortlist for the 20% satellite
 python scripts/buffett_screen.py                  # writes db/buffett_screen_latest.csv
 
-# Rebalance (PLANNED — see "Allocation engine & rebalancer" below)
-python scripts/rebalance.py                       # dry-run: show drift + proposed plan
-python scripts/rebalance.py --no-dry-run          # submit (needs rebalance_orders_enabled)
+# Set target weights (core + satellite) → target_allocation table
+python scripts/set_targets.py --init-core         # pinned ETF core; --qv / --bigbet for satellite
+python scripts/set_targets.py --show              # current active targets + cap checks
+
+# Rebalance (built — Phases 1-3)
+python scripts/rebalance.py                       # dry-run: drift + proposed plan (vs live IBKR)
+python scripts/rebalance.py --no-dry-run          # submit (ALSO needs allocation.rebalance_orders_enabled)
 
 # Reconcile live IBKR fills -> fill_log (+ historical trade_log)
 python scripts/reconcile_flex.py                  # durable T+1 Flex backstop (no Gateway)
@@ -79,15 +83,15 @@ trading_app/
 │                  classification — extracted from the retired portfolio_guard), ui_queries.py
 ├── risk/          circuit_breaker.py (KEPT).  order_manager / position_sizer / portfolio_guard /
 │                  trailing_stop remain pending a final tidy-up (retired, self-contained, unused).
-├── portfolio/     NEW — to build: allocation.py (pure engine), rebalancer.py (execution),
-│                  holdings.py (current state).  See "Allocation engine & rebalancer".
-├── dashboard/     1_Market_Data.py + pages/ {2 Fundamentals&News, 5 Settings, 6 Data Status,
-│                  8 Risk&Portfolio, 9 Account, 10 Trade History}
+├── portfolio/     allocation.py (pure engine), rebalancer.py (gated execution).  Current
+│                  holdings come from data/database.compute_holdings_from_fills (cost basis).
+├── dashboard/     1_Market_Data.py + pages/ {2 Fundamentals&News, 3 Allocation, 5 Settings,
+│                  6 Data Status, 8 Risk&Portfolio, 9 Account, 10 Trade History}
 ├── scripts/       buffett_screen.py, run_pipeline.py, refresh_recent_bars.py, reconcile_fills.py,
 │                  reconcile_flex.py, backfill_flex_trades.py, backfill_benchmark_returns.py,
 │                  backfill_sectors.py, open_orders.py, open_positions.py, verify_connection.py,
-│                  verify_pipeline.py, test_ibkr_news.py, analyze_*.py (pivot-evidence research).
-│                  PLANNED: rebalance.py, set_targets.py.
+│                  verify_pipeline.py, test_ibkr_news.py, analyze_*.py (pivot-evidence research),
+│                  rebalance.py (dry-run + gated execution), set_targets.py.
 ├── tests/         mocked unit tests (data pipeline, ibkr connection, reconciliation, flex,
 │                  circuit breaker/sector via test_risk, ui_queries, trade_log, sectors, …)
 ├── archive/       retired predictive-alpha code (models/, LLM cluster, universe, intraday,
@@ -115,16 +119,16 @@ prices (IBKR/yfinance)      ─┘                                          │
 
 ## Allocation engine & rebalancer (the new core)
 
-Design confirmed 2026-06-28; build pending. Mirrors the codebase's pure-logic-module + execution-wrapper + CLI + dry-run two-gate patterns.
+**Built 2026-06-28 (Phases 1–3).** Mirrors the codebase's pure-logic-module + execution-wrapper + CLI + two-gate patterns.
 
-- **`target_allocation` table** (SQLite, via `_migrate`): one source of truth for desired holdings — `ticker, sleeve('core'|'satellite'), target_weight, label, active, updated_at`. Core rows set once (the pinned table); satellite rows rewritten after each `buffett_screen` + judgment pass. Edited via `scripts/set_targets.py`.
-- **`portfolio/allocation.py` — pure engine** (no IBKR/DB; unit-testable). `compute_plan(targets, holdings, prices, nlv, cash, band=0.05, cash_first=True, cash_buffer=0.01)` → a `RebalancePlan` of `TradeProposal`s. Logic: per-sleeve `drift = current_wt − target_wt`; **band gate** (|drift| ≤ band → HOLD — most quarters produce no trades); holdings not in targets → SELL to 0; **cash-first** deploys idle cash (above the buffer) into the most-underweight sleeves before any SELL (tax-aware); report turnover.
-- **`portfolio/rebalancer.py` — execution.** Opens one `IBKRConnection`, fetches positions/NLV/cash + reference prices (`get_last_price`), calls `compute_plan`, **dry-run by default** (two-gate: `--no-dry-run` *and* `config.allocation.rebalance_orders_enabled=True` both required), submits limit orders near mid, reconciles via `execution/reconciliation.py`, writes a `rebalance_log` row.
-- **`scripts/rebalance.py`** — CLI: dry-run shows drift + plan; `--show`, `--band`, `--cash-first`, `--sleeve core|satellite`, `--no-dry-run`.
+- **`target_allocation` table** (SQLite, created by `create_all`): the source of truth for desired holdings — `ticker, sleeve('core'|'satellite_qv'|'satellite_bigbet'), target_weight, label, active, updated_at`. Core rows set once (the pinned table); satellite rows rewritten after each `buffett_screen` + judgment pass via `replace_target_sleeves` (deactivates the sleeve's active rows as history, inserts the new set). Edited via `scripts/set_targets.py` (`--init-core`, `--qv`, `--bigbet` [caps enforced **at entry**: ≤3%/name, ≤5% aggregate], `--show`).
+- **`portfolio/allocation.py` — pure engine** (no IBKR/DB; unit-testable). `compute_plan(targets, holdings, prices, nlv, cash, band=0.05, cash_buffer=0.01)` → a `RebalancePlan` of `TradeProposal`s. Managed sleeves (core + satellite_qv) rebalance to their **stated weights when they fit** the managed base, else **normalise** to fit (so a ballooning big-bet doesn't false-trigger, and an unfilled satellite leaves cash rather than inflating the core); **band gate** (|drift| ≤ band → HOLD); idle cash deploys into underweight sleeves; holdings not in targets → SELL. **Big-bets are drift-EXEMPT** — held floats free (never trimmed/topped-up); an unheld target → one-time entry BUY to cap, with that capital earmarked out of the managed book. See docs/strategy/risk_premia_harvesting.md §4.
+- **`portfolio/rebalancer.py` — execution.** `submit_plan(conn, plan)` places each non-HOLD proposal as a marketable LIMIT order (ref ± `slippage_cap`, tick-rounded; fractional to `share_precision`); per-order errors isolated (FAILED, never aborts the run). Gated by the caller; free of IBKR construction so it's mock-testable.
+- **`scripts/rebalance.py`** — CLI: dry-run shows drift + plan vs live IBKR (`--band`, `--cash-buffer`). **Two-gate execution:** `--no-dry-run` *and* `config.allocation.rebalance_orders_enabled=True` both required to submit; live runs write a `rebalance_log` row; fills reconcile via the existing Flex/`reqExecutions` path. Holdings/P&L surface on dashboard Page 3.
 
-**Confirmed design decisions (2026-06-28):** (1) **fractional shares** (hit exact weights on a small book); (2) **~1% cash buffer** (rest fully invested); (3) **targets in SQLite** (`target_allocation`, dashboard-friendly); (4) **adopt a transactions/holdings + cost-basis model** for the new system — see Database Schema.
+**Confirmed design decisions (2026-06-28):** (1) **fractional shares**; (2) **~1% cash buffer**; (3) **targets in SQLite** (`target_allocation`); (4) **transactions/holdings + cost-basis model** (`compute_holdings_from_fills`, average-cost) — see Database Schema.
 
-**Build order:** pure engine + tests → `target_allocation` + `set_targets.py` → `rebalance.py` dry-run (real value here, zero order risk) → gated execution + reconciliation → dashboard "Allocation" page → transactions/holdings + tax-lot harvesting (Phase 3).
+**Status:** Phases 1–3 built + tested (engine, targets/`set_targets.py`, dry-run, gated execution, cost-basis holdings, Allocation page). **Remaining:** new slow-cadence automation (replacing the stale `batch_files/`); FIFO tax-lot harvesting (a refinement on the average-cost model).
 
 ## Database Schema
 
@@ -141,9 +145,9 @@ SQLite at `db/trading.db`; all timestamps UTC-naive. `_migrate()` in `data/datab
 | `circuit_breaker_log` | CB TRIGGERED/RESET events |
 | `equity_snapshots` | per-day NLV baseline |
 | `trade_log` | closed-trade history (`source='live'` from reconciliation). Round-trip model — retained for **historical** P&L; the new system's primary ledger is the transactions/holdings model below |
-| **`target_allocation`** | **NEW** — desired weights (core + satellite) |
-| **`rebalance_log`** | **NEW** — one row per rebalance run |
-| **`transactions` / `holdings`** | **NEW (Phase 3)** — per-fill ledger + position/cost-basis snapshots; P&L is mark-to-market vs cost basis (also feeds tax-lot harvesting). Replaces round-trip aggregation for the new buy-and-hold book |
+| `target_allocation` | desired weights — `sleeve('core'\|'satellite_qv'\|'satellite_bigbet')`, `active` flag; via `get_target_allocation` / `replace_target_sleeves` |
+| `rebalance_log` | one row per **live** rebalance run (dry-runs not logged) |
+| **holdings (computed)** | no table — `compute_holdings_from_fills()` reconstructs positions + average-cost basis + realised P&L from `fill_log` on read (replaces round-trip aggregation for the new buy-and-hold book). FIFO tax-lot harvesting is a later refinement |
 
 **Historical / retired** (still in the DB, **not written by the new system**; kept for archived analysis): `signal_log`, `ensemble_weight_history`, `walk_forward_results`, `universe_assets`, `universe_run_log`, `order_decisions`, `signal_runner_log`, `trailing_stop_log`, `intraday_run_log`, `llm_news_analysis`, `news_cache`.
 
@@ -151,7 +155,7 @@ SQLite at `db/trading.db`; all timestamps UTC-naive. `_migrate()` in `data/datab
 
 Load order: dataclass defaults (`config/settings.py`) → `config/settings.yaml` (user overrides) → env vars (secrets only: `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, `IBKR_FLEX_TOKEN`, `IBKR_FLEX_QUERY_ID`). Secrets are never written to YAML (`_SECRET_FIELDS`).
 
-Relevant config: `DataConfig.watchlist` / `benchmark_symbol` ("SPY"); `TradingConfig.paper_orders_enabled` / `paper_equity` / `cash_reserve_pct`; `RiskConfig.circuit_breaker_*`; `FlexConfig.token`/`query_id`. **Planned `AllocationConfig`:** `rebalance_band=0.05`, `cash_first=True`, `cash_buffer=0.01`, `rebalance_orders_enabled=False` (the second gate), `price_source`. The retired `MLConfig` / `UniverseConfig` / `LLMConfig` fields are vestigial — referenced only by archived code and the Settings page's now-unused ML tab (a pending cleanup).
+Relevant config: `DataConfig.watchlist` / `benchmark_symbol` ("SPY"); `TradingConfig.paper_orders_enabled` / `paper_equity` / `cash_reserve_pct`; `RiskConfig.circuit_breaker_*`; `FlexConfig.token`/`query_id`. **`AllocationConfig`** (built): `rebalance_band=0.05`, `cash_buffer=0.01`, `rebalance_orders_enabled=False` (the second execution gate), `slippage_cap=0.005`, `share_precision=4`. The retired `MLConfig` / `UniverseConfig` / `LLMConfig` fields are vestigial — referenced only by archived code and the Settings page's now-unused ML tab (a pending cleanup).
 
 ## Key Architectural Decisions (kept infrastructure)
 
@@ -181,12 +185,14 @@ Unit tests mock `ib_insync`, `yfinance`, and DB calls — no live connections/ne
 
 ## Build roadmap
 
-1. **`portfolio/allocation.py` + tests** (pure engine) ← highest-value, lowest-risk next step.
-2. `target_allocation` table + `scripts/set_targets.py` (persist the pinned core + satellite).
-3. `scripts/rebalance.py` **dry-run** (drift + plan against live IBKR; no orders).
-4. Gated rebalancer execution + reconciliation.
-5. Dashboard "Allocation" page (target vs current, drift, plan, `rebalance_log`).
-6. Transactions/holdings + cost-basis model + tax-lot harvesting (Phase 3).
-7. New slow-cadence automation to replace the stale `batch_files/`.
+1. ~~`portfolio/allocation.py` + tests (pure engine)~~ ✅ done.
+2. ~~`target_allocation` table + `scripts/set_targets.py`~~ ✅ done (core pinned; satellite via screen + judgment).
+3. ~~`scripts/rebalance.py` **dry-run** (drift + plan vs live IBKR)~~ ✅ done.
+4. ~~Gated rebalancer execution + reconciliation~~ ✅ done (two-gate; `rebalance_log`; existing reconcile path).
+5. ~~Dashboard "Allocation" page~~ ✅ done (Page 3 — target vs current, drift, holdings, history).
+6. ~~Cost-basis holdings model~~ ✅ done (`compute_holdings_from_fills`, average-cost). **TODO:** FIFO tax-lot harvesting (refinement).
+7. **TODO:** new slow-cadence automation to replace the stale `batch_files/`.
+
+**Next time you actually trade the new book:** seed the satellite (`buffett_screen` → `set_targets.py --qv/--bigbet`), run `rebalance.py` (dry-run) to review, then arm both gates to execute. The first live plan will sell the leftover predictive-alpha stock positions (flagged untracked) and buy the ETF core.
 
 **Pending cleanups (non-blocking):** archive `risk/{order_manager, position_sizer, portfolio_guard, trailing_stop}` + slim `risk/__init__` + split `test_risk`; remove the Settings page's vestigial ML tab + `MLConfig`/`UniverseConfig`/`LLMConfig`; archive the stale `batch_files/`.
