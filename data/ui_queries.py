@@ -1506,3 +1506,50 @@ def query_llm_analysis_options(days: int = 30) -> dict:
         "models":  sorted(df["model"].dropna().unique().tolist()),
         "symbols": sorted(df["symbol"].dropna().unique().tolist()),
     }
+
+
+# ── Allocation / rebalancer (the new system — Page 3) ─────────────────────────
+
+@st.cache_data(ttl=120)
+def query_target_allocation() -> pd.DataFrame:
+    """Active target_allocation rows (ticker / sleeve / target_weight / label)."""
+    from data.database import get_target_allocation
+    return pd.DataFrame(get_target_allocation(active_only=True))
+
+
+@st.cache_data(ttl=120)
+def query_rebalance_log(limit: int = 30) -> pd.DataFrame:
+    """Recent rebalance runs (newest first)."""
+    from data.database import get_engine
+    return pd.read_sql(
+        "SELECT run_at, mode, nlv, n_proposed, n_submitted, n_failed, turnover_pct, notes "
+        "FROM rebalance_log ORDER BY run_at DESC LIMIT ?",
+        get_engine(), params=(limit,))
+
+
+@st.cache_data(ttl=120)
+def query_holdings() -> pd.DataFrame:
+    """Held positions reconstructed from fill_log (average-cost basis), valued at
+    the latest cached daily close.  Columns: symbol / shares / avg_cost / price /
+    market_value / cost_basis / unrealized_pnl."""
+    from data.database import compute_holdings_from_fills, get_engine
+    held = {k: v for k, v in compute_holdings_from_fills().items() if abs(v["shares"]) > 1e-6}
+    cols = ["symbol", "shares", "avg_cost", "price", "market_value", "cost_basis", "unrealized_pnl"]
+    if not held:
+        return pd.DataFrame(columns=cols)
+    closes = pd.read_sql(
+        "SELECT symbol, close FROM ohlcv_bars b WHERE interval='1d' AND timestamp="
+        "(SELECT MAX(timestamp) FROM ohlcv_bars WHERE symbol=b.symbol AND interval='1d')",
+        get_engine())
+    price = dict(zip(closes["symbol"], closes["close"]))
+    rows = []
+    for sym, v in held.items():
+        px = price.get(sym)
+        mv = v["shares"] * px if px else None
+        rows.append({
+            "symbol": sym, "shares": v["shares"], "avg_cost": v["avg_cost"],
+            "price": px, "market_value": mv, "cost_basis": v["cost_basis"],
+            "unrealized_pnl": (mv - v["cost_basis"]) if mv is not None else None,
+        })
+    return pd.DataFrame(rows, columns=cols).sort_values(
+        "market_value", ascending=False, na_position="last").reset_index(drop=True)

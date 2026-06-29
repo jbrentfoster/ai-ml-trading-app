@@ -2,12 +2,14 @@
 
   python scripts/rebalance.py                 # dry-run: drift + proposed plan
   python scripts/rebalance.py --band 0.05 --cash-buffer 0.01
-  python scripts/rebalance.py --no-dry-run    # (Phase 2 — order submission not yet built)
+  python scripts/rebalance.py --no-dry-run    # submit (ALSO needs the config gate)
 
 Reads targets from the target_allocation table (set via scripts/set_targets.py),
 fetches live IBKR positions / NLV / cash + reference prices, and runs the pure
-engine (portfolio.allocation.compute_plan).  No orders are submitted — execution
-is the gated Phase-2 step.  Run from the project root.
+engine (portfolio.allocation.compute_plan).  Orders are submitted only under the
+two gates — the --no-dry-run flag AND config.allocation.rebalance_orders_enabled
+(default off); otherwise the plan is printed and nothing is sent.  Run from the
+project root.
 """
 import argparse
 import asyncio

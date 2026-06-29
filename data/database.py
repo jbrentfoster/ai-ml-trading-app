@@ -1797,6 +1797,51 @@ def log_rebalance(record: dict) -> None:
         session.commit()
 
 
+def compute_holdings_from_fills(account: str | None = None) -> dict[str, dict]:
+    """Reconstruct current positions + **average-cost basis** from fill_log.
+
+    The new buy-and-hold book's ledger: a BUY adds shares and cost (incl.
+    commission); a SELL realises P&L against the running average cost and reduces
+    the basis.  Returns ``{symbol: {shares, avg_cost, cost_basis, realized_pnl}}``
+    for **every** symbol seen (a fully-closed name keeps its realised P&L with
+    shares ≈ 0, so callers can sum realised P&L; the allocation view filters to
+    shares > 0).  Long-only assumption — the new system never shorts.
+
+    This is the new system's holdings model; it replaces the round-trip trade_log
+    aggregation (FIFO lot tracking for tax is a later refinement).
+    """
+    engine = get_engine()
+    with Session(engine) as session:
+        q = session.query(FillLog)
+        if account:
+            q = q.filter(FillLog.account == account)
+        fills = q.order_by(FillLog.exec_time, FillLog.id).all()
+
+    state: dict[str, dict] = {}
+    for f in fills:
+        s = state.setdefault(f.symbol, {"shares": 0.0, "cost_basis": 0.0, "realized_pnl": 0.0})
+        qty, px, comm = float(f.shares or 0), float(f.price or 0), float(f.commission or 0)
+        if (f.side or "").upper() == "BUY":
+            s["cost_basis"] += qty * px + comm
+            s["shares"] += qty
+        else:  # SELL — realise against the running average cost
+            avg = s["cost_basis"] / s["shares"] if s["shares"] > 0 else 0.0
+            s["realized_pnl"] += qty * px - qty * avg - comm
+            s["cost_basis"] -= qty * avg
+            s["shares"] -= qty
+
+    out = {}
+    for sym, s in state.items():
+        shares = round(s["shares"], 6)
+        out[sym] = {
+            "shares":       shares,
+            "avg_cost":     (s["cost_basis"] / shares) if shares > 1e-9 else 0.0,
+            "cost_basis":   s["cost_basis"] if shares > 1e-9 else 0.0,
+            "realized_pnl": s["realized_pnl"],
+        }
+    return out
+
+
 # ── Order decision helpers ─────────────────────────────────────────────────────
 
 def log_order_decision(record: dict) -> None:
