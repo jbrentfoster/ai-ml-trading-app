@@ -1,489 +1,138 @@
-> ⚠️ **For educational and paper trading use only. Not financial advice.** See [Disclaimer](#disclaimer).
+> ⚠️ **For educational and paper-trading use only. Not financial advice.** See [Disclaimer](#disclaimer).
 
-# AI Trading App
+# Risk-Premia Harvesting Portfolio Tool
 
-A Python-based algorithmic trading system that uses an ML ensemble (LSTM + XGBoost + FinBERT) to generate daily trade signals, managed by a full risk layer (Kelly sizing, ATR stops, bracket orders with optional trailing-stop conversion, circuit breaker, portfolio guard). Connects to Interactive Brokers via `ib_insync` for live/paper order execution. Built on a Streamlit dashboard that explains each component visually.
+A personal, slow-cadence portfolio tool that harvests the **value + quality** risk
+premium on a small capital sleeve, running on Interactive Brokers via IB Gateway.
+It holds a diversified, value+quality-tilted **ETF core (80%)** plus a small,
+concentrated Buffett-style **stock satellite (20%)**, and rebalances on a slow
+(≈ quarterly) cadence with ruthless cost/tax/risk discipline. Built as a
+learning / science project (and a possible legacy tool), **not** as the operator's
+primary wealth.
+
+It is explicitly **not** a return-chasing alpha machine. Success is *risk-adjusted*
+(Sharpe, max drawdown, Calmar) versus a 60/40 benchmark and durability across
+multi-year value droughts — **not** beating SPY total return (it will lag SPY in
+growth bulls, by design — that is the cost of diversification + discipline).
+
+> ### This project pivoted (2026-06)
+> It began as a **predictive-alpha** system (an LSTM + XGBoost + FinBERT ensemble +
+> an LLM news analyst trading daily signals). Four predictive-alpha directions were
+> each tested with cheap probes and **retired on evidence** — durable alpha from
+> commodity public data on a laptop kept not being there. The predictive layer is
+> **archived, not deleted** (git tag `v1.0-predictive-alpha`, code under
+> [`archive/`](archive/README.md), docs under [`archive/docs/`](archive/docs/README.md)).
+>
+> **Why:** [`docs/strategy/pivot_decision_2026-06.md`](docs/strategy/pivot_decision_2026-06.md) ·
+> **Strategy:** [`docs/strategy/risk_premia_harvesting.md`](docs/strategy/risk_premia_harvesting.md)
 
 ---
 
-## Disclaimer
+## How it works
 
-This software is provided for educational and paper trading purposes only. It is not financial or investment advice. The authors make no guarantees regarding performance, accuracy, or fitness for any particular purpose. Use in live or real-money trading is entirely at your own risk. The authors are not liable for any financial losses, damages, or other consequences arising from use of this software.
+```
+set_targets.py   → target_allocation table   (desired weights: core + satellite)
+rebalance.py     → compares targets to the LIVE IBKR account
+                 → a plan (drift + proposed trades), DRY-RUN by default
+[two gates]      → submits marketable-limit orders, logs the run
+reconcile_*.py   → fills land in fill_log
+dashboard Page 3 → holdings (cost-basis P&L), drift, rebalance history
+```
+
+- **Pure allocation engine** (`portfolio/allocation.py`) — unit-tested, no IBKR/DB.
+  Band-based rebalancing (no churn for small drift); idle cash deployed to
+  underweight sleeves; fractional shares; **big-bets are drift-exempt** (winners run
+  untouched).
+- **Two-gate execution** — orders submit only with `--no-dry-run` *and*
+  `config.allocation.rebalance_orders_enabled=True`. Off by default.
+- **Cost-basis holdings** reconstructed from reconciled fills; surfaced on the
+  Streamlit dashboard.
+
+See [`docs/operating_guide.md`](docs/operating_guide.md) for the day-to-day runbook.
 
 ---
 
-## Build phases
+## Setup
 
-| Phase | Description | Status |
-|-------|-------------|--------|
-| 1 | IBKR connection (paper/live trading) | Complete |
-| 2 | Data pipeline + indicators + Streamlit dashboard | Complete |
-| 3 | ML signal generation (LSTM + XGBoost + FinBERT ensemble) | Complete |
-| 4 | Risk & portfolio management | Complete |
-| 5 | RL optimizer (PPO, Sharpe reward) | Pending |
-| 6 | Live trading transition | Pending |
+```bash
+pip install -r requirements.txt
+```
+
+Run all commands from the project root. Activate `.venv/` or prefix with
+`.venv/Scripts/python` on Windows.
+
+### IB Gateway
+
+Used for order submission and live account/price reads (the data pipeline works
+without it). Download from **ibkr.com → Trading → Trading Software → IB Gateway**.
+
+```
+Log in with paper-trading credentials
+Configure → Settings → API → Settings
+  ☑ Enable ActiveX and Socket Clients
+  Socket port: 4002          ← paper (4001 = live)
+  ☐ Read-Only API            ← uncheck to allow orders
+Configure → Settings → Auto-restart
+  ☑ Auto-restart             ← handles the daily session reset
+```
+
+---
+
+## Commands
+
+```bash
+# Set desired weights → target_allocation
+python scripts/set_targets.py --init-core        # pinned ETF core (80%)
+python scripts/set_targets.py --qv "AAPL:0.05,KO:0.05,JNJ:0.05"   # quality-value sat
+python scripts/set_targets.py --bigbet "TICK:0.025"               # capped conviction bet
+python scripts/set_targets.py --show
+
+# Rebalance
+python scripts/rebalance.py                      # dry-run: drift + proposed plan
+python scripts/rebalance.py --no-dry-run         # submit (ALSO needs the config gate)
+
+# Data + screen
+python scripts/run_pipeline.py                   # OHLCV + fundamentals (+ news)
+python scripts/buffett_screen.py                 # ranked large-cap satellite shortlist
+
+# Reconcile fills → fill_log
+python scripts/reconcile_flex.py                 # durable T+1 Flex backstop
+python scripts/reconcile_fills.py                # in-session poll
+
+# Dashboard + tests
+streamlit run dashboard/1_Market_Data.py         # Page 3 = Allocation
+.venv/Scripts/pytest tests/ -v
+```
+
+---
+
+## Project layout
+
+| Path | What |
+|---|---|
+| `portfolio/` | allocation engine (pure) + rebalancer (gated execution) |
+| `scripts/` | `set_targets.py`, `rebalance.py`, `buffett_screen.py`, pipeline + reconcile |
+| `data/` | SQLite ORM + migrations, fetcher, fundamentals, sectors, UI queries |
+| `execution/` | IBKR async connection + fill reconciliation |
+| `dashboard/` | Streamlit pages (Page 3 = Allocation) |
+| `docs/` | [strategy](docs/strategy/), [operating guide](docs/operating_guide.md), [findings + case studies](docs/README.md) (the science record) |
+| `archive/` | retired predictive-alpha code + docs (tag `v1.0-predictive-alpha`) |
+| `CLAUDE.md` | build/architecture reference |
 
 ---
 
 ## Requirements
 
 - Python 3.11+
-- IB Gateway 10.x — for order execution and premium news; data pipeline works without it
+- IB Gateway 10.x (for execution + live reads; the data pipeline runs without it)
 - Windows, macOS, or Linux
 
-```bash
-pip install -r requirements.txt
-```
-
-All commands must be run from the project root directory.
-
 ---
 
-## IBKR setup
-
-The system uses **IB Gateway** for order submission and news. The data pipeline (yfinance) and ML signal generation work without any IBKR connection.
-
-### IB Gateway
-
-IB Gateway is a headless IBKR client designed for automated systems — stable for unattended operation, low memory usage, and no GUI to close accidentally.
-
-Download from: **ibkr.com → Trading → Trading Software → IB Gateway**
-
-Configuration:
-```
-Log in with your paper trading credentials
-Configure → Settings → API → Settings
-  ☑ Enable ActiveX and Socket Clients
-  Socket port: 4002          ← paper (default)
-  ☐ Read-Only API            ← uncheck to allow orders
-Configure → Settings → Auto-restart
-  ☑ Auto-restart             ← handles the daily 24h session reset
-```
-
-### Port reference
-
-| Client | Paper port | Live port |
-|--------|-----------|----------|
-| IB Gateway | 4002 | 4001 |
-
-### Market data subscriptions
-
-Having a funded IBKR account does not automatically include real-time API market data. Subscriptions are managed separately in the Client Portal:
-
-**Account Management → Settings → Market Data Subscriptions**
-
-Without a real-time subscription, the system falls back automatically:
-1. **IBKR live data** — requires real-time API subscription
-2. **IBKR 15-min delayed data** — free, no subscription needed
-3. **yfinance** — always available, returns most recent close
-
-The data pipeline (OHLCV bars via yfinance) and historical data requests are unaffected by real-time subscription status.
-
----
-
-## First-time setup sequence
-
-Run these steps once to seed the database before the automated schedule takes over. In normal operation, `run_daily.bat` and `run_weekly.bat` handle everything — see the [Automatic scheduling](#automatic-scheduling-windows) section below.
-
-### Step 1 — Seed market data
-
-```bash
-python scripts/universe_scheduler.py --run-now     # populate universe_assets (if universe.enabled=True)
-python scripts/run_pipeline.py                     # fetch OHLCV + news + FinBERT scores for all symbols
-python scripts/run_pipeline.py --interval 1h       # also fetch hourly bars (optional)
-python scripts/run_pipeline.py --skip-news         # skip news fetch (faster, for debugging)
-python scripts/run_pipeline.py --use-watchlist     # force static watchlist even when universe is enabled
-```
-
-### Step 2 — Train models
-
-```bash
-python scripts/train_models.py                     # train all symbols (full mode, ~2–5 min/symbol)
-python scripts/train_models.py --symbol AAPL       # single symbol
-python scripts/train_models.py --force             # retrain even if checkpoints already exist
-python scripts/train_models.py --quick             # reduced epochs/folds — debugging only, not for production
-```
-
-### Step 3 — Generate signals (manual / ad-hoc)
-
-```bash
-python scripts/signal_runner.py                    # dry-run, all symbols (default, safe)
-python scripts/signal_runner.py --symbol AAPL      # single symbol
-python scripts/signal_runner.py --no-dry-run       # submit live paper orders
-```
-
-`--no-dry-run` submits **bracket orders** (entry LMT + take-profit LMT + stop STP, all three linked) directly to IB Gateway. Two gates must both be satisfied:
-
-1. IB Gateway is running on the configured port (4002 paper by default)
-2. `trading.paper_orders_enabled=True` in `config/settings.yaml`
-
-Each bracket is submitted **GTC** (Good-Till-Cancelled) so orders placed outside regular trading hours survive until the next open. Prices are rounded to $0.01 to avoid IBKR's minimum-tick-variation rejection (error 110). A BUY signal for a symbol already held is blocked by the PortfolioGuard duplicate check.
-
-When `risk.trailing_stop_enabled=True`, a **Phase 3.5 trailing-stop conversion** runs before new-order submission: for each open long position that has moved at least `trailing_stop_activation_atr × ATR` into profit, the bracket's take-profit and stop legs are cancelled and replaced by a single standalone GTC `TRAIL` order. The trailing stop ratchets up with price and triggers only on reversal, letting winners run past the original take-profit. See [docs/08-risk-management.md](docs/08-risk-management.md#trailing-stops-phase-35--opt-in) for the full explanation.
-
-When `risk.hold_timeout_enabled=True`, a **Phase 3.6 hold-timeout flatten** runs after trailing-stop conversion and before new orders: any held long whose most recent passed-gate BUY in `signal_log` is older than `risk.max_hold_days` (default 30 calendar days) is closed with a market sell after cancelling its bracket children. The semantic is "the model still actively likes this position" — winners that the gate keeps re-confirming survive indefinitely; only positions the model has ignored for a full month are flattened. Positions with no BUY history (manual entries) are left alone.
-
-> In production, `signal_runner.py` is called automatically as the final step of `run_daily.bat`. Do not schedule it separately.
-
-### Step 4 — View results
-
-```bash
-streamlit run dashboard/1_Market_Data.py
-```
-
----
-
-## Dashboard pages
-
-| Page | Description |
-|------|-------------|
-| **1 — Market Data** | Candlestick + RSI/MACD/ATR charts, Bollinger Bands, OHLCV table |
-| **2 — Fundamentals & News** | P/E, EV/EBITDA, growth metrics, FinBERT sentiment trend, news feed |
-| **3 — Model Signals** | Ensemble scores, signal log, XGBoost feature importance, LSTM analysis |
-| **4 — Walk-Forward** | Fold Sharpe/drawdown charts, ensemble weight history, results table |
-| **5 — Settings** | Full YAML config editor: data, universe, trading, ML, news, IBKR, logging |
-| **6 — Data Status** | One row per symbol — bar counts, news coverage by source, model status |
-| **7 — Universe** | Funnel overview, active candidates, size history, manual refresh controls |
-| **8 — Risk & Portfolio** | Circuit breaker, signal runner log, order decisions, trailing-stop log, risk config |
-| **9 — Account** | Live IBKR account summary, positions, orders (requires active IB Gateway) |
-| **10 — Trade History** | Closed trades from `trade_log` (WF-simulated + live fills): net P&L, indicative ST/LT tax view, benchmark-relative + capital-weighted-ROI sections, exit-reason breakdown, per-symbol stats, and a **Trade Forensics drill-down** (per-trade hold-trajectory chart, entry-decision card with bucketed pattern flags, exit attribution, post-exit "left on the table" counterfactual). Sidebar "Dedupe to latest run per symbol" toggle (default ON) hides stale rows from prior weekly retrains by sourcing the latest `run_id` from `walk_forward_results` |
-| **11 — LLM News Analysis** | **Shadow workflow — not read by `signal_runner`.** Event-centric view of the local-LLM news analyst: de-duplicated events table (mean score, resolved-ticker vs feed-tag, attribution status), per-symbol sentiment drill-down, research expander. Populated by `run_llm_news.bat` (opt-in via `config.llm.enabled`). See [docs/11-llm-news-analyst.md](docs/11-llm-news-analyst.md) |
-
----
-
-## Automatic scheduling (Windows)
-
-The daily and weekly runs are driven by two batch files that execute the pipeline steps sequentially. Each step must succeed before the next begins.
-
-### Batch files
-
-| File | When | Steps |
-|------|------|-------|
-| `run_daily.bat` | Mon–Fri 09:40 AM | `run_pipeline.py` → `universe_scheduler.py --rescore-now --no-signal-run` → `train_models.py` (new symbols only) → `reconcile_flex.py` (Step 3c — Flex Web Service backstop for between-run fills) → `backfill_benchmark_returns.py` → `signal_runner.py` (data refresh → signals → trailing-stop conversion → hold-timeout flatten → new orders) |
-| `run_intraday.bat` | Mon–Fri 12:00 PM ET and 03:30 PM ET | `intraday_check.py` — Phase 1 circuit-breaker check + Phase 3.5 trailing-stop re-evaluation against live IBKR price.  Two scheduled slots per day.  Ratchet-only by default (no new TP→TRAIL conversions; opt-in via `RiskConfig.intraday_trail_conversion_enabled`).  Exits 0 on Gateway-down with a `status='gateway_down'` row in `intraday_run_log` so missed runs are visible on Page 8. |
-| `run_eod.bat`   | Mon–Fri 04:30 PM ET | `refresh_recent_bars.py` — re-fetches the last 5 days of OHLCV + indicators for the union of (active universe, recently-acted symbols, held positions) and overwrites the mid-day partial bars the morning `signal_runner` Phase 2 wrote |
-| `run_weekly.bat` | Sunday 01:00 AM | `universe_scheduler.py --run-now` → `run_pipeline.py` → `train_models.py --force` → `backfill_benchmark_returns.py` |
-| `run_llm_news.bat` | *(not yet scheduled)* | LLM news analyst shadow workflow: `ingest_news_bodies.py --days 1` (needs Gateway) → `score_news_llm.py` (needs Ollama, slow ~80s/article). Both no-op unless `config.llm.enabled=True`. Kept off the pre-market critical path on purpose — Step 2 can take ~2h and must never delay `signal_runner`. Logs to `logs/llm/`. Output is surfaced only on Page 11; nothing in the trading path reads it |
-
-**Step ordering matters.** The daily run rescores the universe *before* training so that symbols freshly promoted into the active set get checkpoints the same day rather than next. `--no-signal-run` suppresses the inline signal runner that `universe_scheduler.py` would otherwise fire post-rescore; signals are run explicitly as the final step, after training has caught up.
-
-The weekly run does the universe refresh **first** (reordered 2026-05-20 after the 2026-05-17 weekly review surfaced ~80–100 min of orphaned training on soon-to-be-deactivated symbols during a 48-symbol rotation). Unlike the daily `--rescore-now`, the full Stage 1+2+3 refresh can introduce brand-new symbols that have never been in `universe_assets`; running pipeline + training **after** the refresh guarantees those new symbols have fresh OHLCV / indicators / news / FinBERT scores before training writes their checkpoints. `backfill_benchmark_returns.py` runs last because it reads `trade_log` rows produced by the retrain.
-
-**Why a separate EOD step?** `run_daily.bat` runs pre-market, so its Phase 2 yfinance fetch returns whatever the day's partial state is at fetch time (mid-day for D, previous close for D-1). Nothing else re-fetches the D-1 bar once it's finalised. Symbols that subsequently drop out of the universe AND are no longer held never have their stale partial bar corrected — the recorded "daily low/high/close" remains the mid-day snapshot forever, which silently masks intraday stop-outs and biases walk-forward retraining. `run_eod.bat` at 04:30 PM ET (after the 04:00 close, with margin for yfinance to ingest) refreshes the last 5 days of bars and overwrites whatever's stale.
-
-**Why two separate scripts instead of one persistent scheduler?**
-Each batch file runs its steps sequentially and exits. Windows Task Scheduler handles the timing. This avoids silent failures from persistent processes dying overnight, multiple instances on re-login, and race conditions between pipeline and model training.
-
-**Model training cadence:** `run_daily.bat` calls `train_models.py` without `--force`, so it only trains symbols that are missing checkpoints (effectively a no-op once initial training is done, except for newly-promoted universe members). Full retraining happens weekly on Sunday with `--force`. Weekly retraining is sufficient — daily bars change slowly enough that 6-day-old weights remain effective, and the signal gate and FinBERT adapt continuously without retraining.
-
-### Log files
-
-All output is captured to date-stamped log files:
-
-```
-logs/
-  daily/
-    daily_run_20260416.log     ← one file per run
-    daily_run_20260417.log
-  intraday/
-    intraday_run_20260416_1200.log  ← one file per run_intraday.bat execution
-    intraday_run_20260416_1530.log  (HHMM in filename — multiple runs per day)
-  eod/
-    eod_run_20260416.log       ← one file per run_eod.bat execution
-  weekly/
-    weekly_run_20260420.log
-  llm/
-    llm_news_20260605.log      ← one file per run_llm_news.bat execution
-  backup/
-    backup_2026-06-05.log      ← one file per backup.bat execution
-  python/
-    trading_app.log            ← rotating Python logger (all app code)
-```
-
-To watch a run in progress:
-```powershell
-Get-Content logs\daily\daily_run_20260416.log -Wait
-```
-
-### Laptop power settings
-
-For unattended overnight operation on a laptop:
-
-1. **Settings → System → Power & sleep**: set Sleep to **Never** (plugged in)
-2. **Control Panel → Power Options → Change what closing the lid does**: set "When I close the lid" to **Do nothing** (plugged in)
-
-> Windows 11 Modern Standby can still suspend on lid close even when sleep is disabled. Setting the lid action explicitly prevents this.
-
-### Creating the scheduled tasks
-
-Open PowerShell **as Administrator** and run:
-
-```powershell
-# Mon–Fri at 09:40 AM (pre-market signal run)
-schtasks /create /tn "TradingApp\DailyRun" /tr '"C:\Users\jbren\OneDrive\Documents\VS_Code\trading_app\run_daily.bat"' /sc WEEKLY /d MON,TUE,WED,THU,FRI /st 09:40 /rl HIGHEST /f
-
-# Mon–Fri at 12:00 PM (intraday slot 1 — CB check + trail re-eval)
-schtasks /create /tn "TradingApp\IntradayMidday" /tr '"C:\Users\jbren\OneDrive\Documents\VS_Code\trading_app\run_intraday.bat"' /sc WEEKLY /d MON,TUE,WED,THU,FRI /st 12:00 /rl HIGHEST /f
-
-# Mon–Fri at 03:30 PM (intraday slot 2 — CB check + trail re-eval, 30 min before close)
-schtasks /create /tn "TradingApp\IntradayLateAfternoon" /tr '"C:\Users\jbren\OneDrive\Documents\VS_Code\trading_app\run_intraday.bat"' /sc WEEKLY /d MON,TUE,WED,THU,FRI /st 15:30 /rl HIGHEST /f
-
-# Mon–Fri at 04:30 PM (post-close bar refresh)
-schtasks /create /tn "TradingApp\EodRun" /tr '"C:\Users\jbren\OneDrive\Documents\VS_Code\trading_app\run_eod.bat"' /sc WEEKLY /d MON,TUE,WED,THU,FRI /st 16:30 /rl HIGHEST /f
-
-# Sunday at 01:00 AM (weekly retrain)
-schtasks /create /tn "TradingApp\WeeklyRun" /tr '"C:\Users\jbren\OneDrive\Documents\VS_Code\trading_app\run_weekly.bat"' /sc WEEKLY /d SUN /st 01:00 /rl HIGHEST /f
-```
-
-Verify registration:
-```powershell
-schtasks /query /tn "TradingApp\DailyRun"              /fo LIST
-schtasks /query /tn "TradingApp\IntradayMidday"        /fo LIST
-schtasks /query /tn "TradingApp\IntradayLateAfternoon" /fo LIST
-schtasks /query /tn "TradingApp\EodRun"                /fo LIST
-schtasks /query /tn "TradingApp\WeeklyRun"             /fo LIST
-```
-
-> **Intraday scheduling notes.** Both intraday slots use the same `run_intraday.bat` wrapper — only the time differs.  Run with `--dry-run` (the default in `intraday_check.py` itself) for the first few sessions to validate timing and Gateway availability before flipping the batch file to `--no-dry-run`.  The CB-flatten path only fires under `--no-dry-run` + `paper_orders_enabled=True`; the trail-ratchet logging runs in both modes.  See CLAUDE.md "Key Architectural Decisions" → *Intraday runner exits 0 on Gateway-down rather than raising* for why a missed slot writes a `gateway_down` row instead of failing the scheduled task.
-
-> **Note:** Tasks are created with **Interactive only** logon mode — they run when you are logged in. If the machine reboots and you have not logged back in by 09:40 AM, that day's run will be skipped. To change this, open Task Scheduler → TradingApp → task Properties → General → select **"Run whether user is logged on or not"**.
-
----
-
-## Verify scripts
-
-Run these to confirm each layer is working correctly before running the full pipeline.
-
-```bash
-python scripts/verify_connection.py    # IB Gateway paper account connection
-python scripts/verify_pipeline.py      # data pipeline + indicators end-to-end
-python scripts/verify_signals.py       # ML signal generation end-to-end
-python scripts/verify_universe.py      # universe selection (requires Alpaca API keys)
-python scripts/verify_risk.py          # risk & portfolio management layer
-python scripts/test_ibkr_news.py       # fetch a few IBKR headlines for one symbol
-```
-
----
-
-## Operational tools
-
-Ad-hoc scripts for managing the paper account outside the daily run. All require IB Gateway to be running.
-
-### List / cancel open orders — `open_orders.py`
-
-Default is read-only — lists every parked order on the paper account. Add `--cancel` to take action (useful for clearing stale GTC brackets from a previous `signal_runner --no-dry-run`).
-
-```bash
-# Listing
-python scripts/open_orders.py                        # list all open orders (default)
-python scripts/open_orders.py --symbol ABBV          # list only ABBV legs
-python scripts/open_orders.py --symbol ABBV CL       # multiple symbols
-
-# Cancelling (requires --cancel + one selector)
-python scripts/open_orders.py --cancel --id 52 53 54 # cancel specific order IDs
-python scripts/open_orders.py --cancel --symbol ABBV # cancel every open leg on ABBV
-python scripts/open_orders.py --cancel --all         # cancel everything (prompts for confirmation)
-python scripts/open_orders.py --cancel --all --yes   # same, no prompt
-```
-
-Cancelling the parent leg of a bracket auto-cancels the child TP/stop legs via OCA linkage, but passing all three IDs is safe — IBKR no-ops already-cancelled IDs.
-
-### List / close positions — `open_positions.py`
-
-Default is read-only — lists every held position. Add `--close` plus a selector to flatten with market sells. Different from `open_orders.py`: that manages *parked* orders, this manages *filled* positions.
-
-```bash
-# Listing
-python scripts/open_positions.py                             # list all positions (default)
-python scripts/open_positions.py --symbol AAPL               # list only AAPL
-python scripts/open_positions.py --symbol AAPL MSFT          # multiple symbols
-
-# Closing (requires --close + one selector)
-python scripts/open_positions.py --close --symbol AAPL          # market-sell full AAPL
-python scripts/open_positions.py --close --symbol AAPL --qty 1  # sell exactly 1 share
-python scripts/open_positions.py --close --symbol AAPL MSFT     # close multiple positions in full
-python scripts/open_positions.py --close --all                  # close every position (prompts)
-python scripts/open_positions.py --close --all --yes            # same, no prompt
-```
-
-Only long positions are closed; shorts and zero-qty ghost positions are skipped with a warning. `--qty` requires exactly one `--symbol`.
-
-### Fill reconciliation & backfills
-
-These reconstruct `trade_log` / `fundamental_data` from external sources. The daily run reconciles automatically (Phase 1); these are the manual / one-off equivalents.
-
-```bash
-python scripts/reconcile_fills.py              # poll IBKR reqExecutions → fill_log → trade_log (needs Gateway)
-python scripts/reconcile_fills.py --dry-run    # show what would be reconciled without writing
-python scripts/reconcile_flex.py               # durable backstop: fetch the IBKR Flex Web Service → fill_log → trade_log (NO Gateway; needs IBKR_FLEX_TOKEN + IBKR_FLEX_QUERY_ID)
-python scripts/reconcile_flex.py --dry-run     # fetch + parse + show without writing
-python scripts/backfill_flex_trades.py FILE.xml  # one-time: recover fills from a manually-exported IBKR Activity Flex Query XML file (no Gateway, no token)
-python scripts/backfill_benchmark_returns.py   # idempotent: fill trade_log.benchmark_return_pct (raw SPY return over each trade's hold)
-python scripts/backfill_sectors.py             # one-time: fill fundamental_data.sector on pre-2026-06-03 rows
-```
-
-> **Why `reconcile_flex.py` exists:** `reqExecutions` (used by `reconcile_fills.py` and the daily Phase 1 poll) only returns the *current* Gateway session's fills — on a Gateway that resets overnight, the morning poll misses every between-run fill. The Flex Web Service is session-independent and retains a year+, so it recovers prior-day fills the morning after (Flex is **T+1**). It runs automatically as `run_daily.bat` Step 3c once the two env vars are set; it's a no-op (exit 0) when they aren't, and degrades gracefully (exit 0, retried next day) on a Flex service error. Unlike `backfill_flex_trades.py` (which parses a file you export by hand) this fetches over HTTPS — no manual export.
-
-### Backup — `backup.bat`
-
-Backs up to an external drive (`D:\trading_app_backup` by default — edit `BACKUP_ROOT` in the file): an **atomic** SQLite snapshot via Python's `sqlite3.Connection.backup()` (safe against concurrent writers — a raw file copy mid-write can corrupt the destination), plus `robocopy /MIR` mirrors of `logs/` and `models/cache/`, and a copy of `config/settings.yaml`. Dated DB snapshots and local backup logs are pruned after 30 days. Bails out cleanly (and logs locally to `logs/backup/`) if the drive isn't mounted. Intended to be scheduled at ~17:00 ET after `run_eod.bat`, but is not yet wired into Task Scheduler.
-
----
-
-## Configuration
-
-Settings are edited in the dashboard (Settings page) or directly in `config/settings.yaml`. Secrets (API keys) are never written to the YAML file — set them as environment variables.
-
-```bash
-# Required for Alpaca news and universe selection
-set ALPACA_API_KEY=your_key
-set ALPACA_SECRET_KEY=your_secret
-
-# Optional — enables the daily Flex Web Service reconciliation backstop (Step 3c).
-# Generate both in IBKR Account Management → Flex Web Service (token) + a Trades
-# Flex Query (Level of Detail = Execution, period Month-to-Date or Last N Days).
-# When unset, reconcile_flex.py is a no-op. The token is a secret (never written
-# to settings.yaml). Prefer a .env file (gitignored, auto-loaded at startup).
-set IBKR_FLEX_TOKEN=your_flex_token
-set IBKR_FLEX_QUERY_ID=your_query_id
-```
-
-Key settings:
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `data.watchlist` | 10 large-caps | Symbols used when universe is disabled |
-| `universe.enabled` | False | Use dynamic universe instead of static watchlist |
-| `universe.stage3_max` | 50 | Max candidates after Stage 3 scoring |
-| `trading.mode` | SIMULATION | SIMULATION or LIVE |
-| `trading.paper_equity` | $100,000 | Assumed equity for dry-run sizing when no IBKR connection |
-| `trading.cash_reserve_pct` | 0.20 | Fraction of equity kept in cash; positions sized against the rest |
-| `trading.paper_orders_enabled` | False | Set True to submit to IBKR paper account |
-| `trading.allow_short_selling` | False | When False, SELL signals only close existing longs — never open shorts |
-| `ml.signal_threshold` | 0.35 | Minimum ensemble score to generate a signal |
-| `ml.signal_confirmation` | 2 | Models that must agree (of 3) |
-| `ml.wf_n_splits` | 5 | Walk-forward folds per training run |
-| `risk.kelly_fraction` | 0.25 | Quarter-Kelly multiplier for position sizing |
-| `risk.kelly_max_position_pct` | 0.10 | Hard cap on any single position regardless of Kelly output (10%) |
-| `risk.atr_stop_multiplier` | 2.0 | Stop = entry ± ATR × this |
-| `risk.atr_take_profit_multiplier` | 3.0 | Take-profit = entry ± ATR × this |
-| `risk.max_bar_staleness_days` | 3 | Drop a symbol if its newest cached bar is older than this (handles weekends without false positives) |
-| `risk.circuit_breaker_daily_loss_pct` | 0.03 | 3% daily loss triggers trading halt |
-| `risk.trailing_stop_enabled` | False | Opt-in: convert bracket TPs to trailing stops once a position is +N ATR in profit |
-| `risk.trailing_stop_activation_atr` | 2.0 | Convert once `price ≥ entry + N × ATR` |
-| `risk.trailing_stop_trail_atr` | 2.0 | Trailing distance below the highest reached price, in ATR units |
-| `risk.intraday_trail_conversion_enabled` | False | Opt-in: allow `intraday_check.py` to perform new TP→TRAIL conversions at 12:00 / 15:30 ET (default off — ratchet-only intraday mode) |
-| `risk.intraday_conversion_buffer_atr` | 0.5 | Extra ATR buffer above the daily activation threshold required for intraday conversions |
-| `risk.hold_timeout_enabled` | False | Opt-in: flatten held longs whose latest passed-gate BUY in `signal_log` is older than `max_hold_days` |
-| `risk.max_hold_days` | 30 | Calendar-day threshold for the hold-timeout rule (Phase 3.6). 0 disables defensively |
-| `llm.enabled` | False | Opt-in master switch for the LLM news analyst shadow workflow (Page 11). When False, `run_llm_news.bat` no-ops. Requires a local Ollama install — see [docs/11](docs/11-llm-news-analyst.md) |
-
----
-
-## ML models
-
-### Signal pipeline
-
-Each symbol passes through three models whose scores are combined into an ensemble:
-
-| Model | Input | Output |
-|-------|-------|--------|
-| **LSTM** | 60-bar rolling window of OHLCV + 11 indicators | Score in [-1, 1] |
-| **XGBoost** | 12 indicator + 13 fundamental features | Score in [-1, 1] |
-| **FinBERT** | Recent news headlines (time-decay weighted) | Score in [-1, 1] |
-| **Ensemble** | Weighted sum of above (default 40/35/25) | Score in [-1, 1] |
-
-### Signal gate (three filters, all must pass)
-
-1. `|ensemble_score| >= signal_threshold` (default 0.35)
-2. Regime-adjusted threshold: HIGH_VOLATILITY raises by 1.5×, TRENDING lowers by 0.9×
-3. At least `signal_confirmation` (default 2) of 3 models agree on direction
-
-### Walk-forward training
-
-Models are trained using time-series cross-validation to prevent lookahead bias. Default: 5 folds × (120 train + 21 test bars). After all folds, the ensemble is retrained on the full dataset for live inference.
-
-Each fold's test window is run through a **bracket simulator** that mirrors the live execution path: signals at bar `t` close enter at bar `t+1` open, ATR-based stop/take-profit levels are placed at entry, and intra-bar fills resolve under a worst-case rule (when both stop and TP lie inside `[Low, High]` on the same bar, the stop fills). Trailing-stop conversion, gap-throughs, and the `allow_short_selling` gate are all modelled. Each closed trade is written to the `trade_log` table with `source='walk_forward'`, an `exit_reason` (`stop` / `tp` / `trailing` / `signal_flip` / `fold_end` / `manual_close`), and net P&L after slippage and commissions — surfaced on the Trade History page.
-
-```
-run_pipeline.py     →  data in SQLite
-train_models.py     →  models/cache/{symbol}/lstm.pt + xgb.ubj  +  trade_log rows
-signal_runner.py    →  loads checkpoints, generates signals, logs decisions
-```
-
----
-
-## Risk management
-
-Before any guard runs, signal generation itself drops symbols whose newest cached daily bar is older than `risk.max_bar_staleness_days` (default 3) — this prevents week-old prices from producing live orders if the data pipeline missed a run.
-
-Every surviving signal then passes through a seven-check sequential guard:
-
-1. **Circuit breaker** — halt active? (3% daily / 7% weekly loss triggers; the daily runner self-checks realised + unrealised P&L against an equity baseline at the start of each Phase 1 and auto-trips the halt — no manual click required)
-2. **Stop-price sanity** — stop on the loss side of entry? (BUY needs `stop < entry`, SELL needs `stop > entry`; catches bad ATR → zero-distance stops)
-3. **Portfolio drawdown** — portfolio-wide loss exceeds limit?
-4. **Position size** — proposed size exceeds `kelly_max_position_pct`?
-5. **Sector exposure** — adding this position would exceed 30% in one sector?
-6. **Correlation** — too many highly correlated positions already held?
-7. **Duplicate** — already holding this symbol? (GOOG/GOOGL treated as same underlying)
-
-Sizing additionally short-circuits to `REJECTED_TOO_SMALL` if Kelly output is below 1 share, so 0-share bracket orders never reach IBKR. Position sizing uses fractional Kelly criterion (quarter-Kelly by default) with **ATR-based stops** — the stop distance adapts to each stock's typical daily volatility instead of using a fixed percentage. When there is insufficient signal history (<10 trades), a fixed fallback sizes to risk 1% of investable equity per trade.
-
-For SELL signals with `allow_short_selling=False` (the default), the order manager intercepts before sizing: if a long is held the position is flattened (`CLOSED_LONG`); otherwise the signal is ignored (`REJECTED_NO_POSITION`). Shorts are never opened. The same long-only gate is enforced inside the walk-forward bracket simulator so backtest P&L reflects the live execution path.
-
-Approved orders are submitted as **bracket orders** — three linked legs (entry + stop + take-profit) so risk and reward are both defined before the trade is on. All legs are GTC so they survive outside regular trading hours. When `trailing_stop_enabled=True`, each daily run evaluates every open long and may replace its bracket TP+stop with a **standalone trailing stop** once the position is sufficiently in profit — the stop then ratchets up with price and only triggers on reversal. See [docs/08-risk-management.md](docs/08-risk-management.md) for ATR fundamentals, bracket-order mechanics, and the trailing-stop conversion rules.
-
----
-
-## News sources
-
-News is fetched in priority order with automatic fallback:
-
-| Source | Quality | Requires |
-|--------|---------|---------|
-| **IBKR** | Best — Dow Jones + Briefing.com, ~4 months history | IB Gateway running |
-| **Alpaca** | Good — broad coverage, configurable lookback | `ALPACA_API_KEY` env var |
-| **yfinance** | Fallback — ~10 most recent articles only | Nothing |
-
-Run `run_pipeline.py` with IB Gateway open to get full IBKR news history. The Data Status page (Page 6) shows per-symbol news source and article counts.
-
-These three tiers feed **FinBERT**, which scores **headlines only**. A separate opt-in **LLM news analyst** (`run_llm_news.bat`, `config.llm.enabled`) reads **full article bodies** through a local LLM, resolves which company each story is actually about, and produces a transparent composite sentiment — surfaced on Page 11 as a research signal. It is **not** consumed by `signal_runner`. See [docs/11-llm-news-analyst.md](docs/11-llm-news-analyst.md).
-
----
-
-## Tests
-
-```bash
-.venv\Scripts\pytest tests\ -v              # all tests (no network or IBKR needed)
-.venv\Scripts\pytest tests\test_risk.py -v  # risk module only
-```
-
-Tests use mocks for all external dependencies — no live IBKR connection, yfinance, or network calls required.
-
----
-
-## Database
-
-SQLite at `db/trading.db` (auto-created on first run). Schema migrations are handled by `_migrate()` in `data/database.py` — runs idempotently at every engine init.
-
-| Table | Contents |
-|-------|----------|
-| `ohlcv_bars` | OHLCV + ^VIX bars, all symbols and intervals |
-| `indicator_snapshots` | RSI, MACD, Bollinger, EMA, ATR per bar |
-| `fundamental_data` | P/E, revenue growth, margins etc. (24h cache) |
-| `news_cache` | Headlines + FinBERT sentiment scores |
-| `signal_log` | Every ensemble prediction and gate result |
-| `ensemble_weight_history` | Per-fold ensemble weight snapshots after each rebalance |
-| `walk_forward_results` | Per-fold Sharpe, drawdown, win rate |
-| `trade_log` | Closed trades (WF-simulated and, with Phase B, live IBKR fills) — entry/exit, P&L, exit reason, benchmark return |
-| `fill_log` | Raw IBKR executions ingested by Phase B reconciliation — the audit trail `trade_log` `source='live'` rows are aggregated from (`exec_id` is the idempotency key) |
-| `reconciliation_state` | Phase B reconciliation watermark (one row per source/account) — newest `exec_time` persisted so far |
-| `llm_news_analysis` | LLM news analyst extractions + composite scores (one row per feed-symbol/article/model). Shadow workflow — not read by `signal_runner` |
-| `universe_assets` | Dynamic universe candidates and their scores |
-| `universe_run_log` | Per-stage timing + symbol counts for each universe refresh |
-| `order_decisions` | Every DRY_RUN / APPROVED / REJECTED / CLOSED_LONG decision |
-| `circuit_breaker_log` | All halt trigger and reset events |
-| `equity_snapshots` | Per-day net-liquidation baseline used as the CB's loss-pct denominator |
-| `trailing_stop_log` | Per-position evaluation by `TrailingStopManager` (CONVERTED / SKIPPED / FAILED) |
-| `signal_runner_log` | Daily run summaries (signals generated, orders submitted, longs closed, etc.) |
-| `intraday_run_log` | One row per `intraday_check.py` invocation (12:00 ET / 15:30 ET); status ∈ completed / gateway_down / cb_tripped / error |
+## Disclaimer
+
+This software is provided for educational and paper-trading purposes only. It is not
+financial or investment advice. The authors make no guarantees regarding
+performance, accuracy, or fitness for any particular purpose. Use in live or
+real-money trading is entirely at your own risk. The authors are not liable for any
+financial losses, damages, or other consequences arising from use of this software.

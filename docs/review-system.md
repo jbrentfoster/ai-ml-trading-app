@@ -2,7 +2,7 @@
 
 This document maps the artifacts and skills that turn raw run output into a continually-evolving understanding of system performance. It is the answer to "where does this observation belong?" when reading a log or finishing a trade.
 
-The technical tutorials in `01-system-overview.md` through `10-python-packages.md` cover *what the system does*. This doc covers *how we evaluate it*.
+This doc covers *how we evaluate the system*. (For *what it does*, see `../CLAUDE.md` and `strategy/`; the old predictive-alpha technical tutorials are archived under `../archive/docs/`. This review discipline pre-dates the 2026-06 pivot and reflects the old daily-trade cadence — but the artifact taxonomy here, findings / case studies / enhancements / follow-ups, still applies.)
 
 ---
 
