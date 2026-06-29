@@ -196,4 +196,10 @@ Unit tests mock `ib_insync`, `yfinance`, and DB calls — no live connections/ne
 
 **Next time you actually trade the new book:** seed the satellite (`buffett_screen` → `set_targets.py --qv/--bigbet`), run `rebalance.py` (dry-run) to review, then arm both gates to execute. The first live plan will sell the leftover predictive-alpha stock positions (flagged untracked) and buy the ETF core.
 
-**Pending cleanups (non-blocking):** archive `risk/{order_manager, position_sizer, portfolio_guard, trailing_stop}` + slim `risk/__init__` + split `test_risk`; remove the Settings page's vestigial ML tab + `MLConfig`/`UniverseConfig`/`LLMConfig`.  (Done: archived the stale `batch_files/run_*.bat`; deleted the 305 MB `models/cache` checkpoints; removed the dead "Model" column from Page 6.)
+**Pending cleanups (non-blocking).** One larger, test-touching pass remains:
+
+1. **Archive the retired risk layer** — `risk/{order_manager, position_sizer, portfolio_guard, trailing_stop}` (they cross-import each other and are unused by the new system) → `archive/`; slim `risk/__init__` down to `circuit_breaker` only. Move `tests/test_trailing_stop.py` to `archive/tests/` and split the order-manager / position-sizer / portfolio-guard cases out of `tests/test_risk.py` (keep the circuit-breaker + sector cases, which test kept code). Note: `portfolio_guard`'s sector logic is already extracted to `data/sectors.py`, so the only live dependency on these modules is `risk/__init__`'s re-exports.
+2. **Remove the trailing-stop UI** on Page 8 (`dashboard/pages/8_Risk_&_Portfolio.py`) — it renders a retired feature via `config.risk.trailing_stop_*`.
+3. **Drop the vestigial ML config + UI** — `MLConfig` / `UniverseConfig` / `LLMConfig` in `config/settings.py` + the Settings page's ML tab (referenced only by archived code).
+
+*(Done already: archived `batch_files/run_*.bat`; deleted the 305 MB `models/cache` checkpoints; removed Page 6's dead "Model" column + its `ui_queries` filesystem check.)*
