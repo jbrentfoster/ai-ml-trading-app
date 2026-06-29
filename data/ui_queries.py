@@ -487,9 +487,8 @@ def query_data_status() -> pd.DataFrame:
 
     Columns:
       symbol, daily_bars, latest_daily, hourly_bars, latest_hourly,
-      news_total, news_scored, has_fundamentals, has_model
+      news_total, news_scored, has_fundamentals
     """
-    from pathlib import Path
     import pandas as pd
     from sqlalchemy import text
     from config.settings import config
@@ -607,14 +606,6 @@ def query_data_status() -> pd.DataFrame:
     # Convert latest timestamps to datetime
     for col in ("latest_daily", "latest_hourly"):
         df[col] = pd.to_datetime(df[col], errors="coerce")
-
-    # Model checkpoints (filesystem check — not cached in DB)
-    cache_root = Path("models/cache")
-    def _has_model(sym: str) -> bool:
-        base = cache_root / sym
-        return (base / "lstm.pt").exists() and (base / "xgb.ubj").exists()
-
-    df["has_model"] = df["symbol"].apply(_has_model)
 
     return df.sort_values("symbol").reset_index(drop=True)
 

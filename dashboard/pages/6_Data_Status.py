@@ -53,7 +53,6 @@ stale_threshold = timedelta(days=1)
 
 n_total      = len(df)
 n_with_daily = int((df["daily_bars"] > 0).sum())
-n_with_model = int(df["has_model"].sum())
 n_with_news  = int((df["news_total"] > 0).sum())
 
 # Count symbols whose latest daily bar is more than 1 day old
@@ -64,12 +63,11 @@ n_stale = int(
     .sum()
 )
 
-c1, c2, c3, c4, c5 = st.columns(5)
+c1, c2, c3, c4 = st.columns(4)
 c1.metric("Symbols", n_total)
 c2.metric("With Daily Bars", n_with_daily)
-c3.metric("With Model", n_with_model)
-c4.metric("With News", n_with_news)
-c5.metric("Stale (>1 day)", n_stale, delta=None,
+c3.metric("With News", n_with_news)
+c4.metric("Stale (>1 day)", n_stale, delta=None,
           delta_color="inverse" if n_stale > 0 else "off")
 
 st.markdown("---")
@@ -120,7 +118,6 @@ def _source_breakdown(row) -> str:
 
 display["Source Counts"] = df.apply(_source_breakdown, axis=1)
 display["Fundamentals"]  = df["has_fundamentals"].map({True: "✓", False: ""})
-display["Model"]         = df["has_model"].map({True: "✓", False: ""})
 
 # ── Row colouring ─────────────────────────────────────────────────────────────
 
@@ -166,6 +163,5 @@ with col_r:
 - **News Source** — dominant source: IBKR / Alpaca / yfinance; `+` suffix means mixed sources
 - **Source Counts** — per-source article breakdown, e.g. `IBKR 212 · yf 10`
 - **Fundamentals** — yfinance fundamentals snapshot exists (24h cache)
-- **Model** — LSTM + XGBoost checkpoints found in `models/cache/{symbol}/`
         """
     )

@@ -95,12 +95,13 @@ trading_app/
 ├── tests/         mocked unit tests (data pipeline, ibkr connection, reconciliation, flex,
 │                  circuit breaker/sector via test_risk, ui_queries, trade_log, sectors, …)
 ├── archive/       retired predictive-alpha code (models/, LLM cluster, universe, intraday,
-│                  retired scripts/tests/dashboard pages).  See archive/README.md.
+│                  retired scripts/tests/dashboard pages) + docs/ (old tutorials) + the stale
+│                  run_*.bat.  See archive/README.md.
 ├── docs/          strategy/ (risk_premia_harvesting.md, pivot_decision_2026-06.md),
-│                  findings/, case_studies/, reviews/, enhancements.md, tutorials
+│                  operating_guide.md, findings/, case_studies/, reviews/, enhancements.md
 ├── db/            trading.db (SQLite, gitignored), buffett_screen_latest.csv (gitignored)
-└── batch_files/   run_daily/weekly/eod/intraday.bat — STALE (orchestrate archived scripts);
-                   to be replaced by new rebalance automation.
+└── batch_files/   backup.bat (atomic SQLite snapshot + logs/config mirror; the stale
+                   run_*.bat were archived).  New slow-cadence automation still TODO.
 ```
 
 ## Data Flow
@@ -195,4 +196,4 @@ Unit tests mock `ib_insync`, `yfinance`, and DB calls — no live connections/ne
 
 **Next time you actually trade the new book:** seed the satellite (`buffett_screen` → `set_targets.py --qv/--bigbet`), run `rebalance.py` (dry-run) to review, then arm both gates to execute. The first live plan will sell the leftover predictive-alpha stock positions (flagged untracked) and buy the ETF core.
 
-**Pending cleanups (non-blocking):** archive `risk/{order_manager, position_sizer, portfolio_guard, trailing_stop}` + slim `risk/__init__` + split `test_risk`; remove the Settings page's vestigial ML tab + `MLConfig`/`UniverseConfig`/`LLMConfig`; archive the stale `batch_files/`.
+**Pending cleanups (non-blocking):** archive `risk/{order_manager, position_sizer, portfolio_guard, trailing_stop}` + slim `risk/__init__` + split `test_risk`; remove the Settings page's vestigial ML tab + `MLConfig`/`UniverseConfig`/`LLMConfig`.  (Done: archived the stale `batch_files/run_*.bat`; deleted the 305 MB `models/cache` checkpoints; removed the dead "Model" column from Page 6.)
